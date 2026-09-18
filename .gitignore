@@ -1,0 +1,19 @@
+# Rust / cargo build artifacts
+target/
+
+# WASM / frontend build output (regenerable via `trunk build`)
+web-leptos/dist/
+web/dist/
+
+# Node (if ever added)
+node_modules/
+
+# Logs & editor/OS noise
+*.log
+.DS_Store
+.idea/
+.vscode/
+
+# Local config / secrets
+*.local.toml
+.env

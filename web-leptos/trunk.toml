@@ -1,0 +1,5 @@
+# Trunk build config — outputs to ./dist (i.e. web-leptos/dist/) so the
+# rust-embed folder in rushi-web (bin/rushi-web, ../../web-leptos/dist/)
+# picks up the WASM bundle from disk in debug mode (no rebuild needed).
+[build]
+target = "index.html"

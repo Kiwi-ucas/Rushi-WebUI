@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = ["bin/rushi-web", "web-leptos"]
+default-members = ["bin/rushi-web"]
+
+[workspace.dependencies]
+axum = { version = "0.8", features = ["ws", "query"] }
+axum-extra = { version = "0.10", features = ["typed-header"] }
+tokio = { version = "1", features = ["full"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["fs", "cors"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+libc = "0.2"
+anyhow = "1"
+thiserror = "2"
+rust-embed = { version = "8", features = ["include-exclude"] }
+futures = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+urlencoding = "2"
+chrono = "0.4"
+
+
+[profile.release]
+strip = true
+lto = true

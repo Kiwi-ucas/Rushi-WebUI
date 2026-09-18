@@ -1,0 +1,313 @@
+/* rushi web — rice neumorphism palette (ported verbatim from legacy index.html) */
+:root {
+  /* sushi — rice base (米白色系), single light theme */
+  --bg: #faf9f5;
+  --bg-panel: #f2f0e8;
+  --bg-elev: #efeada;
+  --border: #d8d2c2;
+  --ink: #b8b09c;
+  --text: #1d3226;
+  --text-muted: #5f6f5c;
+  --accent: #166b3a;
+  --accent2: #3f7d3a;
+  --accent-salmon: #e88a70;
+  --danger: #b3402f;
+  --warn: #9a6a10;
+  --code-bg: #f1eee3;
+  /* Opaque card faces: a card keeps the SAME background in the queue,
+     in the pile (compact/deck) and mid-animation — one card, one face.
+     The legacy translucent tints are replaced by opaque equivalents
+     over --bg (#faf9f5) so the pinned deck stack reads clean. */
+  --user-bg: #e8eee6;
+  --assistant-bg: var(--bg); /* light beige (浅米黄 #faf9f5), opaque
+     equivalent of the original transparent face over the rice base */
+  --tool-bg: #f1eee3;
+  --error-bg: #f3e8e2;
+  /* raised-block shadows (warm, on rice): dark fall + top-edge light = extruded relief */
+  --shadow: 0 2px 4px rgba(75, 70, 55, 0.16), 0 1px 1px rgba(75, 70, 55, 0.10), inset 0 1px 0 rgba(255, 255, 255, 0.55);
+  --shadow-hover: 0 3px 8px rgba(75, 70, 55, 0.22), 0 1px 3px rgba(75, 70, 55, 0.12), inset 0 1px 0 rgba(255, 255, 255, 0.55);
+  --shadow-pressed: inset 0 2px 4px rgba(75, 70, 55, 0.20);
+  --shadow-up: 0 -2px 5px rgba(75, 70, 55, 0.14), 0 -1px 2px rgba(75, 70, 55, 0.10), inset 0 1px 0 rgba(255, 255, 255, 0.55);
+  --shadow-up-hover: 0 -3px 10px rgba(75, 70, 55, 0.20), inset 0 1px 0 rgba(255, 255, 255, 0.55);
+  --shadow-side: 2px 0 6px rgba(75, 70, 55, 0.14), 2px 0 2px rgba(75, 70, 55, 0.08), inset 0 1px 0 rgba(255, 255, 255, 0.40);
+  --groove: inset 0 1px 2px rgba(75, 70, 55, 0.20), inset 0 -1px 0 rgba(255, 255, 255, 0.50);
+  --band-h: 46px;
+  /* Deck plate height = PILE_TOP(16) + COMPACT_ROW_H(64): the queue's
+     effective top truncation is the deck's BOTTOM face, not the band. */
+  --deck-h: 80px;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; height: 100%; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 14px; }
+html { background: var(--bg); }
+body { background: var(--bg); color: var(--text); display: flex; height: 100vh; height: 100dvh; overflow: hidden; }
+body.kb-anim { transition: height 0.22s ease-out; }
+
+#app { display: flex; width: 100%; height: 100%; }
+/* The Leptos mount container is invisible to the layout: #app must
+   be a direct flex child of body, exactly like the legacy DOM. */
+#mount-root { display: contents; }
+#boot { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--text-muted); font-size: 13px; font-family: system-ui, sans-serif; z-index: 100; }
+#sidebar { width: 240px; min-width: 0; background: var(--bg); box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.40); display: flex; flex-direction: column; overflow: hidden; position: relative; transition: width .18s ease; }
+#sidebar-inner { width: 240px; flex: 1; min-height: 0; display: flex; flex-direction: column; overflow-y: auto; }
+#app.sidebar-collapsed #sidebar { width: 0; min-width: 0; box-shadow: none; }
+#main { flex: 1; display: flex; flex-direction: column; overflow: hidden; position: relative; }
+#main::before { content: ''; position: absolute; top: var(--band-h); bottom: 0; left: 0; width: 14px; background: linear-gradient(to right, rgba(75, 70, 55, 0.16), rgba(75, 70, 55, 0)); /* keep the top-left corner zone as clean band surface, continuous with the sidebar top bar */ -webkit-mask-image: linear-gradient(to bottom, transparent 10px, black 30px); mask-image: linear-gradient(to bottom, transparent 10px, black 30px); pointer-events: none; z-index: 47; /* above the deck plate (z46); same z as z47 deck layer but earlier in tree order, so the deck face still paints on top */ }
+/* Deck plate: an opaque strip behind the pinned deck (z 46, just below
+   the deck layers at 47–51, above all queue cards at z auto) spanning
+   the transcript's top var(--deck-h)px. The message queue's top
+   truncation is therefore the deck's BOTTOM face: a rising full card
+   disappears under the deck stack (it will fold into it) instead of
+   being hard-clipped at the main-interface top edge. Same color as
+   --bg and the same inset top shadow + corner radius as #transcript,
+   so it reads as the clean band surface. */
+#main::after { content: ''; position: absolute; top: var(--band-h); left: 0; right: 0; height: var(--deck-h); background: var(--bg); border-top-left-radius: 14px; box-shadow: inset 0 10px 14px -10px rgba(75, 70, 55, 0.30); z-index: 46; pointer-events: none; }
+button { font-weight: 700; }
+
+.sb-header { display: flex; align-items: center; justify-content: space-between; height: var(--band-h); padding: 0 16px; border-bottom: none; box-shadow: inset 0 -1px 0 var(--border); }
+.sb-header h1 { font-size: 19px; margin: 0; color: var(--accent); }
+#sidebar-toggle { background: var(--bg-elev); border: none; border-radius: 4px; color: var(--text); padding: 2px 8px; font-size: 16px; cursor: pointer; line-height: 1.3; box-shadow: var(--shadow); }
+#sidebar-toggle:hover { box-shadow: var(--shadow-hover); }
+#sidebar-open { display: none; background: var(--bg-elev); border: none; border-radius: 4px; color: var(--text); padding: 2px 8px; cursor: pointer; font-size: 13px; box-shadow: var(--shadow); }
+#sidebar-open:hover { box-shadow: var(--shadow-hover); }
+#app.sidebar-collapsed #sidebar-open { display: inline-block; }
+#session-list { flex: 1; overflow-y: auto; padding: 8px; }
+.session-item { position: relative; padding: 8px 10px 8px 10px; padding-right: 28px; border-radius: 6px; cursor: pointer; margin-bottom: 4px; display: flex; flex-direction: column; gap: 2px; }
+.session-item:hover { background: var(--bg-elev); box-shadow: var(--shadow); }
+.session-item.active { background: var(--bg-elev); box-shadow: inset 3px 0 0 var(--accent), var(--shadow); }
+.session-item.running { animation: sess-breathe 2.2s ease-in-out infinite; }
+@keyframes sess-breathe {
+  0%, 100% { box-shadow: inset 3px 0 0 rgba(232, 138, 112, 0.45), var(--shadow); }
+  50% { box-shadow: inset 3px 0 0 var(--accent-salmon), var(--shadow); }
+}
+.session-item .sname { font-weight: 700; font-size: 15px; }
+.session-item .smeta { font-size: 13px; color: var(--text-muted); font-weight: 700; }
+/* session "…" menu (dsh-style) */
+.sess-more { position: absolute; top: 50%; right: 4px; transform: translateY(-50%); background: none; border: none; color: var(--text-muted); font-size: 16px; line-height: 1; cursor: pointer; padding: 3px 6px; border-radius: 5px; opacity: 0.65; }
+.sess-more:hover { opacity: 1; background: var(--bg-elev); box-shadow: var(--shadow); color: var(--text); }
+#sess-menu { position: fixed; z-index: 200; min-width: 170px; background: var(--bg-elev); border: none; border-radius: 10px; box-shadow: var(--shadow-hover); padding: 5px; display: none; }
+.sess-menu-item { display: block; width: 100%; text-align: left; padding: 8px 10px; border: none; background: none; color: var(--text); font-size: 13px; border-radius: 6px; cursor: pointer; font-family: inherit; }
+.sess-menu-item:hover { background: var(--bg); }
+.sess-menu-item.danger { color: var(--danger); font-weight: 600; }
+#session-actions { margin: 0; padding: 10px 12px; background: var(--bg); box-shadow: var(--shadow); border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: 6px; }
+#session-actions button { background: var(--bg-elev); border: none; color: var(--text); padding: 7px 10px; border-radius: 6px; cursor: pointer; font-size: 14px; text-align: left; box-shadow: var(--shadow); transition: box-shadow .12s ease, transform .12s ease; }
+#session-actions button:hover { box-shadow: var(--shadow-hover); }
+#session-actions button:active { transform: translateY(1px); box-shadow: var(--shadow-pressed); }
+
+#session-actions button.running { color: var(--accent2); }
+#goal-panel { margin: 0; padding: 10px 12px; background: var(--bg); box-shadow: var(--shadow); border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: 8px; }
+#goal-panel .goal-header { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; color: var(--text-muted); }
+#goal-body { font-size: 13px; line-height: 1.4; }
+#goal-body .goal-text { white-space: pre-wrap; word-break: break-word; margin-bottom: 4px; }
+#goal-body .goal-meta { font-size: 12px; color: var(--text-muted); }
+#goal-body .goal-empty { color: var(--text-muted); font-style: italic; }
+.goal-badge { display: inline-block; padding: 1px 7px; border-radius: 9px; font-size: 11px; font-weight: 700; }
+.goal-badge.active { background: var(--accent2); color: #000; }
+.goal-badge.paused { background: var(--warn); color: #000; }
+.goal-badge.completed { background: var(--accent); color: #000; }
+.goal-badge.blocked { background: var(--danger); color: #fff; }
+.goal-actions { display: flex; flex-wrap: wrap; gap: 4px; }
+.goal-actions button { background: var(--bg-elev); border: none; color: var(--text-muted); border-radius: 4px; padding: 2px 7px; font-size: 12px; cursor: pointer; box-shadow: var(--shadow); }
+.goal-actions button:hover { color: var(--text); box-shadow: var(--shadow-hover); }
+#input-module { margin: 10px 16px 12px; padding: 10px 14px; background: var(--bg); box-shadow: var(--shadow-hover); border-radius: 8px; display: flex; flex-direction: column; gap: 8px; position: relative; }
+#status-strip { display: flex; gap: 14px; font-size: 13px; color: var(--text-muted); font-family: "SF Mono", Consolas, monospace; min-height: 20px; align-items: center; overflow-x: auto; white-space: nowrap; }
+#status-strip:empty { display: none; }
+#status-strip .chip { display: inline-flex; align-items: center; gap: 4px; border: none; background: var(--bg-elev); border-radius: 9px; padding: 2px 8px; box-shadow: var(--shadow); font-weight: 700; }
+#status-strip .chip .lbl { color: var(--text-muted); }
+#status-strip .chip .val { color: var(--text); }
+#status-bar { padding: 8px 10px; font-size: 12px; color: var(--text-muted); font-weight: 700; background: var(--bg); box-shadow: var(--shadow); border-top: 1px solid var(--border); }
+.ws-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--text-muted); margin-right: 4px; }
+.ws-dot.connected { background: var(--accent2); }
+.ws-dot.error { background: var(--danger); }
+
+#context-bar { height: var(--band-h); padding: 4px 16px 2px; border-bottom: none; box-shadow: inset 0 -1px 0 var(--border); font-size: 12px; font-weight: 700; color: var(--text-muted); display: flex; flex-direction: column; gap: 3px; }
+#ctx-row { display: flex; align-items: center; gap: 6px; flex: 1; min-height: 0; }
+#ctx-rounds { display: flex; align-items: center; justify-content: space-between; height: 14px; flex: none; }
+.ctx-round { width: 26px; height: 10px; min-width: 26px; margin: 0; padding: 0; background: var(--bg-elev); border: 1px solid var(--border); border-radius: 4px; box-shadow: var(--groove); cursor: pointer; }
+.ctx-round:hover { box-shadow: var(--shadow); }
+.ctx-round.on { background: var(--accent); border-color: var(--accent); }
+.ctx-round.ctx-spot { visibility: hidden; }
+#ctx-label { color: var(--text-muted); min-width: 0; }
+#ctx-track { flex: 1; height: 6px; background: var(--bg-elev); border: none; border-radius: 3px; overflow: hidden; box-shadow: var(--groove); }
+#ctx-fill { height: 100%; background: var(--accent); width: 0%; transition: width 0.3s; }
+#ctx-pct { min-width: 32px; text-align: right; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+#ctx-k { color: var(--text-muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+#transcript { flex: 1; overflow-y: auto; padding: 16px 16px 20px; scroll-behavior: smooth; border-top-left-radius: 14px; box-shadow: inset 0 10px 14px -10px rgba(75, 70, 55, 0.30); overflow-anchor: none; }
+#scroll-spacer { height: 0; }
+.hid { display: none !important; }
+/* compact row + card pile: a folded card stays a VISIBLE 52px
+   single-line row (card head + first content line, clipped); the
+   rows are the scroll range, never a blank region. The pile itself
+   is just the newest folded row, glued to the transcript top by a
+   scroll-coupled transform (.pile-face) — ONE opaque card, same
+   plane, same shape: no background bar, no slivers, no clones.
+   Anything except round summaries can fold in, user cards included
+   (see syncCardUnfold). */
+.event.compact { height: 64px; margin-bottom: 0; overflow: hidden; cursor: pointer; }
+.event.compact::after { content: ''; position: absolute; left: 0; right: 0; bottom: 0; height: 10px; background: linear-gradient(transparent, var(--card-bg, var(--bg-elev))); pointer-events: none; }
+/* the pile deck: the newest few folded (compact) cards are pinned at the
+   transcript top by a scroll-coupled transform, overlapping into an iOS
+   notification-center stack — the ACTUAL message cards at the same plane,
+   not a separate module. Each layer keeps its OWN card face color
+   (all card faces are now opaque), so the stack reads clean AND a card
+   in the pile looks exactly like the card in the queue. */
+.event.compact.deck-layer { transform: translateY(var(--deck-dy, 0px)); }
+/* the deck-top (newest folded card) is the readable face of the stack */
+.event.compact.deck-top { box-shadow: var(--shadow-hover); }
+#welcome { position: absolute; top: var(--band-h); left: 0; right: 0; bottom: 0; display: flex; align-items: center; justify-content: center; overflow: hidden; pointer-events: none; z-index: 1; }
+#welcome .w-hero { text-align: center; padding: 24px 24px 112px; max-width: 440px; }
+#welcome .w-dish { position: relative; width: 180px; height: 96px; margin: 0 auto 26px; }
+#welcome .w-plate { position: absolute; bottom: 0; left: 0; right: 0; height: 22px; border-radius: 50%; background: linear-gradient(#fff, var(--bg-elev)); box-shadow: 0 5px 10px -5px rgba(75, 70, 55, 0.35), inset 0 1px 0 #fff; }
+#welcome .w-nigiri { position: absolute; bottom: 16px; left: 18px; width: 88px; height: 64px; }
+#welcome .w-rice { position: absolute; bottom: 0; left: 0; right: 0; height: 38px; background: linear-gradient(#fffef8, #f1ead7); border-radius: 16px 16px 12px 12px; box-shadow: inset 0 -4px 6px rgba(75, 70, 55, 0.10), 0 3px 5px rgba(75, 70, 55, 0.14); }
+#welcome .w-fish { position: absolute; top: 0; left: 5px; right: 5px; height: 34px; border-radius: 12px 18px 10px 10px; background: repeating-linear-gradient(105deg, rgba(255, 255, 255, 0.35) 0 3px, rgba(255, 255, 255, 0) 3px 15px), linear-gradient(100deg, #f5a78b, var(--accent-salmon) 75%); box-shadow: 0 3px 5px rgba(75, 70, 55, 0.20); }
+#welcome .w-nori { position: absolute; top: 6px; bottom: 6px; left: 50%; width: 15px; margin-left: -7px; background: linear-gradient(#313a31, #1d221d); border-radius: 4px; box-shadow: 0 1px 2px rgba(0, 0, 0, 0.30); }
+#welcome .w-wasabi { position: absolute; bottom: 18px; left: 118px; width: 18px; height: 11px; border-radius: 50% 50% 42% 42%; background: linear-gradient(#8aa34f, #6f8a3c); transform: rotate(-6deg); }
+#welcome .w-maki { position: absolute; bottom: 18px; right: 14px; width: 42px; height: 42px; border-radius: 50%; background: radial-gradient(circle at 35% 32%, #3a443a, #20251f 72%); box-shadow: 0 4px 6px rgba(75, 70, 55, 0.25); }
+#welcome .w-maki::before { content: ''; position: absolute; inset: 8px; border-radius: 50%; background: #f6f0e1; }
+#welcome .w-maki::after { content: ''; position: absolute; left: 50%; top: 50%; width: 13px; height: 13px; margin: -6.5px 0 0 -6.5px; border-radius: 50%; background: var(--accent-salmon); }
+#welcome .w-title { font-size: 30px; font-weight: 800; letter-spacing: -0.5px; margin: 0 0 12px; }
+#welcome .w-title span { color: var(--accent); }
+#welcome .w-chip { display: inline-block; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; font-weight: 600; color: var(--text-muted); background: var(--bg-elev); border: 1px solid var(--border); border-radius: 6px; padding: 3px 9px; box-shadow: var(--groove); margin-bottom: 12px; }
+#welcome .w-sub { font-size: 13px; line-height: 1.55; color: var(--text-muted); margin: 0 0 22px; }
+#welcome #w-new { pointer-events: auto; background: var(--accent); color: #fff; border: none; border-radius: 8px; padding: 10px 20px; font-size: 13px; font-weight: 700; cursor: pointer; box-shadow: var(--shadow); transition: box-shadow .12s ease, transform .12s ease; }
+#welcome #w-new:hover { box-shadow: var(--shadow-hover); }
+#welcome #w-new:active { transform: translateY(1px); box-shadow: var(--shadow-pressed); }
+#welcome .w-hint { font-size: 11px; color: var(--text-muted); margin-top: 12px; opacity: 0.85; }
+/* --card-bg: the card's own face color. Each .ev-* type sets it so the
+   compact row, the pinned deck layer and the full card all share one
+   background — the card in the pile IS the card in the queue. */
+.event { position: relative; margin-bottom: 12px; border-radius: 8px; padding: 10px 14px; background: var(--card-bg, var(--bg-elev)); box-shadow: var(--shadow); border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); animation: fadeIn 0.15s ease-in; }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+/* deal out of the pile — the mirror of the dock (pass 1): the card
+   peels off when its flow slot has passed the deck's BOTTOM edge
+   (PILE_TOP + COMPACT_ROW_H + PILE_BAND, pile.rs pass 2). The card
+   is already at full height in the layout; two parallel keyframes
+   (mirroring the dock's deck-shift + fold-in pair) start it at the
+   deck-top slot (--deal-dy, = the deck layer it peeled off of,
+   corrected for the queue-still scroll shift) clipped to its 64 px
+   face, then slide it DOWN out of the pile while the clip opens to
+   full height. While unfolding it sits ABOVE the pile (z 51, set
+   inline by the engine and released ~300 ms later, see the deal
+   branch in pile.rs) so it reads as the top card sliding down in
+   front of the deck, revealing the promoted face behind — the exact
+   reverse of the dock's slide-up. 0.25 s / 0.22 s ease-out match
+   the fold's timing so the round trip reads symmetric. Fully
+   opaque, no fade. */
+@keyframes unfold-in { from { clip-path: inset(0 0 calc(100% - 64px) 0 round 8px); } to { clip-path: inset(0 0 0 0 round 8px); } }
+@keyframes unfold-slide { from { transform: translateY(var(--deal-dy, 0px)); } to { transform: none; } }
+.event.unfold-anim { animation: unfold-in 0.25s ease-out backwards, unfold-slide 0.22s ease-out backwards; z-index: 51; }
+/* dock into the pile (pending fold): the card stays full-height in
+   the layout (the queue below does not move at all) while a clip
+   tucks its body up to the 52 px face — the card covers the deck
+   top and tucks in, its own face color throughout (the .ev-* type
+   sets --card-bg, which .event uses as its background). The deck
+   gluing pins the folding card at the r=0 slot (z 51, above the
+   deck's 50) so it stays covered even while the user keeps
+   scrolling.  pile.rs commits the compact layout + the queue-still
+   correction 260 ms later (commit_fold); if the user scrolls back
+   out of the pile zone the fold is cancelled and the card simply
+   stays in the queue. Fully opaque, no fade. */
+.event.folding { z-index: 51; box-shadow: var(--shadow-hover); transform: translateY(var(--deck-dy, 0px)); }
+@keyframes fold-in { from { clip-path: inset(0 0 0 0 round 8px); } to { clip-path: inset(0 0 calc(100% - 64px) 0 round 8px); } }
+.event.fold-anim { animation: fold-in 0.25s ease-out; }
+/* layer-shift merge: when a deck layer's r index changes (a card deals
+   out and the layers behind promote, or a new card docks and pushes the
+   older layers up), the gluing re-pins each affected row in one frame.
+   This slide from the old pin (--deck-dy-prev) to the live pin
+   (--deck-dy) makes the re-stack read as a smooth cascade instead of the
+   new top card popping into place. */
+@keyframes deck-shift { from { transform: translateY(var(--deck-dy-prev, 0px)); } to { transform: translateY(var(--deck-dy, 0px)); } }
+.event.deck-shift { animation: deck-shift 0.22s ease-out; }
+/* a pending-fold card carries BOTH: the 64px clip (fold-in) and the
+   slide into the stack top (deck-shift, --deck-dy-prev 0px -> live
+   --deck-dy). The two single-class rules above would let one drop,
+   so compose here (higher specificity wins the cascade). */
+.event.folding.deck-shift { animation: fold-in 0.25s ease-out, deck-shift 0.22s ease-out; }
+@media (prefers-reduced-motion: reduce) { .event.unfold-anim, .event.fold-anim, .event.deck-shift, .event.folding.deck-shift { animation: none; } }
+
+.ev-user { --card-bg: var(--user-bg); background: var(--user-bg); border-left: 3px solid var(--accent); }
+.ev-user .ev-badge { font-size: 11px; color: var(--accent); text-transform: uppercase; margin-bottom: 4px; }
+.ev-assistant { --card-bg: var(--assistant-bg); background: var(--assistant-bg); }
+.ev-tool-call { --card-bg: var(--tool-bg); background: var(--tool-bg); border-left: 3px solid var(--warn); padding: 6px 12px; }
+.ev-tool-result { --card-bg: var(--tool-bg); background: var(--tool-bg); border-left: 3px solid var(--accent2); padding: 6px 12px; }
+.ev-tool-call .ev-header, .ev-tool-result .ev-header { margin-bottom: 2px; }
+.ev-tool-line { font-size: 13px; font-family: "SF Mono", Consolas, monospace; }
+.ev-tool-args summary { font-size: 12px; color: var(--text-muted); cursor: pointer; margin-top: 4px; }
+.ev-tool-args pre { font-family: monospace; font-size: 12px; white-space: pre-wrap; max-height: 160px; overflow: auto; background: var(--code-bg); border-radius: 4px; padding: 6px 8px; margin-top: 4px; }
+.ev-result-det summary { font-size: 12px; color: var(--text-muted); cursor: pointer; }
+.ev-result-det .ev-result { margin-top: 6px; }
+.ev-tool-result.error { --card-bg: var(--error-bg); border-left-color: var(--danger); background: var(--error-bg); }
+.ev-error { --card-bg: var(--error-bg); background: var(--error-bg); border-left: 3px solid var(--danger); }
+.ev-approval { background: var(--bg-elev); border: none; }
+.ev-compaction { background: var(--bg-elev); border-left: 3px solid var(--text-muted); }
+.ev-rewind { --card-bg: var(--bg-elev); background: var(--bg-elev); border: none; border-top: 2px dashed var(--text-muted); box-shadow: none; padding: 8px 14px; }
+.ev-retract { opacity: 0.5; text-decoration: line-through; }
+
+.ev-header { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; font-size: 12px; color: var(--text-muted); }
+.ev-thinking { margin-bottom: 8px; }
+.ev-thinking summary { cursor: pointer; font-size: 12px; font-weight: 700; color: var(--text-muted); }
+.ev-thinking-body { margin-top: 4px; font-size: 12px; color: var(--text-muted); white-space: pre-wrap; border-left: 2px solid var(--border); padding-left: 8px; }
+.ev-type { font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; }
+.ev-time { margin-left: auto; }
+.ev-content { line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+.ev-content code { background: var(--code-bg); padding: 1px 4px; border-radius: 3px; font-family: "SF Mono", Consolas, monospace; font-size: 13px; }
+.ev-content pre { background: var(--code-bg); padding: 10px; overflow-x: auto; border-radius: 6px; margin: 8px 0; }
+
+.ev-args { background: var(--code-bg); padding: 8px 10px; border-radius: 6px; font-family: monospace; font-size: 13px; overflow-x: auto; margin-top: 6px; white-space: pre-wrap; }
+
+.ev-result { background: var(--code-bg); padding: 8px 10px; border-radius: 6px; font-family: monospace; font-size: 13px; max-height: 400px; overflow-y: auto; white-space: pre-wrap; margin-top: 6px; }
+
+/* syntax highlighting (lightweight, dependency-free) */
+/* syntax highlighting (lightweight, dependency-free) — base = rice */
+.hl-kw { color: #b0352a; font-weight: 600; }
+.hl-str { color: #1a5c8a; }
+.hl-num { color: #0d4f8b; }
+.hl-com { color: #6e7781; font-style: italic; }
+
+.ev-approval-actions { display: flex; gap: 8px; margin-top: 8px; }
+.ev-approval-actions button { padding: 5px 14px; border-radius: 5px; border: none; cursor: pointer; font-size: 13px; font-weight: 600; box-shadow: var(--shadow); }
+.btn-approve { background: var(--accent2); color: #fff; }
+.btn-deny { background: var(--danger); color: #fff; }
+.btn-approve:hover, .btn-deny:hover { opacity: 0.85; }
+.ev-approval-resolved .ev-approval-actions { display: none; }
+.ev-approval-resolved .ev-badge-resolved { font-size: 12px; margin-top: 4px; }
+
+.ev-ctx-exhausted { --card-bg: var(--error-bg); background: var(--error-bg); border-left: 3px solid var(--danger); }
+
+#input-area { display: flex; gap: 8px; align-items: stretch; }
+#queue-select { background: var(--bg-elev); color: var(--text-muted); border: 1px solid var(--border); border-radius: 6px; padding: 8px 6px; font-size: 13px; box-shadow: var(--groove); height: 40px; box-sizing: border-box; }
+#msg-input { flex: 1; background: var(--bg-elev); border: 1px solid var(--border); color: var(--text); border-radius: 8px; padding: 9px 12px; /* 14px = same as the message text (.ev-content); legacy 16px was an iOS auto-zoom threshold, superseded */ font-size: 14px; line-height: 21px; resize: none; height: 40px; box-sizing: border-box; overflow-y: auto; font-family: inherit; box-shadow: var(--groove); }
+#msg-input:focus { outline: none; border-color: var(--accent); }
+#btn-send { background: var(--accent); color: var(--bg); border: none; border-radius: 8px; padding: 10px 18px; cursor: pointer; font-size: 14px; font-weight: 600; box-shadow: var(--shadow); transition: box-shadow .12s ease, transform .12s ease; height: 40px; box-sizing: border-box; display: flex; align-items: center; }
+#btn-send:hover { box-shadow: var(--shadow-hover); }
+#btn-send:active { transform: translateY(1px); box-shadow: var(--shadow-pressed); }
+#btn-send:hover { opacity: 0.9; }
+
+/* new-session dialog (name + working-directory picker) */
+#ns-backdrop { position: fixed; inset: 0; background: rgba(75, 70, 55, 0.30); backdrop-filter: blur(2px); z-index: 300; display: flex; align-items: center; justify-content: center; }
+#ns-dialog { width: 480px; max-width: calc(100vw - 48px); max-height: calc(100vh - 96px); overflow-y: auto; background: var(--bg); border-radius: 14px; box-shadow: var(--shadow-hover); border: 1px solid var(--border); padding: 20px; display: flex; flex-direction: column; gap: 4px; }
+.ns-title { font-size: 17px; font-weight: 800; color: var(--text); margin-bottom: 6px; }
+.ns-label { font-size: 12px; font-weight: 700; color: var(--text-muted); text-transform: uppercase; letter-spacing: .4px; margin-top: 8px; }
+.ns-input { background: var(--bg-elev); border: 1px solid var(--border); color: var(--text); border-radius: 8px; padding: 9px 12px; font-size: 14px; font-family: inherit; box-shadow: var(--groove); }
+.ns-input:focus { outline: none; border-color: var(--accent); }
+.ns-browser { margin-top: 6px; max-height: 210px; overflow-y: auto; background: var(--bg-elev); border: 1px solid var(--border); border-radius: 8px; box-shadow: var(--groove); padding: 4px; display: flex; flex-direction: column; }
+.ns-dir { padding: 6px 10px; border-radius: 6px; font-size: 13px; font-family: "SF Mono", Consolas, monospace; color: var(--text); cursor: pointer; }
+.ns-dir:hover { background: var(--bg); box-shadow: var(--shadow); }
+.ns-dir.ns-up { color: var(--text-muted); font-weight: 700; }
+.ns-empty { padding: 8px 10px; font-size: 12px; color: var(--text-muted); font-style: italic; }
+.ns-err { color: var(--danger); font-size: 12px; margin-top: 6px; }
+.ns-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+.ns-btn { border: none; border-radius: 8px; padding: 9px 16px; font-size: 13px; font-weight: 700; cursor: pointer; box-shadow: var(--shadow); transition: box-shadow .12s ease, transform .12s ease; }
+.ns-btn:hover { box-shadow: var(--shadow-hover); }
+.ns-btn:active { transform: translateY(1px); box-shadow: var(--shadow-pressed); }
+.ns-cancel { background: var(--bg-elev); color: var(--text); }
+.ns-create { background: var(--accent); color: #fff; }
+.ns-create:disabled { opacity: 0.6; cursor: default; }
+
+.md h1, .md h2, .md h3 { margin: 10px 0 6px; }
+.md p { margin: 4px 0; }
+.md ul, .md ol { margin: 4px 0; padding-left: 20px; }
+.md strong { font-weight: 700; }
+.md em { font-style: italic; }
+.md hr { border: none; border-top: 1px solid var(--border); margin: 8px 0; }

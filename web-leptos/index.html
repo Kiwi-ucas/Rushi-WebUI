@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>rushi web</title>
+    <link data-trunk rel="css" href="style.css" />
+    <link data-trunk rel="rust" data-type="main" />
+  </head>
+  <body>
+    <!-- The app mounts INTO #mount-root (the element stays, its
+         contents are appended — so the boot screen lives OUTSIDE it,
+         or it would sit above the app forever). -->
+    <div id="mount-root"></div>
+    <div id="boot">loading…</div>
+    <script>
+      // Boot screen: removed the moment the WASM app starts. If the
+      // app hasn't mounted within 8s (stale tab, blocked fetch, bad
+      // build), turn the boot screen into an error + reload button
+      // instead of a silent "loading…" forever.
+      addEventListener('TrunkApplicationStarted', function () {
+        window.__rushiMounted = true;
+        var b = document.getElementById('boot');
+        if (b) b.remove();
+      });
+      setTimeout(function () {
+        if (window.__rushiMounted) return;
+        var b = document.getElementById('boot');
+        if (!b) return;
+        b.innerHTML =
+          '<div style="text-align:center;color:#e5484d;font:13px system-ui;line-height:1.6">' +
+          '<b>the app failed to start</b><br>' +
+          'the WASM bundle could not load — check the console for a ' +
+          'fetch or instantiation error, then:<br><br>' +
+          '<button onclick="location.reload()" ' +
+            'style="font:13px system-ui;padding:4px 14px;cursor:pointer">' +
+            'reload</button></div>';
+      }, 8000);
+    </script>
+  </body>
+</html>
