@@ -142,6 +142,10 @@ pub fn connect(state: &AppState, session: &str) {
                             })),
                         };
                         let t = ev.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        let content = ev
+                            .get("content")
+                            .and_then(|c| c.as_str())
+                            .map(|s| s.to_string());
                         if t == "assistant_message" {
                             if let Some(n) = ev
                                 .get("usage")
@@ -153,13 +157,56 @@ pub fn connect(state: &AppState, session: &str) {
                                 }
                             }
                         } else if t == "user_message" {
-                            // The user_message closes the previous round
-                            // (legacy curRound bookkeeping); record ctxK.
-                            if !events.with(|v| v.is_empty()) {
-                                rounds_ctxk.update(|v| v.push(ctx_used.get()));
+                            // A user_message closes the previous round
+                            // (legacy curRound bookkeeping). Record ctxK
+                            // EXACTLY ONCE: for our own sends, do_send
+                            // (ui.rs) already pushed it when it created
+                            // the optimistic card, so this handler only
+                            // records it when the event is NOT the echo
+                            // of our own optimistic push.
+                            let is_echo = content
+                                .as_deref()
+                                .is_some_and(|c| {
+                                    events.with(|v| {
+                                        v.iter().any(|e| {
+                                            e.get("type").and_then(|x| x.as_str())
+                                                == Some("user_message")
+                                                && e.get("content").and_then(|x| x.as_str())
+                                                    == Some(c)
+                                                && e.get("optimistic")
+                                                    .and_then(|o| o.as_bool())
+                                                    == Some(true)
+                                        })
+                                    })
+                                });
+                            if !is_echo {
+                                if !events.with(|v| v.is_empty()) {
+                                    rounds_ctxk.update(|v| v.push(ctx_used.get()));
+                                }
                             }
                         }
-                        events.update(|old| old.push(ev));
+                        events.update(move |old| {
+                            // Replace our own optimistic card with the
+                            // canonical server user_message echo (and
+                            // only user_messages) instead of pushing a
+                            // duplicate render of the same message.
+                            if ev.get("type").and_then(|v| v.as_str()) == Some("user_message") {
+                                if let Some(c) = content.clone() {
+                                    if let Some(pos) = old.iter().rposition(|e| {
+                                        e.get("type").and_then(|x| x.as_str())
+                                            == Some("user_message")
+                                            && e.get("content").and_then(|x| x.as_str())
+                                                == Some(c.as_str())
+                                            && e.get("optimistic")
+                                                .and_then(|o| o.as_bool())
+                                                == Some(true)
+                                    }) {
+                                        old.remove(pos);
+                                    }
+                                }
+                            }
+                            old.push(ev);
+                        });
                         crate::pile::on_change();
                     }
                     "error" => {

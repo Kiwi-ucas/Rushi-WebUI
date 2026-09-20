@@ -32,9 +32,9 @@
   --shadow-side: 2px 0 6px rgba(75, 70, 55, 0.14), 2px 0 2px rgba(75, 70, 55, 0.08), inset 0 1px 0 rgba(255, 255, 255, 0.40);
   --groove: inset 0 1px 2px rgba(75, 70, 55, 0.20), inset 0 -1px 0 rgba(255, 255, 255, 0.50);
   --band-h: 46px;
-  /* Deck plate height = PILE_TOP(16) + COMPACT_ROW_H(64): the queue's
+  /* Deck plate height = PILE_TOP(28) + COMPACT_ROW_H(64): the queue's
      effective top truncation is the deck's BOTTOM face, not the band. */
-  --deck-h: 80px;
+  --deck-h: 92px;
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; padding: 0; height: 100%; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 14px; }
@@ -132,7 +132,7 @@ button { font-weight: 700; }
 #ctx-pct { min-width: 32px; text-align: right; color: var(--text-muted); font-variant-numeric: tabular-nums; }
 #ctx-k { color: var(--text-muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
 
-#transcript { flex: 1; overflow-y: auto; padding: 16px 16px 20px; scroll-behavior: smooth; border-top-left-radius: 14px; box-shadow: inset 0 10px 14px -10px rgba(75, 70, 55, 0.30); overflow-anchor: none; }
+#transcript { flex: 1; overflow-y: auto; padding: 28px 16px 20px; scroll-behavior: smooth; border-top-left-radius: 14px; box-shadow: inset 0 10px 14px -10px rgba(75, 70, 55, 0.30); overflow-anchor: none; }
 #scroll-spacer { height: 0; }
 .hid { display: none !important; }
 /* compact row + card pile: a folded card stays a VISIBLE 52px
@@ -177,26 +177,38 @@ button { font-weight: 700; }
 /* --card-bg: the card's own face color. Each .ev-* type sets it so the
    compact row, the pinned deck layer and the full card all share one
    background — the card in the pile IS the card in the queue. */
-.event { position: relative; margin-bottom: 12px; border-radius: 8px; padding: 10px 14px; background: var(--card-bg, var(--bg-elev)); box-shadow: var(--shadow); border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); animation: fadeIn 0.15s ease-in; }
+.event { position: relative; margin-bottom: 12px; border-radius: 8px; padding: 10px 14px; background: var(--card-bg, var(--bg-elev)); box-shadow: var(--shadow); border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
+/* The mount fade lives on a transient `.enter` class (added at card
+   creation, dropped on animationend by the pile engine), NOT on the
+   .event base: when a transition class is stripped (unfold-anim on
+   deal release, folding/fold-anim on fold commit) the computed
+   animation list would otherwise fall back to the base fadeIn and the
+   browser RESTARTS it (opacity 0 -> 1) — the "blink after the card
+   lands in the queue" flicker. A finished .enter animation is
+   harmless: no fill-mode, base style is opacity 1 / transform none. */
+.event.enter { animation: fadeIn 0.15s ease-in; }
 @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
 /* deal out of the pile — the mirror of the dock (pass 1): the card
    peels off when its flow slot has passed the deck's BOTTOM edge
    (PILE_TOP + COMPACT_ROW_H + PILE_BAND, pile.rs pass 2). The card
-   is already at full height in the layout; two parallel keyframes
-   (mirroring the dock's deck-shift + fold-in pair) start it at the
-   deck-top slot (--deal-dy, = the deck layer it peeled off of,
-   corrected for the queue-still scroll shift) clipped to its 64 px
-   face, then slide it DOWN out of the pile while the clip opens to
-   full height. While unfolding it sits ABOVE the pile (z 51, set
-   inline by the engine and released ~300 ms later, see the deal
-   branch in pile.rs) so it reads as the top card sliding down in
+   is already at full height in the layout; it starts at the deck
+   slot it peeled off of, clipped to its 64 px face, then slides
+   DOWN out of the pile while the clip opens to full height. Phase C:
+   the slide is spring-driven — the gluing loop drives --deck-dy
+   (deal slot -> 0) per frame through a critically damped spring
+   (pile.rs); only the unfold-in clip is a keyframe (velocity-
+   matched via --inout-dur). While unfolding it sits ABOVE the pile
+   (z 51, on the class) so it reads as the top card sliding down in
    front of the deck, revealing the promoted face behind — the exact
-   reverse of the dock's slide-up. 0.25 s / 0.22 s ease-out match
-   the fold's timing so the round trip reads symmetric. Fully
-   opaque, no fade. */
+   reverse of the dock's slide-up. Fully opaque, no fade. */
 @keyframes unfold-in { from { clip-path: inset(0 0 calc(100% - 64px) 0 round 8px); } to { clip-path: inset(0 0 0 0 round 8px); } }
-@keyframes unfold-slide { from { transform: translateY(var(--deal-dy, 0px)); } to { transform: none; } }
-.event.unfold-anim { animation: unfold-in 0.25s ease-out backwards, unfold-slide 0.22s ease-out backwards; z-index: 51; }
+/* Phase C: the peel-out slide is not a keyframe — the gluing loop
+   drives --deck-dy per frame through a critically damped spring
+   (pile.rs), and the transform below is its live value. The
+   unfold-in clip (velocity-matched via --inout-dur) runs in
+   parallel; when the spring settles the engine sheds the class +
+   the var and the card rests at its flow position. */
+.event.unfold-anim { animation: unfold-in var(--inout-dur, 0.25s) ease-out backwards; transform: translateY(var(--deck-dy, 0px)); z-index: 51; }
 /* dock into the pile (pending fold): the card stays full-height in
    the layout (the queue below does not move at all) while a clip
    tucks its body up to the 52 px face — the card covers the deck
@@ -210,21 +222,24 @@ button { font-weight: 700; }
    stays in the queue. Fully opaque, no fade. */
 .event.folding { z-index: 51; box-shadow: var(--shadow-hover); transform: translateY(var(--deck-dy, 0px)); }
 @keyframes fold-in { from { clip-path: inset(0 0 0 0 round 8px); } to { clip-path: inset(0 0 calc(100% - 64px) 0 round 8px); } }
-.event.fold-anim { animation: fold-in 0.25s ease-out; }
-/* layer-shift merge: when a deck layer's r index changes (a card deals
-   out and the layers behind promote, or a new card docks and pushes the
-   older layers up), the gluing re-pins each affected row in one frame.
-   This slide from the old pin (--deck-dy-prev) to the live pin
-   (--deck-dy) makes the re-stack read as a smooth cascade instead of the
-   new top card popping into place. */
-@keyframes deck-shift { from { transform: translateY(var(--deck-dy-prev, 0px)); } to { transform: translateY(var(--deck-dy, 0px)); } }
-.event.deck-shift { animation: deck-shift 0.22s ease-out; }
-/* a pending-fold card carries BOTH: the 64px clip (fold-in) and the
-   slide into the stack top (deck-shift, --deck-dy-prev 0px -> live
-   --deck-dy). The two single-class rules above would let one drop,
-   so compose here (higher specificity wins the cascade). */
-.event.folding.deck-shift { animation: fold-in 0.25s ease-out, deck-shift 0.22s ease-out; }
-@media (prefers-reduced-motion: reduce) { .event.unfold-anim, .event.fold-anim, .event.deck-shift, .event.folding.deck-shift { animation: none; } }
+.event.fold-anim { animation: fold-in var(--inout-dur, 0.25s) ease-out forwards; }
+/* Phase C: the layer-shift merge (a card deals out and the layers
+   behind promote, or a new card docks and pushes the older layers up)
+   is no longer a keyframe — the gluing loop drives each affected row's
+   --deck-dy through a critically damped spring (pile.rs), so the
+   re-stack reads as a smooth cascade with no restart on interrupt. */
+/* a deck edge LEAVING the stack (the oldest layer pushed off by a
+   new face, or squeezed out by a deal): it glides back to its flow
+   position (a spring-driven --deck-dy, pile.rs) while this fade
+   runs, tucking behind the cascading promoted layers. A 450 ms
+   timer clears the pin + class afterwards (pile.rs). */
+@keyframes deck-leave-fade { from { opacity: 1; } to { opacity: 0; } }
+.event.deck-leave { animation: deck-leave-fade var(--inout-dur, 0.22s) ease-out forwards; }
+/* a cancelled fold or a leaving edge glides home: the spring drives
+   --deck-dy while this class binds it to the transform (z 51 keeps a
+   cancelled fold above the deck for the whole glide). */
+.event.deck-gliding { z-index: 51; transform: translateY(var(--deck-dy, 0px)); }
+@media (prefers-reduced-motion: reduce) { .event.enter, .event.unfold-anim, .event.fold-anim, .event.deck-leave { animation: none; } }
 
 .ev-user { --card-bg: var(--user-bg); background: var(--user-bg); border-left: 3px solid var(--accent); }
 .ev-user .ev-badge { font-size: 11px; color: var(--accent); text-transform: uppercase; margin-bottom: 4px; }

@@ -27,7 +27,13 @@ use crate::model::{compute_rounds, AppState};
 
 /// Pile anchor: a card whose slot top rises to this screen y folds
 /// (the transcript's top padding).
-const PILE_TOP: f64 = 16.0;
+///
+/// MUST EQUAL `#transcript`'s CSS padding-top (28px in style.css):
+/// the walk starts at `PILE_TOP - s_top` and the gluing target is
+/// `PILE_TOP - r*DECK_PEEK`, so the constant cancels out of the pin
+/// arithmetic — the face actually pins at the transcript's padding.
+/// (Change both together or the deck face jumps.)
+const PILE_TOP: f64 = 28.0;
 /// Hysteresis: a folded card only deals back out once its slot has
 /// dropped this far below the anchor (no flicker at the boundary).
 const PILE_BAND: f64 = 12.0;
@@ -40,13 +46,187 @@ const COMPACT_ROW_H: f64 = 64.0;
 const DECK_SHOW: usize = 4;
 /// How far each deck layer peeks ABOVE the card in front of it
 /// (inverted: the oldest visible layer sits 3*5=15px above the
-/// newest, i.e. PILE_TOP-15 — still within the transcript's top
-/// padding, nothing clips).
+/// newest, i.e. PILE_TOP-15 = 13px from the transcript top — within
+/// the transcript's top padding, nothing clips).
 const DECK_PEEK: f64 = 5.0;
 /// Margin-bottom of a full (queue) row: the base .event margin.
 /// Compact rows are flush (0 margin; pitch = COMPACT_ROW_H). The
 /// queue-still drift when a card folds: nat + FULL_ROW_MARGIN - COMPACT_ROW_H.
 const FULL_ROW_MARGIN: f64 = 12.0;
+
+/// Velocity-matched in/out animation duration (ms).
+///
+/// The fold/deal slide durations track the user's wheel speed: a fast
+/// fling gets a short, snappy motion; a slow scroll a long, gentle
+/// one — so the card in/out speed stays coupled to the scroll speed
+/// (fixed wall-clock durations read as "same speed at any scroll
+/// speed": fast against a fast fling, snappy against a slow crawl).
+/// `vel` is px/ms of user scroll; 0/unknown (a click, idle rAF, or
+/// the very first step) falls back to the classic 220 ms.
+fn inout_dur_ms(vel: f64) -> f64 {
+    if vel < 0.5 {
+        return 220.0;
+    }
+    // ~6 px/ms (a brisk wheel flick) settles in 150 ms; clamp to keep
+    // the motion inside a snappy..gentle window.
+    (900.0 / vel).clamp(80.0, 340.0)
+}
+
+// ── Phase C: critically-damped slide springs ───────────────────────
+/// One card's in/out slide, integrated per rAF frame instead of a
+/// fixed-duration CSS keyframe. `x` is the element's `--deck-dy`
+/// value (transform space, px); the target is recomputed EVERY frame
+/// from live layout (its deck slot for pinned layers, 0 / natural
+/// flow for dealt and leaving cards), so a mid-flight scroll or
+/// re-dock retargets the spring smoothly instead of restarting it.
+/// `vel` is px/ms; on release the card's scroll-coupled motion is
+/// carried by the live layout term, so the spring starts from rest
+/// and only settles the residual — the velocity handoff that keeps
+/// interrupted motion continuous (iOS notification-center feel).
+#[derive(Clone)]
+struct CardSpring {
+    el: HtmlElement,
+    /// true: target is the element's deck slot (pinned layer, handled
+    /// by the gluing loops); false: target is 0 / natural flow
+    /// (dealt + leaving cards, handled by `step_flow_springs`).
+    to_slot: bool,
+    x: f64,
+    vel: f64,
+    /// Stiffness rad/ms (critical damping: c = 2*sqrt(k) with m = 1).
+    omega: f64,
+    /// No integration before this perf-ms (drain stagger).
+    delay_until: f64,
+    /// perf-ms of the last integration step.
+    t_prev: f64,
+}
+
+/// Stiffness that settles a critically damped step response in
+/// `dur` ms (≈98% at t = 5.3/ω). Driven by the same velocity-matched
+/// mapping as the old CSS durations: fast flings settle fast, slow
+/// crawls settle gently.
+fn spring_omega(vel: f64) -> f64 {
+    5.3 / inout_dur_ms(vel)
+}
+
+/// Monotonic perf-ms clock (0.0 when the Performance API is
+/// unavailable — every caller must treat 0.0 as "time unknown").
+fn perf_now() -> f64 {
+    web_sys::window()
+        .and_then(|w| w.performance())
+        .map(|p| p.now())
+        .unwrap_or(0.0)
+}
+
+fn spring_idx(st: &PileState, el: &HtmlElement) -> Option<usize> {
+    st.springs.iter().position(|s| same_el(&s.el, el))
+}
+
+fn spring_drop(st: &mut PileState, el: &HtmlElement) {
+    st.springs.retain(|s| !same_el(&s.el, el));
+}
+
+/// Adopt (or replace) a spring for `el`. `x0` is the starting
+/// `--deck-dy` value; the per-frame target comes from the gluing
+/// loops (slot) or is 0 (flow). `delay_ms` staggers drain batches.
+fn spring_adopt(
+    st: &mut PileState,
+    el: &HtmlElement,
+    to_slot: bool,
+    x0: f64,
+    delay_ms: u32,
+    now_ms: f64,
+    omega: f64,
+) {
+    spring_drop(st, el);
+    st.springs.push(CardSpring {
+        el: el.clone(),
+        to_slot,
+        x: x0,
+        vel: 0.0,
+        omega,
+        delay_until: now_ms + delay_ms as f64,
+        t_prev: now_ms,
+    });
+    if st.springs.len() > 48 {
+        st.springs.drain(0..st.springs.len() - 48);
+    }
+}
+
+/// One critically-damped spring step toward `target`. Returns true
+/// when settled (caller snaps `x` to `target` and retires the
+/// spring).
+fn spring_step(sp: &mut CardSpring, target: f64, now_ms: f64) -> bool {
+    // Exact closed-form step of the critically-damped oscillator
+    // (x - target = (dx + B*t)*e^(-w*t), B = dv + w*dx): unconditionally
+    // stable and monotone — no stability cliff when a stiff spring
+    // (fast scroll) meets a long frame. (Semi-implicit Euler was
+    // unstable for omega*dt above ~0.83: observed x blowing up to
+    // ±1e14.) Cap the step to 500 ms so a huge timer gap never
+    // instantaneously teleports the value.
+    let dt = (now_ms - sp.t_prev).clamp(0.0, 500.0);
+    sp.t_prev = now_ms;
+    let w = sp.omega;
+    if dt > 0.0 {
+        let dx = sp.x - target;
+        let dv = sp.vel;
+        // x(t) - target = (dx + b*t)*e^(-w*t),  b = dv + w*dx
+        // v(t)          = (dv - w*b*t)*e^(-w*t)
+        let b = dv + w * dx;
+        let e = (-w * dt).exp();
+        sp.x = target + (dx + b * dt) * e;
+        sp.vel = (dv - w * b * dt) * e;
+    }
+    (sp.x - target).abs() < 0.5 && sp.vel.abs() < 0.05
+}
+
+/// Advance every FLOW-targeted spring (dealt / leaving edges) and
+/// write its per-frame `--deck-dy`; pinned layers' springs are
+/// advanced by the gluing loops, which own those elements' writes.
+/// A settled spring is retired and the element's transform released.
+fn step_flow_springs(st: &mut PileState, now_ms: f64) {
+    let mut i = 0;
+    while i < st.springs.len() {
+        let is_flow = !st.springs[i].to_slot;
+        let el = st.springs[i].el.clone();
+        if is_flow {
+            let node: web_sys::Node = el.clone().unchecked_into();
+            // Retired when detached or re-folded back into the deck
+            // (the gluing loop re-pins it, so the flow spring is stale).
+            let alive = node.is_connected() && !el.class_list().contains("compact");
+            if !alive {
+                // Retired (detached, or re-folded into the deck before
+                // the glide settled): drop the glide class too, so it
+                // can't stick on the card's next state.
+                let _ = el.class_list().remove_1("deck-gliding");
+                st.springs.remove(i);
+                continue;
+            }
+            let mut sp = st.springs[i].clone();
+            if now_ms < sp.delay_until {
+                sp.t_prev = now_ms; // stagger hold: rest at x0
+                st.springs[i] = sp;
+            } else {
+                let settled = spring_step(&mut sp, 0.0, now_ms);
+                st.springs[i] = sp;
+                if settled {
+                    // Rested exactly at the natural flow position:
+                    // release the inline pin state so the card is a
+                    // plain queue card again (the old release timer's
+                    // job, now driven by the spring settling).
+                    let _ = el.class_list().remove_1("unfold-anim");
+                    let _ = el.class_list().remove_1("deck-gliding");
+                    clear_inline(&el);
+                    st.springs.remove(i);
+                    continue;
+                }
+            }
+            let _ = el
+                .style()
+                .set_property("--deck-dy", &format!("{:.1}px", st.springs[i].x));
+        }
+        i += 1;
+    }
+}
 
 // ── engine state ──────────────────────────────────────────────────
 struct PileState {
@@ -94,13 +274,27 @@ struct PileState {
     stall_reported: bool,
     /// Ring of the last few deal decisions (diagnostics).
     deal_dbg_hist: Vec<String>,
-    /// Accumulated queue-still scroll correction from async commit_fold
-    /// (pending-fold) that will be applied at the next step's gluing pass.
-    pending_corr: f64,
+    /// Wall time (ms) of the previous full step: feeds the scroll
+    /// velocity estimate that drives the velocity-matched in/out
+    /// durations (see `inout_dur_ms`).
+    last_step_t: f64,
+    /// Wall time (ms) of the last user scroll motion (delta > 0.5):
+    /// the commit stillness gate defers fold commits that would land
+    /// mid-gesture.
+    last_user_scroll_t: f64,
+    /// Phase B: pending folds awaiting the settle-driven commit
+    /// ((card, perf-ms when it entered the dock)).
+    fold_watch: Vec<(HtmlElement, f64)>,
+    /// Phase C: per-element critically-damped slide springs that
+    /// replace the fixed-duration CSS keyframe in/out slides.
+    springs: Vec<CardSpring>,
+    /// prefers-reduced-motion: skip springs/glides, snap instead.
+    reduced_motion: bool,
     // Closures kept alive for the app lifetime (wasm GC):
     raf: Option<Closure<dyn Fn()>>,
     scroll_cb: Option<Closure<dyn Fn()>>,
     click_cb: Option<Closure<dyn Fn(web_sys::Event)>>,
+    animend_cb: Option<Closure<dyn Fn(web_sys::Event)>>,
     resize_cb: Option<Closure<dyn Fn()>>,
     transend_cb: Option<Closure<dyn Fn()>>,
     doc_click_cb: Option<Closure<dyn Fn(web_sys::Event)>>,
@@ -205,10 +399,15 @@ pub fn init(state: AppState) {
             park_bottom: false,
             stall_reported: false,
             deal_dbg_hist: Vec::new(),
-            pending_corr: 0.0,
+            last_step_t: 0.0,
+            last_user_scroll_t: 0.0,
+            fold_watch: Vec::new(),
+            springs: Vec::new(),
+            reduced_motion: false,
             raf: None,
             scroll_cb: None,
             click_cb: None,
+            animend_cb: None,
             resize_cb: None,
             transend_cb: None,
             doc_click_cb: None,
@@ -219,6 +418,13 @@ pub fn init(state: AppState) {
         if let Some(t) = &ps.transcript {
             ps.last_stop = t.scroll_top() as f64;
         }
+        // Phase C: under prefers-reduced-motion the slides are snaps,
+        // not glides — skip spring adoption everywhere.
+        ps.reduced_motion = web_sys::window()
+            .and_then(|w| w.match_media("(prefers-reduced-motion: reduce)").ok())
+            .flatten()
+            .map(|mq| mq.matches())
+            .unwrap_or(false);
 
         let raf = Closure::<dyn Fn()>::new(|| on_frame());
         ps.raf = Some(raf);
@@ -237,6 +443,25 @@ pub fn init(state: AppState) {
             let on_click = Closure::<dyn Fn(web_sys::Event)>::new(|e| on_transcript_click(&e));
             let _ = vt.add_event_listener_with_callback("click", on_click.as_js_value().unchecked_ref::<js_sys::Function>());
             ps.click_cb = Some(on_click);
+        }
+
+        // animationend (delegated on the transcript): drop the `.enter`
+        // mount-fade class when a card's fadeIn completes. The event
+        // also fires for the deck/unfold animations, but those cards
+        // shed `.enter` long ago, so this is a no-op for them. Under
+        // reduced motion the animation never runs and the class harmlessly
+        // stays put (its rule is disabled there too).
+        if let Some(t) = &ps.transcript {
+            let vt: EventTarget = t.clone().unchecked_into();
+            let on_animend = Closure::<dyn Fn(web_sys::Event)>::new(|e: web_sys::Event| {
+                let Some(target) = e.target() else {
+                    return;
+                };
+                let el2: web_sys::Element = target.unchecked_into();
+                let _ = el2.class_list().remove_1("enter");
+            });
+            let _ = vt.add_event_listener_with_callback("animationend", on_animend.as_js_value().unchecked_ref::<js_sys::Function>());
+            ps.animend_cb = Some(on_animend);
         }
 
         // window resize + sidebar transitionend → input gutter (legacy).
@@ -467,6 +692,11 @@ fn step_full(st: &mut PileState) {
         st.last_view = view;
         st.last_active = active.clone();
         st.fold_applied = false;
+        // Spring / commit bookkeeping belongs to the previous
+        // session's elements: drop it (stale entries would be
+        // retired lazily, but why keep them alive).
+        st.springs.clear();
+        st.fold_watch.clear();
         release_shrink(st);
         set_spacer_height(st, 0.0);
         return;
@@ -763,6 +993,10 @@ fn clear_inline(el: &HtmlElement) {
     let _ = s.set_property("visibility", "");
     let _ = s.remove_property("--deal-dy");
     let _ = s.remove_property("--fold-dy");
+    // Velocity-matched in/out duration (a dealt card re-joining the
+    // deck must use the default duration for layer cascades, not a
+    // stale speed-matched one).
+    let _ = s.remove_property("--inout-dur");
     let _ = s.remove_property("z-index");
 }
 
@@ -784,11 +1018,102 @@ fn attr_nat_h(el: &HtmlElement, default: f64) -> f64 {
         .unwrap_or(default)
 }
 
-/// Commit a pending fold: the clip tuck has finished, so the card
-/// swaps to the compact layout and its queue-still correction is
-/// queued on the state — the next step's gluing pass applies the
-/// scroll shift, so the layout shrink + correction + re-pin all land
-/// in one frame (no snap). No-op when the fold was cancelled
+/// Re-pin a deck layer to its new r-slot, starting from where it
+/// VISUALLY WAS before the commit. Phase C: instead of a CSS keyframe
+/// (the old `deck-shift`), the layer's `--deck-dy` is driven by a
+/// critically damped spring that the gluing loop integrates per frame.
+///
+/// The commit's queue-still correction scroll moves the layout (and
+/// therefore the stale transform's render point) by `shift` px in the
+/// same task, so the spring starts from `old_dy + shift` — the
+/// pre-commit render position — and glides to the live slot target,
+/// which the gluing loop recomputes every frame (a mid-gesture scroll
+/// retargets the spring instead of restarting an animation).
+fn repin_layer(st: &mut PileState, le: &HtmlElement, r: i32, tr_top: f64, shift: f64, now_ms: f64) {
+    let s = le.style();
+    let old_dy = s
+        .get_property_value("--deck-dy")
+        .ok()
+        .as_deref()
+        .and_then(|v| v.trim_end_matches("px").trim().parse::<f64>().ok())
+        .unwrap_or(0.0);
+    let target = PILE_TOP - r as f64 * DECK_PEEK;
+    // `old_dy + shift` renders exactly at the pre-correction position
+    // (same convention as the old `--deck-dy-prev` keyframe `from`).
+    let start_dy = old_dy + shift;
+    let cls = le.class_list();
+    let _ = cls.add_1("deck-layer");
+    let _ = s.set_property("z-index", &format!("{}", 50 - r));
+    if r == 0 {
+        let _ = cls.add_1("deck-top");
+    } else {
+        let _ = cls.remove_1("deck-top");
+    }
+    if !st.reduced_motion {
+        spring_adopt(st, le, true, start_dy, 0, now_ms, spring_omega(0.0));
+        // Paint the start value now; the gluing loop takes over the
+        // spring on its next frame.
+        let _ = s.set_property("--deck-dy", &format!("{start_dy:.1}px"));
+    } else {
+        spring_drop(st, le);
+        // Snap straight to the new slot (reduced motion).
+        let screen_rel = le.get_bounding_client_rect().top() - tr_top;
+        let new_dy = old_dy - screen_rel + target;
+        let _ = s.set_property("--deck-dy", &format!("{new_dy:.0}px"));
+    }
+}
+
+/// Phase B: the settle-driven commit. Re-checks every 80 ms: the
+/// pending fold commits once the user has been STILL ≥ 150 ms AND the
+/// clip has had its (velocity-matched) duration to play out; a 2.5 s
+/// cap keeps a runaway gesture from holding the fold forever. No
+/// blind timer — the card stays pinned (clipped + glued + spring) as
+/// long as the user keeps scrolling, and the commit lands at the
+/// settle point instead. No-op when the fold was cancelled in the
+/// meantime (scrolled back out of the pile zone: the `folding` class
+/// is gone) — the card just stays in the queue.
+fn watch_fold_commit(st: &mut PileState, el: &HtmlElement, clip_ms: f64) {
+    let cls = el.class_list();
+    if !cls.contains("folding") {
+        st.fold_watch.retain(|(e, _)| !same_el(e, el));
+        return; // cancelled — the card just stays in the queue
+    }
+    let node: web_sys::Node = el.clone().unchecked_into();
+    if !node.is_connected() {
+        st.fold_watch.retain(|(e, _)| !same_el(e, el));
+        return;
+    }
+    let now_ms = perf_now();
+    let t0 = st.fold_watch
+        .iter()
+        .find(|(e, _)| same_el(e, el))
+        .map(|(_, t)| *t)
+        .unwrap_or(0.0);
+    let idle_ok = st.last_user_scroll_t == 0.0 || now_ms - st.last_user_scroll_t >= 150.0;
+    let elapsed = if t0 > 0.0 { now_ms - t0 } else { f64::INFINITY };
+    if (idle_ok && elapsed >= clip_ms) || elapsed >= 2500.0 {
+        commit_fold(st, el);
+        return; // commit_fold retires the watch entry
+    }
+    let el2 = el.clone();
+    let to = gloo_timers::callback::Timeout::new(80, move || {
+        with_pile(|cell| {
+            let s = cell.borrow();
+            if let Some(s) = s.as_ref() {
+                let mut st = s.borrow_mut();
+                watch_fold_commit(&mut st, &el2, clip_ms);
+            }
+        });
+    });
+    LEAKED.with(|l| l.borrow_mut().push(Box::new(to)));
+}
+
+/// Commit a pending fold: the card swaps to the compact layout. The
+/// queue-still correction and the deck re-pin run SYNCHRONOUSLY, in
+/// this same task as the layout shrink, so the browser only ever
+/// paints the final state (the old cross-frame `pending_corr` path
+/// let an intermediate state paint for a frame — the fold-side queue
+/// jump / stale deck flicker). No-op when the fold was cancelled
 /// (user scrolled out of the pile zone, view reset, session switch).
 fn commit_fold(st: &mut PileState, el: &HtmlElement) {
     let cls = el.class_list();
@@ -801,21 +1126,102 @@ fn commit_fold(st: &mut PileState, el: &HtmlElement) {
     if !node.is_connected() {
         return;
     }
+    // ── stillness gate ─────────────────────────────────────────────
+    // The queue-still correction scroll below lands in the SAME task
+    // as the layout shrink. If the user is mid-gesture, that program-
+    // matic scrollTop change fights their scroll and the deck visibly
+    // jolts. The card is perfectly safe to hold in its pending state
+    // (clipped + glued by the gluing loop) until the scroll settles:
+    // reschedule the commit 80 ms later and re-check.
+    let now_ms = web_sys::window()
+        .and_then(|w| w.performance())
+        .map(|p| p.now())
+        .unwrap_or(0.0);
+    if now_ms > 0.0 && st.last_user_scroll_t > 0.0 && now_ms - st.last_user_scroll_t < 150.0 {
+        st.deal_dbg_hist.push(format!(
+            "commit-defer age={:.0}",
+            now_ms - st.last_user_scroll_t
+        ));
+        let el2 = el.clone();
+        let to = gloo_timers::callback::Timeout::new(80, move || {
+            with_pile(|cell| {
+                let s = cell.borrow();
+                if let Some(s) = s.as_ref() {
+                    let mut st = s.borrow_mut();
+                    commit_fold(&mut st, &el2);
+                }
+            });
+        });
+        LEAKED.with(|l| l.borrow_mut().push(Box::new(to)));
+        return;
+    }
     let nat = attr_nat_h(el, 52.0);
     add_compact(el); // compact + removes folding/fold-anim + clears inline
-    // Keep the card above the older deck layers until the gluing
-    // assigns its own z-index on the next frame.
-    let _ = el.style().set_property("z-index", "50");
-    // Queue-still correction: compacting shrank the content above the
-    // queue by (nat + FULL_ROW_MARGIN - COMPACT_ROW_H); the next step
-    // applies the matching scroll shift and syncs `last_stop` (see the
-    // pending_corr carry).
-    st.pending_corr -= nat + FULL_ROW_MARGIN - COMPACT_ROW_H;
-    st.deal_dbg_hist.push(format!("fold-commit nat={:.0}", nat));
+
+    let tr = st.transcript.clone();
+    let mut commit_shift = 0.0;
+    if let Some(tr) = &tr {
+        // ── queue-still correction, same task as the layout shrink ─
+        // Compacting shrank the content above the queue by
+        // (nat + FULL_ROW_MARGIN - COMPACT_ROW_H); scroll by the same
+        // delta so the queue stays still.
+        let drift = nat + FULL_ROW_MARGIN - COMPACT_ROW_H;
+        let s_b = tr.scroll_top() as f64;
+        if drift.abs() > 0.5 {
+            let _ = tr.style().set_property("scroll-behavior", "auto");
+            let _ = tr.set_scroll_top(((s_b - drift).max(0.0)) as i32);
+        }
+        let s_a = tr.scroll_top() as f64;
+        st.last_stop = s_a;
+        // Applied scroll delta. repin_layer needs it: the correction
+        // moved the layout, so a layer's stale transform now renders
+        // `|shift|` px off its pre-commit position; repin adds it
+        // back into the animation's `from` keyframe (see repin_layer).
+        let shift = s_a - s_b;
+        commit_shift = shift;
+
+        // ── synchronous deck re-pin ──────────────────────────────
+        // The correction moved the viewport, so every pinned layer
+        // shifted on screen. Re-pin now (not on the next rAF) so no
+        // stale pin paints: the committing card becomes the new r=0
+        // face; each older layer demotes one slot and slides from its
+        // pre-commit position; the oldest visible layer drops off.
+        let tr_top = tr.get_bounding_client_rect().top();
+        let now_ms = perf_now();
+        let prev_deck = std::mem::take(&mut st.deck_layers);
+        let mut new_deck: Vec<(HtmlElement, i32)> = Vec::new();
+        for (le, r) in &prev_deck {
+            if same_el(le, el) {
+                continue; // the committing card, pinned below as r=0
+            }
+            let new_r = r + 1;
+            if new_r >= DECK_SHOW as i32 {
+                // Pushed off the deck by the new face: glide it back
+                // to its flow position and fade the edge out while
+                // the promoted layers cascade behind it (an instant
+                // clear would leave a one-frame dip in the stack's
+                // top silhouette). Not kept in st.deck_layers — the
+                // gluing loop never re-pins it; leave_deck's spring +
+                // timer release it.
+                leave_deck(st, le, now_ms);
+                continue;
+            }
+            repin_layer(st, le, new_r, tr_top, shift, now_ms);
+            new_deck.push((le.clone(), new_r));
+        }
+        repin_layer(st, el, 0, tr_top, shift, now_ms);
+        new_deck.push((el.clone(), 0));
+        st.deck_layers = new_deck;
+        // This commit is driven by the settle watcher; retire the
+        // card's watch entry (a collapse_all commit has none).
+        st.fold_watch.retain(|(e, _)| !same_el(e, el));
+    }
+
+    st.deal_dbg_hist.push(format!("fold-commit nat={:.0} shift={:.0}", nat, commit_shift));
     if st.deal_dbg_hist.len() > 12 {
         st.deal_dbg_hist.remove(0);
     }
-    schedule_step_locked(st); // gluing pins + re-labels on the next frame
+    schedule_step_locked(st);
 }
 
 // ── sync_card_unfold: scroll-coupled fold/deal + deck gluing ──────
@@ -825,13 +1231,43 @@ fn commit_fold(st: &mut PileState, el: &HtmlElement) {
 /// keyframe animations bridge the gap between the pinned deck
 /// position and the card's flow position so the motion is smooth.
 fn sync_unfold(st: &mut PileState) {
-    let Some(tr) = &st.transcript else { return };
-    let s_top = tr.scroll_top() as f64;
+    // Block-scoped transcript access: the spring bookkeeping in the
+    // passes below needs `st` mutable, which a live `&st.transcript`
+    // borrow would forbid.
+    let (s_top, range) = {
+        let Some(tr) = &st.transcript else { return };
+        let s_top = tr.scroll_top() as f64;
+        let range = tr.scroll_height() as f64 - tr.client_height() as f64;
+        (s_top, range)
+    };
     // True user delta: `last_stop` is synced by every programmatic
     // scroll (park, correction, re-park timers), so this measures
     // only user motion since the last observed position.
     let delta = s_top - st.last_stop;
     st.last_stop = s_top;
+    // User scroll speed for this step (px/ms): feeds the
+    // velocity-matched in/out durations (`inout_dur_ms`). A step after
+    // a long idle clamps dt so stale motion reads as slow, not fast.
+    // Falls back to a nominal 16 ms frame if the Performance API is
+    // unavailable.
+    let now_t = web_sys::window()
+        .and_then(|w| w.performance())
+        .map(|p| p.now())
+        .unwrap_or(0.0);
+    let dt_ms = if st.last_step_t > 0.0 && now_t > 0.0 {
+        (now_t - st.last_step_t).clamp(8.0, 100.0)
+    } else {
+        16.0
+    };
+    st.last_step_t = now_t;
+    let scroll_vel = if delta.abs() > 0.5 {
+        // Real user scroll motion: stamp it so the commit stillness
+        // gate (commit_fold) can defer commits mid-gesture.
+        st.last_user_scroll_t = now_t;
+        delta.abs() / dt_ms
+    } else {
+        0.0
+    };
     st.deal_dbg_hist.push(format!(
         "Δ={:.0} s_top={:.0}",
         delta, s_top
@@ -840,7 +1276,6 @@ fn sync_unfold(st: &mut PileState) {
         st.deal_dbg_hist.remove(0);
     }
 
-    let range = tr.scroll_height() as f64 - tr.client_height() as f64;
     let d = range - s_top;
 
     // Auto-release a click-expanded pile once the user scrolls back
@@ -861,13 +1296,6 @@ fn sync_unfold(st: &mut PileState) {
     let mut changed = false;
     let mut scroll_shift: f64 = 0.0; // applied programmatic scroll shift
     let mut corr_target: Option<f64> = None; // scroll top to correct to
-    // Carry the queue-still correction queued by an async fold commit
-    // (commit_fold, 260 ms after its dock); compose it with this
-    // step's own dock/deal deltas.
-    if st.pending_corr.abs() > 0.5 {
-        corr_target = Some((s_top + st.pending_corr).max(0.0));
-        st.pending_corr = 0.0;
-    }
     let mut folded: Vec<(HtmlElement, f64)> = Vec::new();
     // Cards mid-fold (full-height, clipped): pinned at the deck top
     // while their 260 ms commit timer is in flight.
@@ -924,7 +1352,23 @@ fn sync_unfold(st: &mut PileState) {
                 } else if slot_top > PILE_TOP + COMPACT_ROW_H + PILE_BAND {
                     let _ = cls.remove_1("folding");
                     let _ = cls.remove_1("fold-anim");
-                    clear_deck(el); // drop the pin (deck-layer/--deck-dy/z)
+                    if !st.reduced_motion {
+                        // Glide the card back into the queue instead of
+                        // teleporting: a Flow spring carries its current
+                        // pin offset down to 0 while the deck-gliding
+                        // class binds --deck-dy to the transform.
+                        let old_dy = el.style()
+                            .get_property_value("--deck-dy")
+                            .ok()
+                            .and_then(|v| v.trim_end_matches("px").trim().parse::<f64>().ok())
+                            .unwrap_or(0.0);
+                        spring_adopt(st, el, false, old_dy, 0, now_t, spring_omega(scroll_vel));
+                        let _ = cls.remove_1("deck-layer");
+                        let _ = cls.add_1("deck-gliding");
+                    } else {
+                        spring_drop(st, el);
+                        clear_deck(el); // drop the pin (deck-layer/--deck-dy/z)
+                    }
                     st.deal_dbg_hist.push(format!("fold-cancel slot={:.0}", slot_top));
                     if st.deal_dbg_hist.len() > 12 {
                         st.deal_dbg_hist.remove(0);
@@ -953,41 +1397,53 @@ fn sync_unfold(st: &mut PileState) {
                     // Pending fold: the card stays full-height in the
                     // layout while its clip tucks the body up to the
                     // 52 px face; it reads as the card covering the
-                    // deck top. A 260 ms timer commits the compact
-                    // layout + the queue-still correction (no-op if
-                    // the fold was cancelled in the meantime).
+                    // deck top. Phase B: the commit is SETTLE-DRIVEN —
+                    // no blind timer. The settle watcher
+                    // (watch_fold_commit) holds the card pinned while
+                    // the user keeps scrolling, and commits ~150 ms
+                    // after the last motion (capped at 2.5 s).
                     let c2 = el.class_list();
                     let _ = c2.remove_1("unfold-anim");
+                    // A cancelled fold's glide (deck-gliding) is over:
+                    // re-docking re-pins the card, so drop the glide
+                    // class now or it sticks on the compact card.
+                    let _ = c2.remove_1("deck-gliding");
                     let _ = el.offset_width(); // reflow
+                    // Velocity-matched in/out: the tuck duration
+                    // scales inversely with the user's scroll speed.
+                    // `--inout-dur` drives the fold-in clip; the same
+                    // mapping sets the slide spring's stiffness.
+                    let dur_ms = inout_dur_ms(scroll_vel);
+                    let _ = el.style().set_property("--inout-dur", &format!("{dur_ms:.0}ms"));
                     let _ = c2.add_1("folding");
                     let _ = c2.add_1("fold-anim");
-                    // The pin jumps from the flow position (no
-                    // transform) to the r=0 slot (deck top). Animate
-                    // that jump like a layer-shift so the card SLIDES
-                    // up into the stack top instead of teleporting:
-                    // --deck-dy-prev = 0px (the pre-pin transform) and
-                    // deck-shift slides 0px -> the live --deck-dy
-                    // (the gluing sets it later this same frame). The
-                    // 64px fold-in clip runs in parallel via the
-                    // .folding.deck-shift composite CSS rule.
-                    let _ = el.style().set_property("--deck-dy-prev", "0px");
-                    let _ = c2.remove_1("deck-shift");
-                    let _ = el.offset_width(); // restart the animation
-                    let _ = c2.add_1("deck-shift");
+                    // Phase C: the slide up into the stack top is a
+                    // Pin spring, not a CSS keyframe. The card starts
+                    // at its flow position (dy 0); the gluing pins its
+                    // r=0 target every frame and the spring settles
+                    // the residual — an interrupted scroll retargets
+                    // the glide instead of restarting an animation.
+                    if !st.reduced_motion {
+                        spring_adopt(st, el, true, 0.0, 0, now_t, spring_omega(scroll_vel));
+                    } else {
+                        spring_drop(st, el);
+                    }
                     st.deal_dbg_hist.push(format!(
-                        "dock-pending nat={:.0} slot={:.0} s_top={:.0}",
-                        nat, slot_top, s_top
+                        "dock-pending nat={:.0} slot={:.0} s_top={:.0} dur={:.0}",
+                        nat, slot_top, s_top, dur_ms
                     ));
                     if st.deal_dbg_hist.len() > 12 {
                         st.deal_dbg_hist.remove(0);
                     }
+                    // Phase B settle-driven commit watcher.
+                    st.fold_watch.push((el.clone(), now_t));
                     let el2 = el.clone();
-                    let to = gloo_timers::callback::Timeout::new(260, move || {
+                    let to = gloo_timers::callback::Timeout::new(80, move || {
                         with_pile(|cell| {
                             let s = cell.borrow();
                             if let Some(s) = s.as_ref() {
                                 let mut st = s.borrow_mut();
-                                commit_fold(&mut st, &el2);
+                                watch_fold_commit(&mut st, &el2, dur_ms);
                             }
                         });
                     });
@@ -1014,7 +1470,7 @@ fn sync_unfold(st: &mut PileState) {
     // folds in when its top edge reaches the deck's BOTTOM edge
     // (PILE_TOP + COMPACT_ROW_H) while scrolling down; it peels back
     // out when its flow slot returns PAST that edge by PILE_BAND
-    // while scrolling up. The 12 px band (80 down / 92 up) is the
+    // while scrolling up. The 12 px band (92 down / 104 up) is the
     // hysteresis that keeps the round trip from flickering.
     let drain = st.pile_open || s_top <= 1.0;
     let n = folded.len();
@@ -1030,8 +1486,9 @@ fn sync_unfold(st: &mut PileState) {
                 && !changed
                 && slot_newest >= threshold;
             st.deal_dbg_hist.push(format!(
-                "delta={:.1} changed={} slot={:.0} thr={:.0} deal={} drain=false s_top={:.0}",
-                delta, changed, slot_newest, threshold, deal, s_top
+                "delta={:.1} changed={} slot={:.0} thr={:.0} deal={} drain=false s_top={:.0} dur={:.0}",
+                delta, changed, slot_newest, threshold, deal, s_top,
+                inout_dur_ms(scroll_vel)
             ));
             if st.deal_dbg_hist.len() > 8 {
                 st.deal_dbg_hist.remove(0);
@@ -1075,44 +1532,45 @@ fn sync_unfold(st: &mut PileState) {
             };
 
             // The card was pinned at deck layer `from_end`; the
-            // unfold animation starts at that pin and ends at the
+            // peel-out slide starts at that pin and ends at the
             // (corrected) flow slot, so it reads as the deck's front
             // face sliding down out of the pile into the queue.
             // (Inverted stack: layer `from_end` sits ABOVE the newest
-            // face, at PILE_TOP - from_end*PEEK.)
+            // face, at PILE_TOP - from_end*PEEK.) Phase C: the slide
+            // is a Flow spring (--deck-dy decays deal_dy → 0), not
+            // the old CSS unfold-slide keyframe; the unfold-in clip
+            // (velocity-matched via --inout-dur) runs in parallel.
             let deal_dy = if from_end < DECK_SHOW {
                 PILE_TOP - from_end as f64 * DECK_PEEK - (slot_top - corr)
             } else {
                 0.0
             };
-            let _ = el.style().set_property("--deal-dy", &format!("{deal_dy:.0}px"));
+            // Velocity-matched in/out (mirror of the fold side): the
+            // clip duration scales inversely with the user's scroll
+            // speed; the same mapping sets the slide spring's stiffness.
+            let dur_ms = inout_dur_ms(scroll_vel);
+            let _ = el.style().set_property("--inout-dur", &format!("{dur_ms:.0}ms"));
 
+            // Drain batches stagger via the spring delay (the old CSS
+            // animation-delay) and, for the clip, via animation-delay.
             let delay_ms = (batch * 50).min(250);
-            let _ = el.style().set_property("animation-delay", &format!("{delay_ms}ms"));
+            if delay_ms > 0 {
+                let _ = el.style().set_property("animation-delay", &format!("{delay_ms}ms"));
+            }
+            if !st.reduced_motion {
+                spring_adopt(st, el, false, deal_dy, delay_ms as u32, now_t, spring_omega(scroll_vel));
+                let _ = el.style().set_property("--deck-dy", &format!("{deal_dy:.0}px"));
+            }
             let _ = el.offset_width(); // reflow
             let _ = el.class_list().add_1("unfold-anim");
-            // Mirror of the fold side (`.folding` z 51): the
-            // `unfold-anim` class carries z 51 (above the deck's 50)
-            // for the whole slide-out, so the card reads as the top
-            // card sliding down in FRONT of the pile, revealing the
-            // promoted face behind it — the exact reverse of the
-            // dock's slide-up. (z must live on the class, not inline:
-            // the gluing cleanup calls clear_deck on cards that left
-            // the deck, which wipes inline z-index.) Once the slide
-            // has finished the card is fully in the queue (its top
-            // edge is past the deck's bottom edge), so the release
-            // timer drops the class and z falls back to the queue
-            // layering — invisible, and self-healing if a re-dock
-            // happens in the meantime.
-            let el3 = el.clone();
-            let release_ms = 300u32 + delay_ms.max(0) as u32;
-            let to = gloo_timers::callback::Timeout::new(release_ms, move || {
-                let node: web_sys::Node = el3.clone().unchecked_into();
-                if node.is_connected() {
-                    let _ = el3.class_list().remove_1("unfold-anim");
-                }
-            });
-            LEAKED.with(|l| l.borrow_mut().push(Box::new(to)));
+            // z 51 rides on the .unfold-anim class (above the deck's
+            // 50) for the whole slide-out, so the card reads as the
+            // top card sliding down in FRONT of the pile, revealing
+            // the promoted face behind — the exact reverse of the
+            // dock's slide-up. When the spring settles, its settle
+            // path sheds the class + inline state, and the card falls
+            // back to queue layering — invisible, and self-healing if
+            // a re-dock happens in the meantime.
             batch += 1;
             changed = true;
         }
@@ -1124,6 +1582,9 @@ fn sync_unfold(st: &mut PileState) {
     // Done after pass 2 so all card mutations are in; the gluing
     // below and the next frame's delta account for the applied shift.
     if let Some(target) = corr_target {
+        // Fresh borrow: the top-of-function `tr` was block-scoped so
+        // the spring bookkeeping above could mutate `st`.
+        let tr = st.transcript.as_ref().unwrap();
         let _ = tr.style().set_property("scroll-behavior", "auto");
         let _ = tr.set_scroll_top(target.max(0.0) as i32);
         let applied = tr.scroll_top() as f64;
@@ -1146,6 +1607,11 @@ fn sync_unfold(st: &mut PileState) {
     // left the deck this frame.
     let prev_deck = std::mem::take(&mut st.deck_layers);
     let mut new_deck: Vec<(HtmlElement, i32)> = Vec::new();
+    // Transcript top (for spring start-point measurements).
+    let gl_top = st.transcript
+        .as_ref()
+        .map(|t| t.get_bounding_client_rect().top())
+        .unwrap_or(0.0);
     for r in 0..show {
         // r=0 is the newest folded row: the readable face, the LOWEST
         // of the inverted cascade. Older layers (r>0) sit ABOVE it,
@@ -1157,29 +1623,49 @@ fn sync_unfold(st: &mut PileState) {
         // The correction shifted the viewport by `scroll_shift` this
         // frame; the rows' flow tops moved with it, so the pin
         // offset accounts for the post-correction position.
-        let dy = (glued_y - slot_top + scroll_shift).round() as i32;
-        // Layer-shift merge: when this row's r index changed since the
-        // last frame (a card dealt out, or a new card docked in), slide
-        // it from its old pin (--deck-dy-prev) to the new one instead of
-        // re-pinning it in a single frame — the new top card must not
-        // pop into place, it must glide into the deck-top slot.
+        let base_dy = glued_y - slot_top + scroll_shift;
         let prev_r = prev_deck
             .iter()
             .find(|(e, _)| same_el(e, el))
             .map(|(_, r)| *r);
-        if prev_r != Some(r as i32) {
-            let old_opt = el.style().get_property_value("--deck-dy").ok();
-            let prev_dy = match old_opt.as_deref() {
-                Some(s) if !s.is_empty() => s,
-                _ => "0px",
-            };
-            let _ = el.style().set_property("--deck-dy-prev", prev_dy);
-            let cls = el.class_list();
-            let _ = cls.remove_1("deck-shift");
-            let _ = el.offset_width(); // reflow so the animation restarts
-            let _ = cls.add_1("deck-shift");
+        // Phase C: an in-flight slide spring (a cascade commit, a
+        // layer-shift) owns this row's transform: integrate it
+        // against this frame's pin target and write the live value.
+        // The target recomputes every frame, so a mid-gesture scroll
+        // retargets the glide instead of restarting it.
+        if let Some(i) = spring_idx(st, el) {
+            let mut sp = st.springs[i].clone();
+            let settled = spring_step(&mut sp, base_dy, now_t);
+            let w = if settled { base_dy.round() } else { sp.x };
+            if settled {
+                st.springs.remove(i);
+            } else {
+                st.springs[i] = sp;
+            }
+            let _ = el.style().set_property("--deck-dy", &format!("{w:.1}px"));
+        } else if prev_r.is_some_and(|pr| pr != r as i32) && !st.reduced_motion {
+            // This row's slot changed since the last frame (a card
+            // dealt out, a new face committed): glide it from where
+            // it currently renders (stale transform included) into
+            // the new slot instead of snapping — a spring, not a
+            // keyframe.
+            // Start the glide from the row's CURRENT transform (the
+            // same `old_dy + shift` convention repin_layer uses): the
+            // transform is scroll-invariant, so re-anchoring off the
+            // rendered position would bake the scroll offset in.
+            let old_dy = el
+                .style()
+                .get_property_value("--deck-dy")
+                .ok()
+                .and_then(|v| v.trim_end_matches("px").trim().parse::<f64>().ok())
+                .unwrap_or(0.0);
+            let x0 = old_dy + scroll_shift;
+            spring_adopt(st, el, true, x0, 0, now_t, spring_omega(scroll_vel));
+            let _ = el.style().set_property("--deck-dy", &format!("{x0:.1}px"));
+        } else {
+            // First pin (or settled spring): the static pin value.
+            let _ = el.style().set_property("--deck-dy", &format!("{:.1}px", base_dy.round()));
         }
-        let _ = el.style().set_property("--deck-dy", &format!("{dy}px"));
         let _ = el.style().set_property("z-index", &format!("{}", (50 - r) as i32));
         let cls = el.class_list();
         let _ = cls.add_1("deck-layer");
@@ -1193,22 +1679,125 @@ fn sync_unfold(st: &mut PileState) {
     // Cards mid-fold (still full-height, clipped): pin each at the
     // r=0 slot (deck top, z 51 — above the deck's 50) so the card
     // stays covered even if the user keeps scrolling during the
-    // 260 ms fold window; its commit swaps it into the compact
-    // deck-layer set on the next frame.
+    // fold window; its commit swaps it into the compact deck-layer
+    // set on the next frame. Phase C: the dock slide into the stack
+    // top is a Pin spring (adopted in the dock-pending branch),
+    // integrated here against the live pin target.
     for (el, slot_top) in &pending_slots {
-        let dy = (PILE_TOP - slot_top + scroll_shift).round() as i32;
-        let _ = el.style().set_property("--deck-dy", &format!("{dy}px"));
+        let base_dy = PILE_TOP - slot_top + scroll_shift;
+        if let Some(i) = spring_idx(st, el) {
+            let mut sp = st.springs[i].clone();
+            let settled = spring_step(&mut sp, base_dy, now_t);
+            let w = if settled { base_dy.round() } else { sp.x };
+            if settled {
+                st.springs.remove(i);
+            } else {
+                st.springs[i] = sp;
+            }
+            let _ = el.style().set_property("--deck-dy", &format!("{w:.1}px"));
+        } else {
+            let _ = el.style().set_property("--deck-dy", &format!("{:.1}px", base_dy.round()));
+        }
         let _ = el.style().set_property("z-index", "51");
         let _ = el.class_list().add_1("deck-layer");
         new_deck.push((el.clone(), 0));
     }
-    // Clear pinning from cards that left the deck.
-    for (el, _) in &prev_deck {
+    // Clear pinning from cards that left the deck. A compact row
+    // pushed off the visible 4-layer stack glides back to its flow
+    // position and fades its edge out (leave_deck's Flow spring)
+    // instead of vanishing mid-cascade; anything else clears.
+    // A card with a live flow spring (a dealt / leaving edge) is
+    // left alone — its settle path or leave timer releases it.
+    for (el, _r) in &prev_deck {
         if !new_deck.iter().any(|(e, _)| same_el(e, el)) {
-            clear_deck(el);
+            if compact.iter().any(|(e, _)| same_el(e, el)) {
+                leave_deck(st, el, now_t);
+            } else if spring_idx(st, el).is_none() {
+                clear_deck(el);
+            }
         }
     }
     st.deck_layers = new_deck;
+    // Phase C: integrate the flow-targeted springs (dealt cards,
+    // leaving edges, cancelled folds) and keep the rAF loop alive
+    // while any spring is still settling, even at rest (no scroll
+    // event to drive it).
+    step_flow_springs(st, now_t);
+    if !st.springs.is_empty() {
+        schedule_step_locked(st);
+    }
+}
+
+/// Push a deck layer off the stack (Phase C): instead of holding its
+/// vacated slot, the edge glides back to its natural flow position
+/// (a Flow spring drives --deck-dy down to 0) while `deck-leave`
+/// fades it out, tucking behind the cascading promoted layers. A
+/// leave watcher (watch_deck_leave) clears the pin + classes once
+/// the edge has settled out of the deck; a re-promotion mid-cascade
+/// sheds the fade so the card reappears behind the cascade instead.
+/// Idempotent: an already-fading layer is owned by its watcher.
+fn leave_deck(st: &mut PileState, le: &HtmlElement, now_ms: f64) {
+    let cls = le.class_list();
+    if cls.contains("deck-leave") {
+        return; // a leave watcher already owns this layer
+    }
+    let s = le.style();
+    let old_dy = s
+        .get_property_value("--deck-dy")
+        .ok()
+        .and_then(|v| v.trim_end_matches("px").trim().parse::<f64>().ok())
+        .unwrap_or(0.0);
+    // Phase C: instead of holding the vacated slot (the old deck-shift
+    // hold-slide), the edge glides back DOWN to its natural flow
+    // position — where it really is in the compact stack — while it
+    // fades, tucking itself behind the cascading promoted layers.
+    // A Flow spring owns the transform; the gluing stale-cleanup
+    // leaves it alone (it's no longer in the pin set), and the settle
+    // path (step_flow_springs) releases the transform at flow.
+    if !st.reduced_motion {
+        spring_adopt(st, le, false, old_dy, 0, now_ms, spring_omega(0.0));
+        let _ = s.set_property("--deck-dy", &format!("{old_dy:.1}px"));
+    } else {
+        spring_drop(st, le);
+        let _ = s.remove_property("--deck-dy");
+    }
+    let _ = cls.add_1("deck-leave");
+    // Watcher: after the fade window, clear the pin + class once the
+    // edge has settled OUT of the deck; a re-promotion mid-cascade
+    // instead sheds the fade so the card reappears behind the
+    // cascade.
+    let el2 = le.clone();
+    let to = gloo_timers::callback::Timeout::new(450, move || {
+        with_pile(|cell| {
+            let s = cell.borrow();
+            if let Some(s) = s.as_ref() {
+                let mut st = s.borrow_mut();
+                watch_deck_leave(&mut st, &el2);
+            }
+        });
+    });
+    LEAKED.with(|l| l.borrow_mut().push(Box::new(to)));
+}
+
+/// Re-check (every 250 ms) whether a leaving edge may be cleared:
+/// out of the deck → clear the pin + fade class; back in the deck
+/// (re-promoted by a deal during the fade) → shed the fade so the
+/// card is visible again and the gluing owns its pin; detached →
+/// retire.
+fn watch_deck_leave(st: &mut PileState, el: &HtmlElement) {
+    if st.deck_layers.iter().any(|(e, _)| same_el(e, el)) {
+        // Re-promoted: visible again, gluing owns the pin from here.
+        let _ = el.class_list().remove_1("deck-leave");
+        spring_drop(st, el);
+        return;
+    }
+    let node: web_sys::Node = el.clone().unchecked_into();
+    if !node.is_connected() {
+        spring_drop(st, el);
+        return; // detached: nothing left to clean
+    }
+    clear_deck(el);
+    spring_drop(st, el);
 }
 
 /// Clear a card's deck pinning (--deck-dy CSS var + z-index + deck classes
@@ -1222,6 +1811,8 @@ fn clear_deck(el: &HtmlElement) {
     let _ = cls.remove_1("deck-layer");
     let _ = cls.remove_1("deck-top");
     let _ = cls.remove_1("deck-shift");
+    let _ = cls.remove_1("deck-leave");
+    let _ = cls.remove_1("deck-gliding");
 }
 
 // ── sync_card_shrink (legacy syncCardShrink, faithful port) ───────

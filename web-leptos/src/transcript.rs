@@ -76,6 +76,11 @@ fn event_card_view(key: usize, events: RwSignal<Vec<Value>>, state: AppState) ->
         "ext_status" => "event ev-ext-status",
         _ => "event",
     };
+    // `.enter` drives the mount fade-in (style.css `.event.enter`). The
+    // class is removed on `animationend` by the pile engine's delegated
+    // listener; if that never fires (reduced motion) the class is
+    // harmless — the animation is disabled there too.
+    let cls = format!("{cls} enter");
 
     let brief = match t.as_str() {
         "user_message" => format!(

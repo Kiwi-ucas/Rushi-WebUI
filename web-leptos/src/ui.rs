@@ -151,11 +151,14 @@ pub async fn do_send(state: AppState, content: String, queue: String) {
     };
     let queue_opt = if queue.is_empty() { None } else { Some(queue) };
 
-    // optimistic local render (port of the doSend local push)
+    // optimistic local render (port of the doSend local push).
+    // The `optimistic` flag lets the WS echo path replace this card
+    // with the canonical server event instead of rendering it twice.
     let mut ev = json!({
         "type": "user_message",
         "ts": timeutil::now_iso(),
         "content": content,
+        "optimistic": true,
     });
     if let Some(q) = &queue_opt {
         ev["queue"] = json!(q);

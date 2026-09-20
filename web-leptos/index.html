@@ -14,28 +14,51 @@
     <div id="mount-root"></div>
     <div id="boot">loading…</div>
     <script>
-      // Boot screen: removed the moment the WASM app starts. If the
-      // app hasn't mounted within 8s (stale tab, blocked fetch, bad
-      // build), turn the boot screen into an error + reload button
-      // instead of a silent "loading…" forever.
+      // Boot screen: removed the moment the WASM app starts.
+      //
+      // A genuine WASM failure (blocked fetch, 404, bad build,
+      // instantiation error) rejects the module-level init promise;
+      // surface that immediately instead of waiting for the slow-load
+      // timeout. A slow download (e.g. the 8 MB debug WASM over a
+      // remote tailnet link on a phone) just takes longer: keep the
+      // "loading…" state until the longer timeout so it does not read
+      // as a failure.
+      var bootFailed = false;
+      function showBootError(title, detail) {
+        if (window.__rushiMounted || bootFailed) return;
+        bootFailed = true;
+        var b = document.getElementById('boot');
+        if (!b) return;
+        b.innerHTML =
+          '<div style="text-align:center;color:#e5484d;font:13px system-ui;line-height:1.6">' +
+          '<b>' + title + '</b><br>' + detail + '<br><br>' +
+          '<button onclick="location.reload()" ' +
+            'style="font:13px system-ui;padding:4px 14px;cursor:pointer">' +
+            'reload</button></div>';
+      }
       addEventListener('TrunkApplicationStarted', function () {
         window.__rushiMounted = true;
         var b = document.getElementById('boot');
         if (b) b.remove();
       });
-      setTimeout(function () {
+      addEventListener('unhandledrejection', function (e) {
         if (window.__rushiMounted) return;
-        var b = document.getElementById('boot');
-        if (!b) return;
-        b.innerHTML =
-          '<div style="text-align:center;color:#e5484d;font:13px system-ui;line-height:1.6">' +
-          '<b>the app failed to start</b><br>' +
-          'the WASM bundle could not load — check the console for a ' +
-          'fetch or instantiation error, then:<br><br>' +
-          '<button onclick="location.reload()" ' +
-            'style="font:13px system-ui;padding:4px 14px;cursor:pointer">' +
-            'reload</button></div>';
-      }, 8000);
+        var reason = e.reason;
+        var msg = reason ? (reason.message || String(reason)) : 'unknown error';
+        showBootError(
+          'the app failed to start',
+          'the WASM bundle could not load (' + msg + ') — check the ' +
+          'console for a fetch or instantiation error'
+        );
+      });
+      setTimeout(function () {
+        showBootError(
+          'still loading…',
+          'the WASM bundle has not finished loading. The debug build ' +
+          'is ~8 MB — on a slow connection this can take a while. ' +
+          'Check the console for a fetch or instantiation error'
+        );
+      }, 30000);
     </script>
   </body>
 </html>
