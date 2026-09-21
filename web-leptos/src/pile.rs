@@ -269,6 +269,11 @@ struct PileState {
     /// step (set by `on_history_loaded`, e.g. right after a session's
     /// history lands).
     park_bottom: bool,
+    /// Sticky bottom ("live follow"): while true, new events keep the
+    /// viewport parked at the newest card. Released by a user scroll
+    /// UP (they're reading history); re-armed when they land back
+    /// within 80px of the bottom. Programmatic parks never clear it.
+    stick_to_bottom: bool,
     /// One-shot stall alarm already fired (DOM-lag gate retried 90
     /// frames without the For DOM catching up).
     stall_reported: bool,
@@ -397,6 +402,7 @@ pub fn init(state: AppState) {
             last_active: state.active_session.get_untracked(),
             fold_applied: false,
             park_bottom: false,
+            stick_to_bottom: true,
             stall_reported: false,
             deal_dbg_hist: Vec::new(),
             last_step_t: 0.0,
@@ -584,7 +590,7 @@ fn register_debug_hook(w: &web_sys::Window) {
                         .filter(|el| el.class_list().contains("compact"))
                         .count();
                     format!(
-                        "init=1 steps={} fold_applied={} compact={}/{} events={} cards={} pile_face={} pile_open={} kb_open={} summary={} park_bottom={} stall_reported={} active={:?} view={:?} last_panic={} dbg=[{}]",
+                        "init=1 steps={} fold_applied={} compact={}/{} events={} cards={} pile_face={} pile_open={} kb_open={} summary={} park_bottom={} stick={} stall_reported={} active={:?} view={:?} last_panic={} dbg=[{}]",
                         st.steps,
                         st.fold_applied,
                         compact,
@@ -596,6 +602,7 @@ fn register_debug_hook(w: &web_sys::Window) {
                         st.kb_open,
                         st.current_summary.is_some(),
                         st.park_bottom,
+                        st.stick_to_bottom,
                         st.stall_reported,
                         st.state.active_session.get_untracked().as_deref(),
                         st.last_view,
@@ -636,6 +643,9 @@ pub fn on_history_loaded() {
         let Some(st) = st.as_ref() else { return };
         let mut st = st.borrow_mut();
         st.park_bottom = true;
+        // Landing on the last message means we're at the bottom:
+        // follow the live feed from here.
+        st.stick_to_bottom = true;
     });
     on_change();
 }
@@ -894,23 +904,29 @@ fn step_scrolls(
     // Session change with a loaded stream: park at the last message.
     if active.clone() != st.last_active {
         st.last_active = active.clone();
+        // We are landing on the newest message: follow the live feed
+        // from here until the user scrolls up to read history.
+        st.stick_to_bottom = true;
         park_to_bottom(st, true);
     }
 
-    // Auto-scroll on new events while live, but ONLY if the user is
-    // already at (or near) the bottom.  Yanking a user who is reading
-    // mid-transcript — e.g. sitting at the summary card — to the very
-    // bottom on every new event is the "jump past the summary" bug.
+    // Auto-scroll on new events while live, but ONLY while the user
+    // is still following the live feed (`stick_to_bottom`).  Yanking
+    // a user who is reading mid-transcript — e.g. sitting at the
+    // summary card — to the very bottom on every new event is the
+    // "jump past the summary" bug.  The flag is released by a user
+    // scroll-up (sync_unfold) and re-armed when they land back at
+    // the bottom, so it stays true through content growth (which is
+    // exactly when we need it).
     let grew = events.len() > st.last_events_len;
     st.last_events_len = events.len();
-    if grew && view.is_none() && active.is_some() {
-        let near_bottom = st.transcript.as_ref().is_some_and(|t| {
-            let dist = t.scroll_height() as f64 - t.scroll_top() as f64 - t.client_height() as f64;
-            dist <= 80.0
-        });
-        if near_bottom {
-            park_to_bottom(st, false);
-        }
+    if grew && view.is_none() && active.is_some() && st.stick_to_bottom {
+        // Park WITH the 150 ms re-park: this branch may run in the
+        // DOM-lag gate, before Leptos has flushed the new card nodes,
+        // so the immediate park lands at the pre-flush bottom; the
+        // re-park (gated on stick_to_bottom) re-scrolls once the
+        // cards are in.
+        st.park_bottom = true;
     }
 
     // Park at the last message (session select → history just landed,
@@ -947,17 +963,29 @@ fn park_to_bottom(st: &mut PileState, repark: bool) {
     if repark {
         let t2 = t.clone();
         let to = gloo_timers::callback::Timeout::new(150, move || {
-            let _ = t2.style().set_property("scroll-behavior", "auto");
-            let _ = t2.set_scroll_top(t2.scroll_height());
-            // Record the position directly instead of corr_pending: a
-            // no-op re-park leaves no stale flag that would zero the
-            // user's next scroll delta.
-            with_pile(|cell| {
+            // Re-park only if the follow intent is still active: the
+            // user may have scrolled up to read during the 150 ms
+            // flush window, and yanking them back would be the
+            // "jump past the summary" bug in slow motion.
+            let still = with_pile(|cell| {
                 let s = cell.borrow();
-                if let Some(s) = s.as_ref() {
-                    s.borrow_mut().last_stop = t2.scroll_top() as f64;
-                }
+                s.as_ref()
+                    .map(|rc| rc.borrow().stick_to_bottom)
+                    .unwrap_or(false)
             });
+            if still {
+                let _ = t2.style().set_property("scroll-behavior", "auto");
+                let _ = t2.set_scroll_top(t2.scroll_height());
+                // Record the position directly instead of corr_pending: a
+                // no-op re-park leaves no stale flag that would zero the
+                // user's next scroll delta.
+                with_pile(|cell| {
+                    let s = cell.borrow();
+                    if let Some(s) = s.as_ref() {
+                        s.borrow_mut().last_stop = t2.scroll_top() as f64;
+                    }
+                });
+            }
         });
         LEAKED.with(|l| l.borrow_mut().push(Box::new(to)));
     }
@@ -1268,14 +1296,28 @@ fn sync_unfold(st: &mut PileState) {
         16.0
     };
     st.last_step_t = now_t;
+    let d = range - s_top; // distance to the transcript bottom
     let scroll_vel = if delta.abs() > 0.5 {
         // Real user scroll motion: stamp it so the commit stillness
         // gate (commit_fold) can defer commits mid-gesture.
         st.last_user_scroll_t = now_t;
+        // Sticky bottom: user motion that ends > 80px above the
+        // bottom releases the live follow (they're reading history).
+        // Gated on user motion so CONTENT GROWTH (d grows while
+        // delta ~ 0) never clears the flag — that is what keeps the
+        // viewport following a streaming loop card after card.
+        if d > 80.0 {
+            st.stick_to_bottom = false;
+        }
         delta.abs() / dt_ms
     } else {
         0.0
     };
+    // Re-arm the live follow whenever the viewport rests within 80px
+    // of the bottom: the user is watching the feed or just returned.
+    if d <= 80.0 {
+        st.stick_to_bottom = true;
+    }
     st.deal_dbg_hist.push(format!(
         "Δ={:.0} s_top={:.0}",
         delta, s_top
@@ -1283,8 +1325,6 @@ fn sync_unfold(st: &mut PileState) {
     if st.deal_dbg_hist.len() > 12 {
         st.deal_dbg_hist.remove(0);
     }
-
-    let d = range - s_top;
 
     // Auto-release a click-expanded pile once the user scrolls back
     // down to the bottom. A round that still fits stays expanded.
