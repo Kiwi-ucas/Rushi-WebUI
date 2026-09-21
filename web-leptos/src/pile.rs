@@ -54,6 +54,16 @@ const DECK_PEEK: f64 = 5.0;
 /// queue-still drift when a card folds: nat + FULL_ROW_MARGIN - COMPACT_ROW_H.
 const FULL_ROW_MARGIN: f64 = 12.0;
 
+/// How far BELOW the deck's bottom face the queue's top edge may sit.
+/// The top-edge cut line is `PILE_TOP + COMPACT_ROW_H + TOP_EDGE_GAP`:
+/// the topmost card's relief top edge lands this far below the deck
+/// face, leaving a clean gap in which its rounded top + inset
+/// highlight are visible (mirrors the bottom card's relief sitting
+/// above the input cut line, not flush against it). 12px = the
+/// design's card spacing (FULL_ROW_MARGIN); the deck's own drop
+/// shadow reaches ~6px below its face, so 12px clears it cleanly.
+const TOP_EDGE_GAP: f64 = 12.0;
+
 /// Velocity-matched in/out animation duration (ms).
 ///
 /// The fold/deal slide durations track the user's wheel speed: a fast
@@ -403,7 +413,7 @@ pub fn init(state: AppState) {
 
         // Build marker: name the running bundle so a stale cached
         // wasm/js is easy to spot (DevTools console).
-        let _ = js_sys::eval("console.log('[rushi-webui] build v0.5.0-topcut')");
+        let _ = js_sys::eval("console.log('[rushi-webui] build v0.5.1-topgap')");
 
         let mut ps = PileState {
             state,
@@ -1851,7 +1861,7 @@ fn sync_unfold(st: &mut PileState) {
     // Mirror of the bottom cut line (sync_shrink), which cuts the
     // bottom card at the input cut line with height + the #scroll-
     // spacer below absorbing the difference. Here the topmost idle
-    // full card is cut at the deck's bottom face the same way:
+    // full card is cut just below the deck's bottom face the same way:
     //   margin-top = m  pushes the box down so the complete relief
     //   top edge lands exactly on the cut line (the pile/queue
     //   boundary);
@@ -1862,7 +1872,12 @@ fn sync_unfold(st: &mut PileState) {
     // bottom's #scroll-spacer). The compact rows sit ABOVE this
     // card in the flow, so the pin never moves the deck rows' flow
     // positions and the gluing loop stays uncoupled.
-    let cut = PILE_TOP + COMPACT_ROW_H; // the deck's bottom face
+    // The top-edge cut line: deck bottom face + a visible gap. The
+    // card's relief top edge lands below the deck's drop shadow, so
+    // the rounded top + inset highlight read as a clear boundary
+    // between the pile and the queue (mirror of the bottom card's
+    // relief sitting above the input cut line, not flush against it).
+    let cut = PILE_TOP + COMPACT_ROW_H + TOP_EDGE_GAP;
     let target: Option<(HtmlElement, f64, usize)> = if show > 0 {
         match top_full {
             Some((el, slot_top, ci)) => {
@@ -1910,11 +1925,18 @@ fn sync_unfold(st: &mut PileState) {
         // hold while it is within 2 px below it, release clearly
         // below. No pin/release ping-pong at the boundary.
         if m > 0.5 || (pinned_now && m > -2.0) {
-            // Natural height from data-natH (set at render time),
-            // NOT the live offset_height: an already-pinned card
-            // reports its shrunk height, which would feed the
-            // shrink back on itself.
-            let nat = attr_nat_h(&el, COMPACT_ROW_H);
+            // Natural height: the batched live read for an
+            // unpinned card (its natural flow height); data-natH
+            // for the already-pinned one, whose live offset_height
+            // reports the shrunk box and would feed the shrink
+            // back on itself.
+            let nat = if pinned_now {
+                attr_nat_h(&el, COMPACT_ROW_H)
+            } else if card_h[ci] > 0.0 {
+                card_h[ci]
+            } else {
+                attr_nat_h(&el, COMPACT_ROW_H)
+            };
             // Write-skip: idle frames (stable scroll) leave the
             // card untouched; only a real m change rewrites the
             // inline styles and reflows the queue below it.
