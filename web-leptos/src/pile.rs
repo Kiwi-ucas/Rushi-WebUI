@@ -183,26 +183,16 @@ fn spring_step(sp: &mut CardSpring, target: f64, now_ms: f64) -> bool {
 /// write its per-frame `--deck-dy`; pinned layers' springs are
 /// advanced by the gluing loops, which own those elements' writes.
 /// A settled spring is retired and the element's transform released.
-/// Option A: when `cancel` is true (the user is actively scrolling),
-/// in-flight exit slides are cancelled instead: the card snaps to
-/// its flow position. Slides play only at rest, on the discrete
-/// deal moment.
-fn step_flow_springs(st: &mut PileState, now_ms: f64, cancel: bool) {
+/// Flow springs target 0 (the card's own flow position), so they
+/// cannot chase the scroll: the exit slide is one-shot, bounded by
+/// the spring's settle time. That is what keeps a slide from turning
+/// into a scroll-coupled drag.
+fn step_flow_springs(st: &mut PileState, now_ms: f64) {
     let mut i = 0;
     while i < st.springs.len() {
         let is_flow = !st.springs[i].to_slot;
         let el = st.springs[i].el.clone();
         if is_flow {
-            if cancel {
-                // Scrolling: no exit glide. Snap the card to its flow
-                // position and release the pin state immediately.
-                st.springs.remove(i);
-                let _ = el.class_list().remove_1("unfold-anim");
-                let _ = el.class_list().remove_1("deck-gliding");
-                let _ = el.style().remove_property("--deck-dy");
-                let _ = el.style().remove_property("z-index");
-                continue;
-            }
             let node: web_sys::Node = el.clone().unchecked_into();
             // Retired when detached or re-folded back into the deck
             // (the gluing loop re-pins it, so the flow spring is stale).
@@ -394,6 +384,10 @@ pub fn init(state: AppState) {
             }
             return;
         }
+
+        // Build marker: name the running bundle so a stale cached
+        // wasm/js is easy to spot (DevTools console).
+        let _ = js_sys::eval("console.log('[rushi-webui] build v0.4.2-pile')");
 
         let mut ps = PileState {
             state,
@@ -1113,11 +1107,10 @@ fn repin_layer(st: &mut PileState, le: &HtmlElement, r: i32, tr_top: f64, shift:
     } else {
         let _ = cls.remove_1("deck-top");
     }
-    // Option A (scroll-drag off): the enter cascade at commit keeps its
-    // spring — the commit is stillness-gated, so it only fires while
-    // the user is NOT scrolling. If a scroll starts mid-slide, the
-    // gluing loops cancel the in-flight spring and snap (see the
-    // `scrolling` gates in sync_unfold).
+    // The commit is stillness-gated, so this cascade only fires at
+    // rest: a one-shot enter animation. If a scroll starts mid-slide,
+    // the gluing loop retargets the in-flight spring to the live pin
+    // position; it settles quickly instead of chasing the scroll.
     if !st.reduced_motion {
         spring_adopt(st, le, true, start_dy, 0, now_ms, spring_omega(0.0));
         // Paint the start value now; the gluing loop takes over the
@@ -1272,8 +1265,8 @@ fn commit_fold(st: &mut PileState, el: &HtmlElement) {
                 // top silhouette). Not kept in st.deck_layers — the
                 // gluing loop never re-pins it; leave_deck's spring +
                 // timer release it. Commits are stillness-gated, so
-                // the glide plays at rest (scrolling flag is false).
-                leave_deck(st, le, now_ms, false);
+                // the glide plays at rest.
+                leave_deck(st, le, now_ms);
                 continue;
             }
             repin_layer(st, le, new_r, tr_top, shift, now_ms);
@@ -1315,11 +1308,11 @@ fn sync_unfold(st: &mut PileState) {
     // only user motion since the last observed position.
     let delta = s_top - st.last_stop;
     st.last_stop = s_top;
-    // Option A (scroll-drag off): while the user is actively scrolling,
-    // every slide spring is cancelled and the pinned deck snaps — the
-    // stack stays still. In/out slides play only at rest, on the
-    // discrete commit/deal moments.
-    let scrolling = delta.abs() > 0.5;
+    // Slide policy: enter/exit slides are one-shot event springs that
+    // play when the fold/deal happens (even mid-scroll) and settle
+    // within ~200 ms. Steady-state pinned rows snap to their target
+    // every frame, so the deck never chases the scroll between
+    // events — no "pile drags along" motion.
     // User scroll speed for this step (px/ms): feeds the
     // velocity-matched in/out durations (`inout_dur_ms`). A step after
     // a long idle clamps dt so stale motion reads as slow, not fast.
@@ -1440,10 +1433,11 @@ fn sync_unfold(st: &mut PileState) {
                 } else if slot_top > PILE_TOP + COMPACT_ROW_H + PILE_BAND {
                     let _ = cls.remove_1("folding");
                     let _ = cls.remove_1("fold-anim");
-                    // Option A (scroll-drag off): the cancel is itself
-                    // caused by user scroll, so it snaps instead of
-                    // gliding. At rest it may still glide.
-                    if !st.reduced_motion && !scrolling {
+                    // The cancel is the card's exit event: it glides
+                    // back even mid-scroll. The glide is one-shot and
+                    // bounded by the settle time, so it cannot chase
+                    // the scroll into a drag.
+                    if !st.reduced_motion {
                         // Glide the card back into the queue instead of
                         // teleporting: a Flow spring carries its current
                         // pin offset down to 0 while the deck-gliding
@@ -1514,11 +1508,12 @@ fn sync_unfold(st: &mut PileState) {
                     // r=0 target every frame and the spring settles
                     // the residual — an interrupted scroll retargets
                     // the glide instead of restarting an animation.
-                    // Option A (scroll-drag off): the enter slide only
-                    // plays at rest. While the user scrolls, the card
-                    // is pinned to the deck top without a glide; the
-                    // enter cascade plays at the commit moment instead.
-                    if !st.reduced_motion && !scrolling {
+                    // The enter slide plays even mid-scroll: it is the
+                    // card's enter animation. One-shot and bounded by
+                    // the settle time; after it settles, the gluing
+                    // loop snaps the row to its live pin target, so
+                    // the deck never chases the scroll.
+                    if !st.reduced_motion {
                         spring_adopt(st, el, true, 0.0, 0, now_t, spring_omega(scroll_vel));
                     } else {
                         spring_drop(st, el);
@@ -1611,32 +1606,22 @@ fn sync_unfold(st: &mut PileState) {
             let nat = el.offset_height() as f64;
             let _ = el.set_attribute("data-natH", &nat.to_string());
 
-            // Queue-still coupling: expanding this card pushes the
-            // content below down by (nat + FULL_ROW_MARGIN - COMPACT_ROW_H);
-            // in the scroll-driven single-deal case record a matching
-            // scroll shift (applied after pass 2) so the queue stays put
-            // while the card settles into its slot. Drain (click-open /
-            // at the very top) uses the top edge as its stable reference
-            // — no correction there.
-            let drift = nat + FULL_ROW_MARGIN - COMPACT_ROW_H;
-            let corr = if !drain && drift.abs() > 0.5 {
-                corr_target = Some(corr_target.unwrap_or(s_top) + drift);
-                drift
-            } else {
-                0.0
-            };
-
+            // No queue-still correction on the deal path: yanking the
+            // scroll down as the card expands is the "pile drags the
+            // scroll" motion. The content below shifts down naturally
+            // instead (the layout grows by the expansion).
+            //
             // The card was pinned at deck layer `from_end`; the
-            // peel-out slide starts at that pin and ends at the
-            // (corrected) flow slot, so it reads as the deck's front
-            // face sliding down out of the pile into the queue.
-            // (Inverted stack: layer `from_end` sits ABOVE the newest
-            // face, at PILE_TOP - from_end*PEEK.) Phase C: the slide
-            // is a Flow spring (--deck-dy decays deal_dy → 0), not
-            // the old CSS unfold-slide keyframe; the unfold-in clip
+            // peel-out slide starts at that pin and ends at the flow
+            // slot, so it reads as the deck's front face sliding down
+            // out of the pile into the queue. (Inverted stack: layer
+            // `from_end` sits ABOVE the newest face, at
+            // PILE_TOP - from_end*PEEK.) Phase C: the slide is a Flow
+            // spring (--deck-dy decays deal_dy → 0), one-shot and
+            // bounded by the settle time; the unfold-in clip
             // (velocity-matched via --inout-dur) runs in parallel.
             let deal_dy = if from_end < DECK_SHOW {
-                PILE_TOP - from_end as f64 * DECK_PEEK - (slot_top - corr)
+                PILE_TOP - from_end as f64 * DECK_PEEK - slot_top
             } else {
                 0.0
             };
@@ -1652,11 +1637,10 @@ fn sync_unfold(st: &mut PileState) {
             if delay_ms > 0 {
                 let _ = el.style().set_property("animation-delay", &format!("{delay_ms}ms"));
             }
-            // Option A (scroll-drag off): the exit slide plays only at
-            // rest. While the user scrolls, the card is dealt without
-            // the glide (clear_deck above already dropped the pin; the
-            // unfold-anim clip still plays in parallel).
-            if !st.reduced_motion && !scrolling {
+            // The exit slide plays even mid-scroll: it is the card's
+            // exit animation. One-shot and bounded by the settle time;
+            // a flow spring targets 0, so it cannot chase the scroll.
+            if !st.reduced_motion {
                 spring_adopt(st, el, false, deal_dy, delay_ms as u32, now_t, spring_omega(scroll_vel));
                 let _ = el.style().set_property("--deck-dy", &format!("{deal_dy:.0}px"));
             } else {
@@ -1678,8 +1662,12 @@ fn sync_unfold(st: &mut PileState) {
     }
 
     // ── Apply the recorded scroll correction (queue stillness) ─────
-    // A dock shrinks the content above the queue; a deal grows it.
-    // Shifting the viewport by the same delta keeps the queue STILL.
+    // Only click-collapse (pass 1) records a correction: collapsing
+    // the whole pile at once shrank the content above the queue, so
+    // shift the viewport to keep the queue still. The scroll-driven
+    // deal path intentionally does NOT record one — yanking the
+    // scroll mid-gesture was the "pile drags the scroll" motion; the
+    // content below now shifts naturally instead.
     // Done after pass 2 so all card mutations are in; the gluing
     // below and the next frame's delta account for the applied shift.
     if let Some(target) = corr_target {
@@ -1720,17 +1708,11 @@ fn sync_unfold(st: &mut PileState) {
         // frame; the rows' flow tops moved with it, so the pin
         // offset accounts for the post-correction position.
         let base_dy = glued_y - slot_top + scroll_shift;
-        if scrolling {
-            // Option A (scroll-drag off): while the user scrolls, the
-            // pinned deck stays still. Cancel any in-flight slide and
-            // snap the row to its pin target — no spring chase, no
-            // "pile drags along" motion.
-            spring_drop(st, el);
-            let _ = el.style().set_property("--deck-dy", &format!("{:.1}px", base_dy.round()));
-        } else if let Some(i) = spring_idx(st, el) {
-            // Phase C: an in-flight slide spring (the commit cascade or
-            // a retargeted deal exit) owns this row's transform until
-            // it settles; step it against this frame's pin target.
+        if let Some(i) = spring_idx(st, el) {
+            // Phase C: an in-flight slide spring (commit cascade, deal,
+            // cancel) owns this row's transform until it settles. The
+            // spring is one-shot and bounded by its settle time, so it
+            // plays the slide without ever chasing the scroll.
             let mut sp = st.springs[i].clone();
             let settled = spring_step(&mut sp, base_dy, now_t);
             let w = if settled { base_dy.round() } else { sp.x };
@@ -1741,11 +1723,9 @@ fn sync_unfold(st: &mut PileState) {
             }
             let _ = el.style().set_property("--deck-dy", &format!("{w:.1}px"));
         } else {
-            // Option A (scroll-drag off): a slot change (a card dealt
-            // out, a new face committed) snaps into its new slot. The
-            // old layer-shift spring made the pinned deck chase the
-            // scroll while the user scrolled — the "pile drags along"
-            // motion. Static pin value instead.
+            // Steady state: the static pin value, written every frame
+            // so the pinned deck sits still while the user scrolls
+            // (no spring, no chase, no "pile drags along" motion).
             let _ = el.style().set_property("--deck-dy", &format!("{:.1}px", base_dy.round()));
         }
         let _ = el.style().set_property("z-index", &format!("{}", (50 - r) as i32));
@@ -1767,13 +1747,7 @@ fn sync_unfold(st: &mut PileState) {
     // integrated here against the live pin target.
     for (el, slot_top) in &pending_slots {
         let base_dy = PILE_TOP - slot_top + scroll_shift;
-        if scrolling {
-            // Option A: the folding card snaps to the deck top while the
-            // user scrolls. Its enter slide plays at the commit moment
-            // (repin_layer) once the scroll settles.
-            spring_drop(st, el);
-            let _ = el.style().set_property("--deck-dy", &format!("{:.1}px", base_dy.round()));
-        } else if let Some(i) = spring_idx(st, el) {
+        if let Some(i) = spring_idx(st, el) {
             let mut sp = st.springs[i].clone();
             let settled = spring_step(&mut sp, base_dy, now_t);
             let w = if settled { base_dy.round() } else { sp.x };
@@ -1799,7 +1773,7 @@ fn sync_unfold(st: &mut PileState) {
     for (el, _r) in &prev_deck {
         if !new_deck.iter().any(|(e, _)| same_el(e, el)) {
             if compact.iter().any(|(e, _)| same_el(e, el)) {
-                leave_deck(st, el, now_t, scrolling);
+                leave_deck(st, el, now_t);
             } else if spring_idx(st, el).is_none() {
                 clear_deck(el);
             }
@@ -1809,9 +1783,10 @@ fn sync_unfold(st: &mut PileState) {
     // Phase C: integrate the flow-targeted springs (dealt cards,
     // leaving edges, cancelled folds) and keep the rAF loop alive
     // while any spring is still settling, even at rest (no scroll
-    // event to drive it). Option A: a scroll in progress cancels
-    // every in-flight exit glide (the cards snap to flow).
-    step_flow_springs(st, now_t, scrolling);
+    // event to drive it). Flow springs target the card's flow
+    // position (offset 0), so they settle and stop: they never
+    // chase the scroll.
+    step_flow_springs(st, now_t);
     if !st.springs.is_empty() {
         schedule_step_locked(st);
     }
@@ -1825,7 +1800,7 @@ fn sync_unfold(st: &mut PileState) {
 /// the edge has settled out of the deck; a re-promotion mid-cascade
 /// sheds the fade so the card reappears behind the cascade instead.
 /// Idempotent: an already-fading layer is owned by its watcher.
-fn leave_deck(st: &mut PileState, le: &HtmlElement, now_ms: f64, scrolling: bool) {
+fn leave_deck(st: &mut PileState, le: &HtmlElement, now_ms: f64) {
     let cls = le.class_list();
     if cls.contains("deck-leave") {
         return; // a leave watcher already owns this layer
@@ -1843,9 +1818,10 @@ fn leave_deck(st: &mut PileState, le: &HtmlElement, now_ms: f64, scrolling: bool
     // A Flow spring owns the transform; the gluing stale-cleanup
     // leaves it alone (it's no longer in the pin set), and the settle
     // path (step_flow_springs) releases the transform at flow.
-    // Option A (scroll-drag off): the glide plays only at rest; a
-    // scroll in progress snaps the edge to flow instead.
-    if !st.reduced_motion && !scrolling {
+    // The leave glide is the card's exit animation. It plays on any
+    // leave. One-shot and bounded; a flow spring targets 0, so it
+    // cannot chase the scroll into a drag.
+    if !st.reduced_motion {
         spring_adopt(st, le, false, old_dy, 0, now_ms, spring_omega(0.0));
         let _ = s.set_property("--deck-dy", &format!("{old_dy:.1}px"));
     } else {
