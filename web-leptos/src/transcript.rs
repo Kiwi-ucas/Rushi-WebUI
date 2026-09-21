@@ -60,10 +60,14 @@ pub fn Transcript(state: AppState) -> impl IntoView {
 }
 
 /// The in-progress assistant card: streamed thinking block (open) +
-/// streamed body text. Both children are reactive text nodes off the
-/// `live_reasoning` / `live_text` signals, so each delta updates the
-/// card in place. Plain text while streaming; the final card renders
-/// markdown once the `assistant_message` event lands.
+/// streamed body rendered as markdown at a 60fps budget. Both
+/// children are reactive off the `live_reasoning` / `live_text`
+/// signals, so each delta updates the card in place. The body is
+/// re-parsed on every delta (a `Memo` keyed on the text signal) and
+/// rendered with the SAME block renderer as the final card, so the
+/// live card and the final `assistant_message` card look identical —
+/// headings, lists and code blocks grow into place as the model
+/// writes, instead of showing raw pre-wrapped source.
 fn live_card_view(state: AppState) -> AnyView {
     let live_text = state.live_text;
     let live_reasoning = state.live_reasoning;
@@ -85,11 +89,67 @@ fn live_card_view(state: AppState) -> AnyView {
                 </details>
             </Show>
             <div class="ev-content ev-live-text">
-                { move || live_text.get() }
+                { live_md_view(live_text) }
             </div>
         </div>
     };
     v.into_any()
+}
+
+/// Reactively render a text signal as a `.md` tree on a 60fps budget.
+///
+/// The text is append-only, and a markdown block is FROZEN the moment
+/// it is delimited (blank line / closed fence) — later deltas can
+/// only grow the last, still-in-progress block. The render exploits
+/// that:
+///
+/// - `parsed` — a `Memo` re-parsing the WHOLE text on each delta.
+///   This is the only O(total-text) work per frame (fence regex
+///   scan + linear inline pass); comfortably sub-millisecond up to
+///   ~50KB, which is the whole streaming card.
+/// - stable `For` over blocks `0..n-1` with index keys and STATIC
+///   children: a child view is built ONCE when its block becomes
+///   stable and is never re-run (no per-delta re-render, no
+///   re-highlight of finished code blocks). A newly completed block
+///   adds exactly one new child.
+/// - one hot reactive view for block `n-1` (the growing tail), which
+///   re-runs on every delta.
+///
+/// When the text is cleared (final event lands) the memo is empty:
+/// the `For` unmounts its blocks, the `Show` hides the hot view, and
+/// the card itself is unmounted by the `Show` on `streaming`.
+fn live_md_view(text: RwSignal<String>) -> impl IntoView {
+    let parsed = Memo::new(move |_prev: Option<&Vec<md::MdBlock>>| {
+        md::parse_md(&text.get())
+    });
+    let stable = parsed;
+    let hot = parsed;
+    view! {
+        <div class="md">
+            <For
+                each=move || {
+                    let n = stable.get().len();
+                    all_card_indices(n.saturating_sub(1))
+                }
+                key=|&i| i
+                children=move |i| {
+                    // Built once per block, at the moment the block
+                    // becomes stable; its content is frozen, so the
+                    // static view never needs to re-run.
+                    md_block_view(&stable.get()[i])
+                }
+            />
+            <Show
+                when=move || !hot.get().is_empty()
+                fallback=|| ()
+            >
+                { move || {
+                    let blocks = hot.get();
+                    md_block_view(&blocks[blocks.len() - 1])
+                } }
+            </Show>
+        </div>
+    }
 }
 
 // ── single event card ─────────────────────────────────────────────

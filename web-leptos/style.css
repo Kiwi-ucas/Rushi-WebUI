@@ -398,7 +398,13 @@ button { font-weight: 700; }
 .dc-body { font-size: 14px; color: var(--text); line-height: 1.5; }
 .ns-danger { background: var(--danger); color: #fff; }
 
-.md h1, .md h2, .md h3 { margin: 10px 0 6px; }
+/* explicit type scale for .md content: without font-size/weight rules the
+   headings fall back to UA defaults (h1=2em, h2=1.5em, h3≈1.17em on the
+   14px body) — oversized, with no hierarchy. 18/16/14 ladder keeps the
+   compact feel; h2/h3 take the accent so sections read as structure. */
+.md h1 { font-size: 18px; font-weight: 800; color: var(--text); margin: 14px 0 6px; }
+.md h2 { font-size: 16px; font-weight: 700; color: var(--accent); margin: 12px 0 5px; }
+.md h3 { font-size: 14px; font-weight: 700; color: var(--accent); margin: 10px 0 4px; }
 .md p { margin: 4px 0; }
 .md ul, .md ol { margin: 4px 0; padding-left: 20px; }
 .md strong { font-weight: 700; }

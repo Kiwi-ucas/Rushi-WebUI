@@ -424,7 +424,12 @@ pub async fn tail_model_stream(path: PathBuf, tx: tokio::sync::mpsc::Sender<Stri
             }
         }
 
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // 60fps delivery cadence: the client renders each model_stream
+        // frame within one animation frame, so polling faster than the
+        // display refresh would only add wakeups without new frames.
+        // (The events.jsonl tail keeps its own 50ms cadence — final
+        // events don't need per-frame granularity.)
+        tokio::time::sleep(std::time::Duration::from_millis(16)).await;
     }
 }
 
