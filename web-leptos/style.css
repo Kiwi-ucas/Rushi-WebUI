@@ -53,6 +53,15 @@ body.kb-anim { transition: height 0.22s ease-out; }
 #app.sidebar-collapsed #sidebar { width: 0; min-width: 0; box-shadow: none; }
 #main { flex: 1; display: flex; flex-direction: column; overflow: hidden; position: relative; }
 #main::before { content: ''; position: absolute; top: var(--band-h); bottom: 0; left: 0; width: 14px; background: linear-gradient(to right, rgba(75, 70, 55, 0.16), rgba(75, 70, 55, 0)); /* keep the top-left corner zone as clean band surface, continuous with the sidebar top bar */ -webkit-mask-image: linear-gradient(to bottom, transparent 10px, black 30px); mask-image: linear-gradient(to bottom, transparent 10px, black 30px); pointer-events: none; z-index: 47; /* same z as the z47 deck layer but earlier in tree order, so the deck face still paints on top */ }
+/* Top-zone cover (v0.4.5): the strip between the header band and the
+   deck (transcript 0..PILE_TOP=28px, the zone above the topmost deck
+   row). Opaque rice, same top chrome as #transcript so it reads as the
+   band surface continuing down. z46 = above queue cards (z auto),
+   below the pinned deck rows (z47+) — it kills the card sliver that
+   used to scroll through the gap above the pile. This is NOT the
+   removed deck plate (that was 0..92, under the rows); it is only the
+   28px above the pile, continuous with the header. */
+#main::after { content: ''; position: absolute; top: var(--band-h); left: 0; right: 0; height: 28px; background: var(--bg); border-top-left-radius: 14px; box-shadow: inset 0 10px 14px -10px rgba(75, 70, 55, 0.30); z-index: 46; pointer-events: none; }
 button { font-weight: 700; }
 
 .sb-header { display: flex; align-items: center; justify-content: space-between; height: var(--band-h); padding: 0 16px; border-bottom: none; box-shadow: inset 0 -1px 0 var(--border); }

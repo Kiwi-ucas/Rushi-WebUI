@@ -398,7 +398,7 @@ pub fn init(state: AppState) {
 
         // Build marker: name the running bundle so a stale cached
         // wasm/js is easy to spot (DevTools console).
-        let _ = js_sys::eval("console.log('[rushi-webui] build v0.4.4-pile')");
+        let _ = js_sys::eval("console.log('[rushi-webui] build v0.4.5-top')");
 
         let mut ps = PileState {
             state,
