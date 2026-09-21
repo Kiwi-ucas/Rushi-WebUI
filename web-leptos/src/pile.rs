@@ -847,8 +847,9 @@ fn step_full(st: &mut PileState) {
             continue;
         }
         let _ = cls.remove_1("hid");
-        if el.has_attribute("data-isSum") {
-            // Exempt round summary: full card in the flow, never folds.
+        if fold_exempt(el) {
+            // Exempt round summary / assistant messages: full card in
+            // the flow, never folds.
             let _ = cls.remove_1("compact");
             let _ = cls.remove_1("folding");
             let _ = cls.remove_1("fold-anim");
@@ -998,6 +999,13 @@ fn clear_inline(el: &HtmlElement) {
     // stale speed-matched one).
     let _ = s.remove_property("--inout-dur");
     let _ = s.remove_property("z-index");
+}
+
+/// Cards that never fold into the pile: the round summary
+/// (`data-isSum`) plus every assistant message (`ev-assistant`) —
+/// both stay full cards in the flow, like the summary card.
+fn fold_exempt(el: &HtmlElement) -> bool {
+    el.has_attribute("data-isSum") || el.class_list().contains("ev-assistant")
 }
 
 fn add_compact(el: &HtmlElement) {
@@ -1314,9 +1322,10 @@ fn sync_unfold(st: &mut PileState) {
         if cls.contains("hid") {
             continue;
         }
-        if el.has_attribute("data-isSum") {
-            // An exempt summary: a full card in the flow — never
-            // folds, but its height still positions the cards below.
+        if fold_exempt(el) {
+            // An exempt card (round summary / assistant message): a
+            // full card in the flow — never folds, but its height
+            // still positions the cards below.
             let h = if el.offset_height() > 0 {
                 el.offset_height() as f64
             } else {
@@ -1996,7 +2005,7 @@ fn set_pile_open(st: &mut PileState, v: bool) {
         // has no scroll range to dock cards back one by one.
         for el in iter_cards(st) {
             let cls = el.class_list();
-            if cls.contains("hid") || el.has_attribute("data-isSum") {
+            if cls.contains("hid") || fold_exempt(&el) {
                 continue;
             }
             if st.current_summary.as_ref() == Some(&el) {

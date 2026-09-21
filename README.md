@@ -4,6 +4,11 @@ Web front-end for the rushi agent harness. Same Tier-2 position as
 `rushi-tui`: a replaceable view over the same event-sourced session
 log. The kernel, tools, and hooks are untouched.
 
+> **Local setup note (2026-09):** the TUI is no longer used here —
+> the WebUI is the primary front-end. The `rushi-tui` repo (with its
+> uncommitted changes) is left as-is and is not part of the build or
+> sync path. `sync.sh` and `run-webui.sh` never touch the TUI.
+
 ## Architecture
 
 ```

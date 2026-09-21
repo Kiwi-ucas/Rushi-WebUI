@@ -3,13 +3,35 @@
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use serde_json::json;
-use web_sys::{HtmlSelectElement, KeyboardEvent, MouseEvent};
+use web_sys::{KeyboardEvent, MouseEvent};
+use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 
 use crate::api;
 use crate::model::{compute_rounds, GoalView, AppState};
 use crate::timeutil;
 use crate::ws;
+
+/// Run `f` in a macrotask (setTimeout 0), i.e. after the current event
+/// dispatch has fully finished. Needed for closing menus / dialogs: this
+/// Chromium build drains microtasks *mid* event dispatch (between the
+/// target handler and the bubble listeners), so a `spawn_local`-deferred
+/// unmount can land mid-dispatch — the detached element's listeners then
+/// fire on freed wasm closures and throw "closure invoked after being
+/// dropped". A macrotask runs only after the dispatch is done.
+fn after_dispatch(f: impl FnOnce() + 'static) {
+    if let Some(w) = web_sys::window() {
+        let cb = Closure::once(f);
+        let f: &js_sys::Function = cb.as_js_value().unchecked_ref();
+        let _ = w.set_timeout_with_callback(f);
+        // Transfer ownership to the timer. Without forget(), the Rust
+        // handle's drop would unref the JS side and the callback could
+        // fire on freed state ("closure invoked after being dropped").
+        cb.forget();
+    } else {
+        f();
+    }
+}
 
 /// Context budget (tokens) shown by the context bar (port of ctxBudget).
 pub const CTX_BUDGET: u64 = 262_144;
@@ -54,22 +76,30 @@ pub fn select_session(state: AppState, name: &str) {
 }
 
 pub fn delete_session(state: AppState, name: &str) {
-    let active = state.active_session.get();
-    let _ = api::delete_session(name);
-    if active.as_deref() == Some(name) {
-        state.active_session.set(None);
-        state.events.set(Vec::new());
-        state.view_round.set(None);
-        state.ctx_used.set(0);
-        state.rounds_ctxk.set(Vec::new());
-        state.goal.set(None);
-        ws::close_current();
-        state.ws_status.set("disconnected".to_string());
-    }
+    let name_owned = name.to_string();
     let s2 = state;
     spawn_local(async move {
-        if let Ok(sessions) = api::load_sessions().await {
-            s2.sessions.set(sessions);
+        match api::delete_session(&name_owned).await {
+            Ok(()) => {
+                if s2.active_session.get().as_deref() == Some(name_owned.as_str()) {
+                    s2.active_session.set(None);
+                    s2.events.set(Vec::new());
+                    s2.view_round.set(None);
+                    s2.ctx_used.set(0);
+                    s2.rounds_ctxk.set(Vec::new());
+                    s2.goal.set(None);
+                    ws::close_current();
+                    s2.ws_status.set("disconnected".to_string());
+                }
+                if let Ok(sessions) = api::load_sessions().await {
+                    s2.sessions.set(sessions);
+                }
+            }
+            Err(e) => {
+                if let Some(w) = web_sys::window() {
+                    let _ = w.alert_with_message(&format!("delete failed: {e}"));
+                }
+            }
         }
     });
 }
@@ -117,15 +147,22 @@ pub fn start_loop(state: AppState) {
         return;
     };
     if ws::is_open() {
+        // The server's loop_status frame flips the flag once the spawn
+        // succeeds (or confirms an already-running loop).
         ws::send_command(&id, &json!({ "kind": "start" }));
     } else {
         let s = state;
         spawn_local(async move {
-            let _ = api::start_loop(&id).await;
-            s.loop_running.set(true);
+            match api::start_loop(&id).await {
+                Ok(()) => s.loop_running.set(true),
+                Err(e) => {
+                    if let Some(w) = web_sys::window() {
+                        let _ = w.alert_with_message(&format!("start failed: {e}"));
+                    }
+                }
+            }
         });
     }
-    state.loop_running.set(true);
 }
 
 pub fn stop_loop(state: AppState) {
@@ -133,7 +170,10 @@ pub fn stop_loop(state: AppState) {
     if ws::is_open() {
         ws::send_command(&id, &json!({ "kind": "stop" }));
     } else {
-        let _ = api::stop_loop(&id);
+        let _id = id.clone();
+        spawn_local(async move {
+            let _ = api::stop_loop(&_id).await;
+        });
     }
     state.loop_running.set(false);
 }
@@ -194,11 +234,20 @@ pub async fn do_send(state: AppState, content: String, queue: String) {
     spawn_local(async move {
         if !api::loop_running(&active3).await {
             if ws::is_open() {
+                // The server's loop_status frame flips the flag.
                 ws::send_command(&active3, &json!({ "kind": "start" }));
             } else {
-                let _ = api::start_loop(&active3).await;
+                match api::start_loop(&active3).await {
+                    Ok(()) => state3.loop_running.set(true),
+                    Err(e) => {
+                        if let Some(w) = web_sys::window() {
+                            let _ = w.alert_with_message(&format!(
+                                "start loop failed: {e}"
+                            ));
+                        }
+                    }
+                }
             }
-            state3.loop_running.set(true);
         }
     });
 }
@@ -336,7 +385,19 @@ pub fn Sidebar(state: AppState) -> impl IntoView {
                     </button>
                 </div>
                 <div id="status-bar">
-                    <span class=ws_dot_class>{ move || ws_status.get() }</span>
+                    <span class=ws_dot_class></span>
+                    { move || ws_status.get() }
+                    <Show when=move || active.get().is_some()>
+                        <span class="sb-loop">
+                            { move || {
+                                if loop_running.get() {
+                                    "loop running".to_string()
+                                } else {
+                                    "loop stopped".to_string()
+                                }
+                            } }
+                        </span>
+                    </Show>
                 </div>
             </div>
         </aside>
@@ -358,10 +419,18 @@ pub fn Sidebar(state: AppState) -> impl IntoView {
                             class="sess-menu-item"
                             on:click=move |_| {
                                 let name = menu_session.get().unwrap_or_default();
-                                menu_session.set(None);
-                                if !name.is_empty() {
-                                    rename_session(state, &name);
-                                }
+                                // Defer the close to a macrotask: this Chromium
+                                // build drains microtasks mid-dispatch, so a
+                                // spawn_local unmount would drop the menu's
+                                // stop-propagation closure before the bubble
+                                // phase finishes and throw "closure invoked
+                                // after being dropped".
+                                after_dispatch(move || {
+                                    if !name.is_empty() {
+                                        rename_session(state, &name);
+                                    }
+                                    menu_session.set(None);
+                                });
                             }
                         >
                             { "rename" }
@@ -370,17 +439,12 @@ pub fn Sidebar(state: AppState) -> impl IntoView {
                             class="sess-menu-item danger"
                             on:click=move |_| {
                                 let name = menu_session.get().unwrap_or_default();
-                                menu_session.set(None);
-                                if !name.is_empty()
-                                    && web_sys::window()
-                                        .and_then(|w| w.confirm_with_message(&format!(
-                                            "Delete session \"{}\" and all its data?",
-                                            name
-                                        )).ok())
-                                        .unwrap_or(false)
-                                {
-                                    delete_session(state, &name);
-                                }
+                                after_dispatch(move || {
+                                    if !name.is_empty() {
+                                        state.confirm_delete.set(Some(name));
+                                    }
+                                    menu_session.set(None);
+                                });
                             }
                         >
                             { "delete" }
@@ -727,7 +791,15 @@ pub fn NewSessionDialog(state: AppState) -> impl IntoView {
         }
     });
 
-    let close = move || open.set(None);
+    // Defer the close to a macrotask: a microtask can still land
+    // mid-dispatch (this Chromium build drains microtasks between the
+    // target handler and the bubble listeners), which would unmount
+    // the dialog while its own listeners are still on the propagation
+    // path and throw "closure invoked after being dropped".
+    let close = move || {
+        let open = open;
+        after_dispatch(move || open.set(None));
+    };
 
     let create = move || {
         let n = name.get().trim().to_string();
@@ -811,20 +883,131 @@ pub fn NewSessionDialog(state: AppState) -> impl IntoView {
     }
 }
 
+/// Delete-confirmation sub-window (in-app replacement for the native
+/// `window.confirm`): Some(name) opens the dialog for that session.
+/// Models the NewSessionDialog markup; the Delete action hands off to
+/// `delete_session` (which awaits the API call and surfaces errors).
+#[component]
+pub fn DeleteConfirmDialog(state: AppState) -> impl IntoView {
+    let open = state.confirm_delete;
+
+    // Same as NewSessionDialog: unmount on a macrotask, after the
+    // click has fully finished dispatching.
+    let close = move || {
+        let open = open;
+        after_dispatch(move || open.set(None));
+    };
+
+    let confirm = move |_| {
+        let name = open.get().unwrap_or_default();
+        let open = open;
+        after_dispatch(move || {
+            open.set(None);
+            if !name.is_empty() {
+                delete_session(state, &name);
+            }
+        });
+    };
+
+    view! {
+        <Show when=move || open.get().is_some() fallback=|| ()>
+            <div id="dc-backdrop" on:click=move |_| close()>
+                <div id="dc-dialog" on:click=move |e: MouseEvent| e.stop_propagation()>
+                    <div class="dc-title">{ "Delete Session" }</div>
+                    { move || open.get().map(|name| view! {
+                        <div class="dc-body">
+                            { format!("Delete session \"{name}\" and all its data? This cannot be undone.") }
+                        </div>
+                    }) }
+                    <div class="dc-actions">
+                        <button class="ns-btn ns-cancel" on:click=move |_| close()>{ "Cancel" }</button>
+                        <button class="ns-btn ns-danger" on:click=confirm>{ "Delete" }</button>
+                    </div>
+                </div>
+            </div>
+        </Show>
+    }
+}
+
 // ── input module (port of doSend / keydown) ───────────────────────
+/// One row of the queue-mode popup (direct / steer / follow). A
+/// raised-look option button: hover tucks it into the panel
+/// (groove), the active one gets an accent tick.
+fn qsel_opt(
+    value: String,
+    label: &'static str,
+    qsel_value: RwSignal<String>,
+    qsel_open: RwSignal<bool>,
+) -> impl IntoView {
+    let click_value = value.clone();
+    let selected = move || qsel_value.get() == value;
+    view! {
+        <button
+            class="qsel-opt"
+            aria-selected=selected
+            on:click=move |_| {
+                qsel_value.set(click_value.clone());
+                qsel_open.set(false);
+            }
+        >
+            <span class="qsel-tick">{"✓"}</span>
+            { label }
+        </button>
+    }
+}
+
 #[component]
 pub fn InputModule(state: AppState) -> impl IntoView {
     let msg = RwSignal::new(String::new());
+    // Queue-mode picker (direct/steer/follow). A custom popup instead
+    // of the native <select>: the OS-rendered dropdown list can't be
+    // themed, so the panel is our own DOM, styled with the same rice
+    // neumorphism as the rest of the chrome. `qsel_value` is "" for
+    // "direct"; the send paths read it instead of scraping the DOM.
+    let qsel_open = RwSignal::new(false);
+    let qsel_value = RwSignal::new(String::new());
+
 
     view! {
         <div id="input-module">
-            <StatusStrip state=state />
+            <StatusStrip state=state.clone() />
             <div id="input-area">
-                <select id="queue-select">
-                    <option value="">direct</option>
-                    <option value="steer">steer</option>
-                    <option value="follow">follow</option>
-                </select>
+                <div
+                    id="queue-select"
+                    class=move || if qsel_open.get() { "open".to_string() } else { String::new() }
+                >
+                    <button
+                        class="qsel-btn"
+                        on:click=move |_| qsel_open.update(|o| *o = !*o)
+                    >
+                        { move || if qsel_value.get().is_empty() {
+                            "direct".to_string()
+                        } else {
+                            qsel_value.get().clone()
+                        } }
+                        <span class="qsel-chev">{"▾"}</span>
+                    </button>
+                    <Show
+                        when=move || qsel_open.get()
+                        fallback=move || ()
+                    >
+                        {
+                            let qv = qsel_value.clone();
+                            let qo = qsel_open.clone();
+                            view! {
+                                <div
+                                    class="qsel-backdrop"
+                                    on:click=move |_| qo.set(false)
+                                />
+                                <div class="qsel-panel">
+                                    { qsel_opt(String::new(), "direct", qv.clone(), qo.clone()) }
+                                    { qsel_opt("steer".to_string(), "steer", qv.clone(), qo.clone()) }
+                                    { qsel_opt("follow".to_string(), "follow", qv, qo) }
+                                </div>
+                            }
+                        }
+                    </Show>
+                </div>
                 <textarea
                     id="msg-input"
                     placeholder="Send a message... (Ctrl+Enter to send)"
@@ -833,11 +1016,7 @@ pub fn InputModule(state: AppState) -> impl IntoView {
                     on:keydown=move |e: KeyboardEvent| {
                         if e.key() == "Enter" && (e.ctrl_key() || e.meta_key()) {
                             e.prevent_default();
-                            let q = web_sys::window()
-                                .and_then(|w| w.document())
-                                .and_then(|d| d.get_element_by_id("queue-select"))
-                                .and_then(|el| Some(el.unchecked_into::<HtmlSelectElement>().value()))
-                                .unwrap_or_default();
+                            let q = qsel_value.get().clone();
                             let text = msg.get();
                             msg.set(String::new());
                             let s = state;
@@ -850,11 +1029,7 @@ pub fn InputModule(state: AppState) -> impl IntoView {
                 <button
                     id="btn-send"
                     on:click=move |_| {
-                        let q = web_sys::window()
-                            .and_then(|w| w.document())
-                            .and_then(|d| d.get_element_by_id("queue-select"))
-                            .and_then(|el| Some(el.unchecked_into::<HtmlSelectElement>().value()))
-                            .unwrap_or_default();
+                        let q = qsel_value.get().clone();
                         let text = msg.get();
                         msg.set(String::new());
                         let s = state;

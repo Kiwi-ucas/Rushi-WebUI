@@ -76,6 +76,7 @@ fn App() -> impl IntoView {
                 <ui::InputModule state=state />
             </main>
             <ui::NewSessionDialog state=state />
+            <ui::DeleteConfirmDialog state=state />
         </div>
     }
 }

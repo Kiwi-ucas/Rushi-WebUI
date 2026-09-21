@@ -114,10 +114,11 @@ button { font-weight: 700; }
 #status-strip .chip { display: inline-flex; align-items: center; gap: 4px; border: none; background: var(--bg-elev); border-radius: 9px; padding: 2px 8px; box-shadow: var(--shadow); font-weight: 700; }
 #status-strip .chip .lbl { color: var(--text-muted); }
 #status-strip .chip .val { color: var(--text); }
-#status-bar { padding: 8px 10px; font-size: 12px; color: var(--text-muted); font-weight: 700; background: var(--bg); box-shadow: var(--shadow); border-top: 1px solid var(--border); }
-.ws-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--text-muted); margin-right: 4px; }
+#status-bar { padding: 8px 10px; font-size: 12px; color: var(--text-muted); font-weight: 700; background: var(--bg); box-shadow: var(--shadow); border-top: 1px solid var(--border); display: flex; align-items: center; gap: 6px; }
+.ws-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--text-muted); }
 .ws-dot.connected { background: var(--accent2); }
 .ws-dot.error { background: var(--danger); }
+.sb-loop { color: var(--text-muted); }
 
 #context-bar { height: var(--band-h); padding: 4px 16px 2px; border-bottom: none; box-shadow: inset 0 -1px 0 var(--border); font-size: 12px; font-weight: 700; color: var(--text-muted); display: flex; flex-direction: column; gap: 3px; }
 #ctx-row { display: flex; align-items: center; gap: 6px; flex: 1; min-height: 0; }
@@ -291,7 +292,62 @@ button { font-weight: 700; }
 .ev-ctx-exhausted { --card-bg: var(--error-bg); background: var(--error-bg); border-left: 3px solid var(--danger); }
 
 #input-area { display: flex; gap: 8px; align-items: stretch; }
-#queue-select { background: var(--bg-elev); color: var(--text-muted); border: 1px solid var(--border); border-radius: 6px; padding: 8px 6px; font-size: 13px; box-shadow: var(--groove); height: 40px; box-sizing: border-box; }
+/* queue-mode picker (direct/steer/follow). The native <select> is
+   replaced by a custom popup: the OS-rendered option list can't be
+   themed, so the panel is our own DOM in the same rice-neumorphic
+   chrome — a raised pill button, a floating panel with the warm
+   extruded shadow, options that sink into a groove on hover. */
+#queue-select { position: relative; flex: none; }
+#queue-select .qsel-btn {
+  width: 92px; height: 40px; box-sizing: border-box;
+  display: flex; align-items: center; justify-content: center; gap: 6px;
+  background: var(--bg-elev); color: var(--text-muted);
+  border: 1px solid var(--border); border-radius: 8px;
+  font: 600 13px/1 inherit; cursor: pointer;
+  /* the picker trigger stays extruded/raised in every state (same relief
+     language as the floating panel below) — only the free-text input box
+     uses the sunken groove */
+  box-shadow: var(--shadow);
+  transition: box-shadow .12s ease, color .12s ease;
+}
+#queue-select .qsel-btn:hover { box-shadow: var(--shadow-hover); color: var(--text); }
+#queue-select.open .qsel-btn { box-shadow: var(--shadow-hover); color: var(--accent); }
+.qsel-chev { font-size: 10px; color: var(--text-muted); transition: transform .15s ease; }
+#queue-select.open .qsel-chev { transform: rotate(180deg); }
+/* transparent full-viewport catcher; any click outside the panel
+   lands here and closes the popup (no document listeners needed) */
+.qsel-backdrop { position: fixed; inset: 0; z-index: 60; }
+/* two-layer relief: the panel is the base raised card (凸起); the option
+   pills inside are a second, raised layer on top (凸起 on 凸起) */
+.qsel-panel {
+  position: absolute; bottom: calc(100% + 8px); left: 0; z-index: 61;
+  min-width: 110px; padding: 8px;
+  display: flex; flex-direction: column; gap: 6px;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 10px;
+  box-shadow: var(--shadow-hover);
+  animation: qsel-pop .14s ease-out;
+}
+@keyframes qsel-pop {
+  from { opacity: 0; transform: translateY(4px) scale(0.98); }
+}
+.qsel-opt {
+  display: flex; align-items: center; gap: 8px;
+  padding: 7px 10px; border: none; border-radius: 7px;
+  /* each option is its own raised relief pill (凸起) — the whole picker
+     menu is raised throughout; only the free-text input box is sunken */
+  background: var(--bg-elev); color: var(--text-muted);
+  font: 500 13px/1 inherit; text-align: left; cursor: pointer;
+  box-shadow: var(--shadow);
+  transition: box-shadow .1s ease, color .1s ease;
+}
+.qsel-opt:hover { background: var(--bg-elev); box-shadow: var(--shadow-hover); color: var(--text); }
+.qsel-tick { width: 14px; visibility: hidden; color: var(--accent); font-size: 12px; }
+.qsel-opt[aria-selected] { color: var(--text); font-weight: 700; }
+.qsel-opt[aria-selected] .qsel-tick { visibility: visible; }
+@media (prefers-reduced-motion: reduce) {
+  .qsel-panel { animation: none; }
+  .qsel-chev { transition: none; }
+}
 #msg-input { flex: 1; background: var(--bg-elev); border: 1px solid var(--border); color: var(--text); border-radius: 8px; padding: 9px 12px; /* 14px = same as the message text (.ev-content); legacy 16px was an iOS auto-zoom threshold, superseded */ font-size: 14px; line-height: 21px; resize: none; height: 40px; box-sizing: border-box; overflow-y: auto; font-family: inherit; box-shadow: var(--groove); }
 #msg-input:focus { outline: none; border-color: var(--accent); }
 #btn-send { background: var(--accent); color: var(--bg); border: none; border-radius: 8px; padding: 10px 18px; cursor: pointer; font-size: 14px; font-weight: 600; box-shadow: var(--shadow); transition: box-shadow .12s ease, transform .12s ease; height: 40px; box-sizing: border-box; display: flex; align-items: center; }
@@ -319,6 +375,13 @@ button { font-weight: 700; }
 .ns-cancel { background: var(--bg-elev); color: var(--text); }
 .ns-create { background: var(--accent); color: #fff; }
 .ns-create:disabled { opacity: 0.6; cursor: default; }
+
+/* delete-session confirmation dialog */
+#dc-backdrop { position: fixed; inset: 0; background: rgba(75, 70, 55, 0.30); backdrop-filter: blur(2px); z-index: 300; display: flex; align-items: center; justify-content: center; }
+#dc-dialog { width: 380px; max-width: calc(100vw - 48px); background: var(--bg); border-radius: 14px; box-shadow: var(--shadow-hover); border: 1px solid var(--border); padding: 20px; display: flex; flex-direction: column; gap: 4px; }
+.dc-title { font-size: 17px; font-weight: 800; color: var(--text); margin-bottom: 6px; }
+.dc-body { font-size: 14px; color: var(--text); line-height: 1.5; }
+.ns-danger { background: var(--danger); color: #fff; }
 
 .md h1, .md h2, .md h3 { margin: 10px 0 6px; }
 .md p { margin: 4px 0; }

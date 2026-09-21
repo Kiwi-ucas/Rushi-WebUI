@@ -73,11 +73,13 @@ pub fn connect(state: &AppState, session: &str) {
     let ws_status = state.ws_status;
     let ctx_used = state.ctx_used;
     let rounds_ctxk = state.rounds_ctxk;
+    let loop_running = state.loop_running;
 
     let on_msg = {
         let events = events;
         let ctx_used = ctx_used;
         let rounds_ctxk = rounds_ctxk;
+        let loop_running = loop_running;
         Closure::wrap(Box::new(move |e: MessageEvent| {
             let data = match e.data().as_string() {
                 Some(d) => d,
@@ -221,6 +223,36 @@ pub fn connect(state: &AppState, session: &str) {
                         });
                         events.update(|old| old.push(ev));
                         crate::pile::on_change();
+                    }
+                    "loop_status" => {
+                        let running = item.get("running").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let exit = item.get("exit").and_then(|v| v.as_i64());
+                        let stopped = item.get("stopped").and_then(|v| v.as_bool()).unwrap_or(false);
+                        loop_running.set(running);
+                        // An unexpected death (non-zero exit or killed by a
+                        // signal, not our stop command) gets a card so the
+                        // user can see the loop died and where to look.
+                        let unexpected = !running
+                            && !stopped
+                            && match exit {
+                                Some(c) => c != 0,
+                                None => true,
+                            };
+                        if unexpected {
+                            let detail = match exit {
+                                Some(c) => format!("exit {c}"),
+                                None => "killed by signal".to_string(),
+                            };
+                            let ev = serde_json::json!({
+                                "type": "error",
+                                "ts": crate::timeutil::now_iso(),
+                                "message": format!(
+                                    "loop stopped unexpectedly ({detail}); check loop.stderr in the session folder"
+                                ),
+                            });
+                            events.update(|old| old.push(ev));
+                            crate::pile::on_change();
+                        }
                     }
                     _ => {}
                 }

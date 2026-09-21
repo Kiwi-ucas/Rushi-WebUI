@@ -106,6 +106,8 @@ pub struct AppState {
     pub pile_open: RwSignal<bool>,
     /// New-session dialog: Some(default_cwd) shows the modal.
     pub new_session_open: RwSignal<Option<String>>,
+    /// Delete-confirmation sub-window: Some(name) shows the dialog.
+    pub confirm_delete: RwSignal<Option<String>>,
 }
 
 impl AppState {
@@ -127,6 +129,7 @@ impl AppState {
             pile_top_brief: RwSignal::new(String::new()),
             pile_open: RwSignal::new(false),
             new_session_open: RwSignal::new(None),
+            confirm_delete: RwSignal::new(None),
         }
     }
 

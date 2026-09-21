@@ -348,10 +348,14 @@ async fn ws_session(socket: WebSocket, st: AppState, session: String) {
         sessions::tail_file(path, line_tx).await;
     });
 
+    // Loop-lifecycle channel: the server tells this client when the
+    // loop process for the session starts or dies.
+    let mut loop_rx = st.loops.subscribe();
+
     // 3. Inbound commands from the client:
     //    {"kind":"message","content":"...","queue":"steer|follow"}
     //    {"kind":"approval","id":"...","decision":"approve|deny"}
-    //    {"kind":"rewind","target_seq":N,"mode":"before|after"}
+    //    {"kind":"rewind","target_seq":N,"mode":"before|on"}
     //    {"kind":"start"}  /  {"kind":"stop"}
     let mut socket_dead = false;
     while !socket_dead {
@@ -364,6 +368,26 @@ async fn ws_session(socket: WebSocket, st: AppState, session: String) {
                     }
                 }
                 None => break, // watcher finished (connection to file lost)
+            },
+            ev = loop_rx.recv() => match ev {
+                Ok(e) if e.session == session => {
+                    let frame = serde_json::json!([
+                        {
+                            "kind": "loop_status",
+                            "running": e.running,
+                            "exit": e.exit,
+                            "stopped": e.stopped,
+                        }
+                    ]);
+                    if sock_tx.send(Message::text(frame.to_string())).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(_) => {} // event for another session
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(%n, "loop_status frames lagged for {session}");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
             },
             msg = sock_rx.next() => match msg {
                 Some(Ok(Message::Text(b))) => {
@@ -392,10 +416,23 @@ async fn ws_session(socket: WebSocket, st: AppState, session: String) {
                                 let _ = st.sessions.append_rewind(&session, target, mode).await;
                             }
                             "start" => {
-                                if let Err(e) = st.loops.start(&session).await {
-                                    let err = format!("[{{\"kind\":\"error\",\"message\":\"start failed: {e}\"}}]
+                                match st.loops.start(&session).await {
+                                    Ok(_) => {} // loop_status(true) went out via the broadcast
+                                    Err(e) => {
+                                        let msg = e.to_string();
+                                        if msg.contains("already running") {
+                                            // A loop is alive (tracked here or a stale pid) —
+                                            // confirm running instead of alarming the client.
+                                            let frame = serde_json::json!([
+                                                { "kind": "loop_status", "running": true }
+                                            ]);
+                                            let _ = sock_tx.send(Message::text(frame.to_string())).await;
+                                        } else {
+                                            let err = format!("[{{\"kind\":\"error\",\"message\":\"start failed: {msg}\"}}]
 ");
-                                    let _ = sock_tx.send(Message::text(err)).await;
+                                            let _ = sock_tx.send(Message::text(err)).await;
+                                        }
+                                    }
                                 }
                             }
                             "stop" => {
