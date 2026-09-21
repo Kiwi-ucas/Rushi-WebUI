@@ -256,6 +256,10 @@ struct PileState {
     last_stop: f64,
     /// Card currently height-shrunk at the cut line.
     shrunken_card: Option<HtmlElement>,
+    /// The card pinned at the TOP cut line: its complete relief top
+    /// edge is the pile/queue boundary (mirror of the bottom cut
+    /// line). None when nothing is pinned.
+    top_pin: Option<HtmlElement>,
     /// Summary card of the current view (never folds; the pile stops
     /// there).
     current_summary: Option<HtmlElement>,
@@ -394,7 +398,7 @@ pub fn init(state: AppState) {
 
         // Build marker: name the running bundle so a stale cached
         // wasm/js is easy to spot (DevTools console).
-        let _ = js_sys::eval("console.log('[rushi-webui] build v0.4.3-pile')");
+        let _ = js_sys::eval("console.log('[rushi-webui] build v0.4.4-pile')");
 
         let mut ps = PileState {
             state,
@@ -407,6 +411,7 @@ pub fn init(state: AppState) {
             pile_open: false,
             last_stop: 0.0,
             shrunken_card: None,
+            top_pin: None,
             current_summary: None,
             last_applied_summary: None,
             last_events_len: 0,
@@ -712,6 +717,10 @@ fn step_full(st: &mut PileState) {
         st.pile_face = None;
         set_pile_open_flag(st, false);
         st.shrunken_card = None;
+        if let Some(p) = st.top_pin.clone() {
+            release_top_pin(&p);
+        }
+        st.top_pin = None;
         st.current_summary = None;
         st.last_applied_summary = None;
         st.last_events_len = 0;
@@ -1403,6 +1412,9 @@ fn sync_unfold(st: &mut PileState) {
         .collect();
 
     // ── Pass 1 (forward): fold full cards, collect compact rows ───
+    // The queue's topmost idle full card: the top-edge cut-line
+    // target. Applied after pass 1 (the top-edge pin block below).
+    let mut top_full: Option<(HtmlElement, f64, usize)> = None; // (el, slot_top, ci)
     for (ci, el) in cards.iter().enumerate() {
         // Stop at the summary card: later cards are hidden and don't
         // participate in the pile geometry.
@@ -1431,7 +1443,18 @@ fn sync_unfold(st: &mut PileState) {
             folded.push((el.clone(), slot_top));
             y += COMPACT_ROW_H;
         } else {
-            // Full card in the queue.
+            // Full card in the queue. Record the topmost idle one:
+            // it is the top-edge cut-line candidate. Transient
+            // states (folding, in-flight slides, leave fades) are
+            // owned by other mechanisms, so skip them.
+            if top_full.is_none()
+                && !cls.contains("folding")
+                && !cls.contains("unfold-anim")
+                && !cls.contains("deck-gliding")
+                && !cls.contains("deck-leave")
+            {
+                top_full = Some((el.clone(), slot_top, ci));
+            }
             if cls.contains("folding") {
                 // A pending fold is in flight: the card stays full-height
                 // in the layout (the queue below stays put) until its
@@ -1817,6 +1840,74 @@ fn sync_unfold(st: &mut PileState) {
         }
     }
     st.deck_layers = new_deck;
+
+    // ── Top-edge cut line: the queue's top edge is a complete card ──
+    // Mirror of the bottom cut line (sync_shrink). When the deck is
+    // pinned, the topmost idle full card keeps its full relief TOP
+    // edge as the pile/queue boundary: instead of its top edge
+    // sliding up behind the pinned rows and being sliced, a
+    // transform shifts the card down so that edge lands exactly on
+    // the deck's bottom face. Transform-only — compositor work, no
+    // layout reflow, no scroll jump. The bottom overlap is covered
+    // by the next opaque card. A card fully behind the deck is
+    // hidden; the deck face is then the boundary.
+    let cut = PILE_TOP + COMPACT_ROW_H; // the deck's bottom face
+    let target: Option<(HtmlElement, f64, usize)> = if show > 0 {
+        match top_full {
+            Some((el, slot_top, ci)) => {
+                // Re-check: it may have gone pending-fold this frame
+                // (the gluing loop owns those).
+                let cls = el.class_list();
+                if cls.contains("folding") || cls.contains("fold-anim") {
+                    None
+                } else {
+                    Some((el, slot_top, ci))
+                }
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+    // Release a pin that is no longer the target.
+    if let Some(prev) = &st.top_pin {
+        let still = target
+            .as_ref()
+            .map_or(false, |(e, _, _)| same_el(e, prev));
+        if !still {
+            release_top_pin(prev);
+            st.top_pin = None;
+        }
+    }
+    if let Some((el, slot_top, ci)) = target {
+        let m = cut - slot_top + scroll_shift;
+        if m > 0.5 {
+            let nat = if card_h[ci] > 0.0 {
+                card_h[ci]
+            } else {
+                attr_nat_h(&el, COMPACT_ROW_H)
+            };
+            if nat - m > 4.0 {
+                // A slice of the card remains below the deck: shift it
+                // down; the complete top edge sits on the cut line.
+                let _ = el
+                    .style()
+                    .set_property("transform", &format!("translateY({m:.1}px)"));
+                let _ = el.style().remove_property("visibility");
+            } else {
+                // Fully behind the deck: the deck face is the
+                // boundary; hide the card.
+                let _ = el.style().set_property("visibility", "hidden");
+                let _ = el.style().remove_property("transform");
+            }
+            st.top_pin = Some(el.clone());
+        } else {
+            // Back below the deck: unpin.
+            release_top_pin(&el);
+            st.top_pin = None;
+        }
+    }
+
     // Phase C: integrate the flow-targeted springs (dealt cards,
     // leaving edges, cancelled folds) and keep the rAF loop alive
     // while any spring is still settling, even at rest (no scroll
@@ -1967,6 +2058,11 @@ fn sync_shrink(st: &mut PileState) {
         if el.class_list().contains("folding") {
             continue;
         }
+        // The top-edge pin owns this card's transform; the bottom
+        // shrink must not resize a card it is shifting.
+        if st.top_pin.as_ref().map(|p| same_el(p, el)).unwrap_or(false) {
+            continue;
+        }
         if el.get_bounding_client_rect().top() < cut - 1.0 {
             target = Some(el.clone());
             break;
@@ -2038,6 +2134,14 @@ fn release_shrink_card(card: &HtmlElement) {
     let _ = s.set_property("height", "");
     let _ = s.set_property("overflow", "");
     let _ = s.set_property("visibility", "");
+}
+
+/// Release a top-edge pin: clear the shift transform and the
+/// fully-hidden state set by the top-edge cut-line block.
+fn release_top_pin(el: &HtmlElement) {
+    let s = el.style();
+    let _ = s.remove_property("transform");
+    let _ = s.remove_property("visibility");
 }
 
 fn set_spacer_height(st: &PileState, h: f64) {
