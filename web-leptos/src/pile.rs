@@ -258,8 +258,13 @@ struct PileState {
     shrunken_card: Option<HtmlElement>,
     /// The card pinned at the TOP cut line: its complete relief top
     /// edge is the pile/queue boundary (mirror of the bottom cut
-    /// line). None when nothing is pinned.
-    top_pin: Option<HtmlElement>,
+    /// line, sync_shrink). Pinned via margin-top + reduced height:
+    /// the margin is the "spacer above" (mirrors the bottom
+    /// #scroll-spacer), the two cancel so total content height —
+    /// and the user's scroll position — stays constant.
+    /// `(el, last_m)`: last_m feeds the write-skip. None when
+    /// nothing is pinned.
+    top_pin: Option<(HtmlElement, f64)>,
     /// Summary card of the current view (never folds; the pile stops
     /// there).
     current_summary: Option<HtmlElement>,
@@ -398,7 +403,7 @@ pub fn init(state: AppState) {
 
         // Build marker: name the running bundle so a stale cached
         // wasm/js is easy to spot (DevTools console).
-        let _ = js_sys::eval("console.log('[rushi-webui] build v0.4.5-top')");
+        let _ = js_sys::eval("console.log('[rushi-webui] build v0.5.0-topcut')");
 
         let mut ps = PileState {
             state,
@@ -718,7 +723,7 @@ fn step_full(st: &mut PileState) {
         set_pile_open_flag(st, false);
         st.shrunken_card = None;
         if let Some(p) = st.top_pin.clone() {
-            release_top_pin(&p);
+            release_top_pin(&p.0);
         }
         st.top_pin = None;
         st.current_summary = None;
@@ -1054,6 +1059,7 @@ fn clear_inline(el: &HtmlElement) {
     let _ = s.set_property("height", "");
     let _ = s.set_property("overflow", "");
     let _ = s.set_property("transform", "");
+    let _ = s.set_property("margin-top", "");
     let _ = s.set_property("animation-delay", "");
     // A shrunk bottom card is hidden via inline `visibility`; a dealt
     // card must come back visible even if the shrink pass releases it
@@ -1842,23 +1848,37 @@ fn sync_unfold(st: &mut PileState) {
     st.deck_layers = new_deck;
 
     // ── Top-edge cut line: the queue's top edge is a complete card ──
-    // Mirror of the bottom cut line (sync_shrink). When the deck is
-    // pinned, the topmost idle full card keeps its full relief TOP
-    // edge as the pile/queue boundary: instead of its top edge
-    // sliding up behind the pinned rows and being sliced, a
-    // transform shifts the card down so that edge lands exactly on
-    // the deck's bottom face. Transform-only — compositor work, no
-    // layout reflow, no scroll jump. The bottom overlap is covered
-    // by the next opaque card. A card fully behind the deck is
-    // hidden; the deck face is then the boundary.
+    // Mirror of the bottom cut line (sync_shrink), which cuts the
+    // bottom card at the input cut line with height + the #scroll-
+    // spacer below absorbing the difference. Here the topmost idle
+    // full card is cut at the deck's bottom face the same way:
+    //   margin-top = m  pushes the box down so the complete relief
+    //   top edge lands exactly on the cut line (the pile/queue
+    //   boundary);
+    //   height     = nat - m keeps the bottom edge at its natural
+    //   spot, so margin and shrink cancel: total content height —
+    //   and the user's scroll position — stay constant.
+    // The margin-top IS the "spacer above" (the mirror of the
+    // bottom's #scroll-spacer). The compact rows sit ABOVE this
+    // card in the flow, so the pin never moves the deck rows' flow
+    // positions and the gluing loop stays uncoupled.
     let cut = PILE_TOP + COMPACT_ROW_H; // the deck's bottom face
     let target: Option<(HtmlElement, f64, usize)> = if show > 0 {
         match top_full {
             Some((el, slot_top, ci)) => {
-                // Re-check: it may have gone pending-fold this frame
-                // (the gluing loop owns those).
+                // Re-check transient states. Pending "folding" is
+                // deliberately kept pinned: the pin holds the card
+                // at the cut line through the 150 ms stillness
+                // window, so the queue's top edge never flickers;
+                // the commit (add_compact → clear_inline) drops the
+                // pin when the card joins the cascade. "fold-anim"
+                // is mid-spring (the gluing loop owns it), and a
+                // card owned by the bottom cut line (shrunken_card)
+                // is left alone.
                 let cls = el.class_list();
-                if cls.contains("folding") || cls.contains("fold-anim") {
+                if cls.contains("fold-anim")
+                    || st.shrunken_card.as_ref().map(|s| same_el(s, &el)).unwrap_or(false)
+                {
                     None
                 } else {
                     Some((el, slot_top, ci))
@@ -1873,36 +1893,58 @@ fn sync_unfold(st: &mut PileState) {
     if let Some(prev) = &st.top_pin {
         let still = target
             .as_ref()
-            .map_or(false, |(e, _, _)| same_el(e, prev));
+            .map_or(false, |(e, _, _)| same_el(e, &prev.0));
         if !still {
-            release_top_pin(prev);
+            release_top_pin(&prev.0);
             st.top_pin = None;
         }
     }
     if let Some((el, slot_top, ci)) = target {
         let m = cut - slot_top + scroll_shift;
-        if m > 0.5 {
-            let nat = if card_h[ci] > 0.0 {
-                card_h[ci]
-            } else {
-                attr_nat_h(&el, COMPACT_ROW_H)
-            };
-            if nat - m > 4.0 {
-                // A slice of the card remains below the deck: shift it
-                // down; the complete top edge sits on the cut line.
-                let _ = el
-                    .style()
-                    .set_property("transform", &format!("translateY({m:.1}px)"));
-                let _ = el.style().remove_property("visibility");
-            } else {
-                // Fully behind the deck: the deck face is the
-                // boundary; hide the card.
-                let _ = el.style().set_property("visibility", "hidden");
-                let _ = el.style().remove_property("transform");
+        let pinned_now = st
+            .top_pin
+            .as_ref()
+            .map(|p| same_el(&p.0, &el))
+            .unwrap_or(false);
+        // Hysteresis: engage when the top edge crosses the face,
+        // hold while it is within 2 px below it, release clearly
+        // below. No pin/release ping-pong at the boundary.
+        if m > 0.5 || (pinned_now && m > -2.0) {
+            // Natural height from data-natH (set at render time),
+            // NOT the live offset_height: an already-pinned card
+            // reports its shrunk height, which would feed the
+            // shrink back on itself.
+            let nat = attr_nat_h(&el, COMPACT_ROW_H);
+            // Write-skip: idle frames (stable scroll) leave the
+            // card untouched; only a real m change rewrites the
+            // inline styles and reflows the queue below it.
+            let last_m = st.top_pin.as_ref().map(|p| p.1).unwrap_or(f64::MIN);
+            if (m - last_m).abs() > 0.05 {
+                // push + height = nat always: the layout height the
+                // card contributes stays constant (height conservation).
+                let push = m.min(nat);
+                let h = (nat - m).max(0.0);
+                let s = el.style();
+                if nat - m > 4.0 {
+                    // A slice of the card remains below the deck:
+                    // cut at the cut line, relief top edge intact.
+                    let _ = s.set_property("margin-top", &format!("{push:.1}px"));
+                    let _ = s.set_property("height", &format!("{h:.1}px"));
+                    let _ = s.set_property("overflow", "hidden");
+                    let _ = s.remove_property("visibility");
+                } else {
+                    // Fully behind the deck: the deck face is the
+                    // boundary. Hide the card but keep its layout
+                    // height accounted for.
+                    let _ = s.set_property("margin-top", &format!("{push:.1}px"));
+                    let _ = s.set_property("height", &format!("{h:.1}px"));
+                    let _ = s.set_property("overflow", "hidden");
+                    let _ = s.set_property("visibility", "hidden");
+                }
+                st.top_pin = Some((el.clone(), m));
             }
-            st.top_pin = Some(el.clone());
-        } else {
-            // Back below the deck: unpin.
+        } else if pinned_now {
+            // Back below the deck face: unpin, restore natural height.
             release_top_pin(&el);
             st.top_pin = None;
         }
@@ -2060,7 +2102,7 @@ fn sync_shrink(st: &mut PileState) {
         }
         // The top-edge pin owns this card's transform; the bottom
         // shrink must not resize a card it is shifting.
-        if st.top_pin.as_ref().map(|p| same_el(p, el)).unwrap_or(false) {
+        if st.top_pin.as_ref().map(|p| same_el(&p.0, el)).unwrap_or(false) {
             continue;
         }
         if el.get_bounding_client_rect().top() < cut - 1.0 {
@@ -2140,8 +2182,11 @@ fn release_shrink_card(card: &HtmlElement) {
 /// fully-hidden state set by the top-edge cut-line block.
 fn release_top_pin(el: &HtmlElement) {
     let s = el.style();
-    let _ = s.remove_property("transform");
-    let _ = s.remove_property("visibility");
+    let _ = s.set_property("margin-top", "");
+    let _ = s.set_property("height", "");
+    let _ = s.set_property("overflow", "");
+    let _ = s.set_property("visibility", "");
+    let _ = s.remove_property("transform"); // legacy v0.4.4 residue
 }
 
 fn set_spacer_height(st: &PileState, h: f64) {
