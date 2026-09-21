@@ -348,6 +348,15 @@ async fn ws_session(socket: WebSocket, st: AppState, session: String) {
         sessions::tail_file(path, line_tx).await;
     });
 
+    // 2b. Model stream channel: tail the session's live `.model-stream`
+    // (the model subprocess writes one SSE delta JSON line per token)
+    // so the client can render the in-progress assistant card live.
+    let stream_path = st.sessions.session_dir(&session).join(".model-stream");
+    let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel::<String>(256);
+    let stream_watcher = tokio::spawn(async move {
+        sessions::tail_model_stream(stream_path, stream_tx).await;
+    });
+
     // Loop-lifecycle channel: the server tells this client when the
     // loop process for the session starts or dies.
     let mut loop_rx = st.loops.subscribe();
@@ -368,6 +377,20 @@ async fn ws_session(socket: WebSocket, st: AppState, session: String) {
                     }
                 }
                 None => break, // watcher finished (connection to file lost)
+            },
+            line = stream_rx.recv() => match line {
+                Some(l) => {
+                    // Live model delta (the `.model-stream` side channel).
+                    if sock_tx
+                        .send(Message::text(format!("[{{\"kind\":\"model_stream\",\"data\":{}}}]
+", l)))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                None => break, // stream watcher finished
             },
             ev = loop_rx.recv() => match ev {
                 Ok(e) if e.session == session => {
@@ -452,6 +475,7 @@ async fn ws_session(socket: WebSocket, st: AppState, session: String) {
     }
 
     watcher.abort();
+    stream_watcher.abort();
 }
 
 // ── Static frontend ────────────────────────────────────────────────

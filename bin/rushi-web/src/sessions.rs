@@ -300,7 +300,7 @@ pub struct SessionInfo {
 
 /// Tail `path` for new lines and forward them over `tx`.
 ///
-/// Polls the file every 200 ms; only complete (newline-terminated)
+/// Polls the file every 50 ms; only complete (newline-terminated)
 /// lines are emitted. If the file shrinks (truncated/rotated) the
 /// read offset resets to 0. Exits when the channel receiver is
 /// dropped (the WebSocket connection went away).
@@ -356,7 +356,75 @@ pub async fn tail_file(path: PathBuf, tx: tokio::sync::mpsc::Sender<String>) {
         }
         offset += consumed;
 
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// Tail the session-local model stream channel (`.model-stream`),
+/// which the model subprocess writes live SSE deltas into while a
+/// model call is in flight. The loop owns the file's lifecycle: it
+/// is created before each call and deleted after, so the file is
+/// absent most of the time.
+///
+/// Starts at the file's current end (a late connection must not
+/// replay an in-progress message's deltas; the final
+/// `assistant_message` event carries the full text anyway). A
+/// truncate (the next model call opens with `File::create`) resets
+/// the offset so the new call's deltas flow. Polls every 100 ms.
+pub async fn tail_model_stream(path: PathBuf, tx: tokio::sync::mpsc::Sender<String>) {
+    let mut offset: u64 = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    let mut partial: Vec<u8> = Vec::new();
+
+    loop {
+        match std::fs::metadata(&path) {
+            // No file: idle between model calls. A stale file left by
+            // a killed call is inert; the next call truncates it, which
+            // the truncate branch below detects.
+            Err(_) => {
+                offset = 0;
+                partial.clear();
+            }
+            Ok(m) => {
+                if m.len() < offset {
+                    offset = 0;
+                    partial.clear();
+                }
+                if let Ok(new_bytes) = std::fs::File::open(&path).and_then(|mut f| {
+                    if f.seek(SeekFrom::Start(offset)).is_err() {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    let mut b = Vec::new();
+                    f.read_to_end(&mut b)?;
+                    Ok(b)
+                }) {
+                    let mut buf = std::mem::take(&mut partial);
+                    buf.extend_from_slice(&new_bytes);
+                    let mut consumed: u64 = 0;
+                    let mut rest = buf.as_slice();
+                    loop {
+                        match rest.iter().position(|&b| b == b'\n') {
+                            Some(i) => {
+                                let line: String = String::from_utf8_lossy(&rest[..i]).into_owned();
+                                rest = &rest[i + 1..];
+                                consumed += i as u64 + 1;
+                                if !line.trim().is_empty()
+                                    && tx.send(line).await.is_err()
+                                {
+                                    return; // receiver gone
+                                }
+                            }
+                            None => {
+                                partial = rest.to_vec();
+                                break;
+                            }
+                        }
+                    }
+                    offset += consumed;
+                }
+            }
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
 

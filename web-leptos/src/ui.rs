@@ -62,6 +62,7 @@ pub fn select_session(state: AppState, name: &str) {
     state.rounds_ctxk.set(Vec::new());
     state.goal.set(None);
     state.menu_session.set(None);
+    state.clear_live();
 
     let s2 = state;
     let name2 = name.to_string();
@@ -88,6 +89,7 @@ pub fn delete_session(state: AppState, name: &str) {
                     s2.ctx_used.set(0);
                     s2.rounds_ctxk.set(Vec::new());
                     s2.goal.set(None);
+                    s2.clear_live();
                     ws::close_current();
                     s2.ws_status.set("disconnected".to_string());
                 }

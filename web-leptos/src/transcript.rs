@@ -43,9 +43,53 @@ pub fn Transcript(state: AppState) -> impl IntoView {
                     event_card_view(i, events, state)
                 }
             />
+            // Streaming card: the in-flight model call, rendered live
+            // off the `.model-stream` side channel. No `event` class
+            // token, so the pile engine's iter_cards ignores it; it
+            // rides in the flow at the bottom and is replaced by the
+            // final assistant_message card when that event lands.
+            <Show
+                when=move || state.streaming.get()
+                fallback=|| ()
+            >
+                { live_card_view(state) }
+            </Show>
             <div id="scroll-spacer" />
         </div>
     }
+}
+
+/// The in-progress assistant card: streamed thinking block (open) +
+/// streamed body text. Both children are reactive text nodes off the
+/// `live_reasoning` / `live_text` signals, so each delta updates the
+/// card in place. Plain text while streaming; the final card renders
+/// markdown once the `assistant_message` event lands.
+fn live_card_view(state: AppState) -> AnyView {
+    let live_text = state.live_text;
+    let live_reasoning = state.live_reasoning;
+    let v = view! {
+        <div class="ev-live enter">
+            <span class="ev-header">
+                <span class="ev-type">agent</span>
+                <span class="ev-running-dot" />
+            </span>
+            <Show
+                when=move || !live_reasoning.get().is_empty()
+                fallback=|| ()
+            >
+                <details class="ev-thinking" open>
+                    <summary>{ "thinking…" }</summary>
+                    <div class="ev-thinking-body">
+                        { move || live_reasoning.get() }
+                    </div>
+                </details>
+            </Show>
+            <div class="ev-content ev-live-text">
+                { move || live_text.get() }
+            </div>
+        </div>
+    };
+    v.into_any()
 }
 
 // ── single event card ─────────────────────────────────────────────
@@ -244,8 +288,21 @@ fn ev_body(ev: &Value, t: &str, state: AppState, events: RwSignal<Vec<Value>>) -
             } else {
                 view! { <div /> }.into_any()
             };
+            // Running marker: shown while the matching tool_result has
+            // not landed yet (ws.rs maintains tool_pending).
+            let cid = ev.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let pending = state.tool_pending;
+            let running = Memo::new(move |_prev: Option<&bool>| {
+                pending.with(|v| v.iter().any(|p| p == cid.as_str()))
+            });
+            let running_view: AnyView = view! {
+                <Show when=move || running.get() fallback=|| ()>
+                    <span class="ev-running">{ "running…" }</span>
+                </Show>
+            }
+            .into_any();
             let v = view! {
-                <div class="ev-tool-line">{ tool_line }</div>
+                <div class="ev-tool-line">{ tool_line } { running_view }</div>
                 { args_detail }
             };
             v.into_any()

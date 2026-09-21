@@ -189,6 +189,21 @@ button { font-weight: 700; }
    harmless: no fill-mode, base style is opacity 1 / transform none. */
 .event.enter { animation: fadeIn 0.15s ease-in; }
 @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+/* Streaming card: the in-flight model call, rendered live off the
+   .model-stream side channel. Mirrors the .event card chrome but carries
+   NO `.event` token, so the pile engine's iter_cards ignores it and the
+   fold/deal math is unaffected. Replaced by the final .ev-assistant card
+   when the assistant_message event lands. */
+.ev-live { position: relative; margin-bottom: 12px; border-radius: 8px; padding: 10px 14px; background: var(--card-bg, var(--bg-elev)); box-shadow: var(--shadow); border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
+.ev-live.enter { animation: fadeIn 0.15s ease-in; }
+.ev-live .ev-type::after { content: '… generating'; margin-left: 6px; color: var(--text-muted); }
+.ev-live .ev-content.ev-live-text { white-space: pre-wrap; font-family: inherit; }
+/* Running marker on a tool_call card while its tool_result has not
+   landed yet. A small pulsing dot reads as "in progress". */
+.ev-running { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 700; color: var(--text-muted); }
+.ev-running::before { content: ''; width: 7px; height: 7px; border-radius: 50%; background: var(--accent, #6cc); animation: ev-pulse 1.1s ease-in-out infinite; }
+@keyframes ev-pulse { 0%, 100% { opacity: 0.35; transform: scale(0.85); } 50% { opacity: 1; transform: scale(1); } }
+@media (prefers-reduced-motion: reduce) { .ev-live.enter { animation: none; } .ev-running::before { animation: none; opacity: 1; } }
 /* deal out of the pile — the mirror of the dock (pass 1): the card
    peels off when its flow slot has passed the deck's BOTTOM edge
    (PILE_TOP + COMPACT_ROW_H + PILE_BAND, pile.rs pass 2). The card

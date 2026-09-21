@@ -108,6 +108,21 @@ pub struct AppState {
     pub new_session_open: RwSignal<Option<String>>,
     /// Delete-confirmation sub-window: Some(name) shows the dialog.
     pub confirm_delete: RwSignal<Option<String>>,
+    /// Accumulated live text deltas of the in-flight model call
+    /// (`model_stream` frames). Rendered by the streaming card and
+    /// dropped when the final `assistant_message` event lands.
+    pub live_text: RwSignal<String>,
+    /// Accumulated live reasoning deltas of the in-flight call (the
+    /// streaming "thinking" block). Dropped with the final event.
+    pub live_reasoning: RwSignal<String>,
+    /// True while `model_stream` deltas are flowing (the streaming
+    /// card is visible and the pile follows it). Cleared when the
+    /// final `assistant_message` / `error` event lands, on history
+    /// reload, or on session switch.
+    pub streaming: RwSignal<bool>,
+    /// `tool_call` ids that have no `tool_result` yet: their cards
+    /// show a running state until the result event arrives.
+    pub tool_pending: RwSignal<Vec<String>>,
 }
 
 impl AppState {
@@ -130,7 +145,22 @@ impl AppState {
             pile_open: RwSignal::new(false),
             new_session_open: RwSignal::new(None),
             confirm_delete: RwSignal::new(None),
+            live_text: RwSignal::new(String::new()),
+            live_reasoning: RwSignal::new(String::new()),
+            streaming: RwSignal::new(false),
+            tool_pending: RwSignal::new(Vec::new()),
         }
+    }
+
+    /// Clear all live-stream state: the in-progress model call's
+    /// streamed text/reasoning, the streaming flag, and the
+    /// running tool-call set. Called on session switch, active
+    /// session deletion, and fresh WS connections.
+    pub fn clear_live(&self) {
+        self.live_text.set(String::new());
+        self.live_reasoning.set(String::new());
+        self.streaming.set(false);
+        self.tool_pending.set(Vec::new());
     }
 
     /// Index range of events to show for the current view_round

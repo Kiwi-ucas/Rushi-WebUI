@@ -76,7 +76,7 @@ pub fn highlight(src: &str) -> Vec<HlSeg> {
 }
 
 // ── markdown blocks ────────────────────────────────────────────────
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum MdBlock {
     H1(String),
     H2(String),
@@ -88,7 +88,7 @@ pub enum MdBlock {
     Code(String, String),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum MdInline {
     Text(String),
     Bold(String),
@@ -167,8 +167,13 @@ fn split_inline_blocks(src: &str, bullet: bool, ordered: bool) -> Vec<Vec<MdInli
                 let s = l.strip_prefix("- ").or_else(|| l.strip_prefix("* "));
                 s.map(|s| s.to_string())
             } else if ordered {
-                let s = l.split(". ").next();
-                s.map(|s| s.trim_start_matches(|c: char| c.is_ascii_digit()).trim().to_string())
+                // Port of the legacy `l.replace(/^\s*\d+\.\s+/, '')`: the
+                // item text is what FOLLOWS the `N.` marker. The line was
+                // validated to start with a digit run + ". ", so the first
+                // ". " occurrence is the marker itself — take everything
+                // after it (an earlier `split(". ").next()` returned the
+                // number, leaving every <li> empty).
+                l.find(". ").map(|p| l[p + 2..].trim_start().to_string())
             } else {
                 Some(l.to_string())
             };
@@ -228,10 +233,21 @@ fn text_blocks(text: &str) -> Vec<MdBlock> {
         // a block of consecutive list lines?
         let lines: Vec<&str> = para.lines().map(|l| l.trim()).collect();
         let all_bullet = !lines.is_empty() && lines.iter().all(|l| l.starts_with("- ") || l.starts_with("* "));
+        // Legacy guard: /^\s*\d+\.\s+/ — a digit run, a dot, THEN a
+        // space. A loose "starts with a digit" check would turn plain
+        // paragraphs like "3 items to check" into empty <ol>s.
         let all_ordered = !lines.is_empty()
             && lines
                 .iter()
-                .all(|l| l.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false));
+                .all(|l| {
+                    // Legacy marker /^\s*\d+\.\s+/ on an already-trimmed
+                    // line: a digit RUN, a dot, then a space. (strip_prefix
+                    // with a closure consumes only ONE char; trimming the
+                    // run first keeps multi-digit markers like "10." valid.)
+                    l.trim_start_matches(|c: char| c.is_ascii_digit())
+                        .strip_prefix('.')
+                        .is_some_and(|r| r.starts_with(' '))
+                });
         if all_bullet {
             out.push(MdBlock::Ul(split_inline_blocks(para, true, false)));
         } else if all_ordered {
@@ -348,4 +364,108 @@ pub fn normalize_event(ev: &mut serde_json::Value) -> serde_json::Value {
     }
     *ev = cur.clone();
     cur
+}
+
+// ── tests ───────────────────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The reported bug: ordered-list items rendered as empty <li>s
+    /// because the old split took the marker ("1") instead of the text.
+    #[test]
+    fn ordered_list_keeps_item_text() {
+        let blocks = parse_md("1. **first** item\n2. second\n3. third");
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            MdBlock::Ol(items) => {
+                assert_eq!(items.len(), 3);
+                assert_eq!(
+                    items[0],
+                    vec![MdInline::Bold("first".into()), MdInline::Text(" item".into())]
+                );
+                assert_eq!(items[1], vec![MdInline::Text("second".into())]);
+                assert_eq!(items[2], vec![MdInline::Text("third".into())]);
+            }
+            other => panic!("expected Ol, got {other:?}"),
+        }
+    }
+
+    /// A ". " inside an item must not truncate it (the marker is the
+    /// FIRST ". " only).
+    #[test]
+    fn ordered_item_keeps_inner_period_space() {
+        let blocks = parse_md("2. see docs. then run it");
+        match &blocks[0] {
+            MdBlock::Ol(items) => {
+                assert_eq!(items[0], vec![MdInline::Text("see docs. then run it".into())]);
+            }
+            other => panic!("expected Ol, got {other:?}"),
+        }
+    }
+
+    /// Multi-digit markers, indented lines.
+    #[test]
+    fn ordered_list_multidigit_indented() {
+        let blocks = parse_md("10. ten\n  11. eleven");
+        match &blocks[0] {
+            MdBlock::Ol(items) => {
+                assert_eq!(
+                    items.as_slice(),
+                    &[vec![MdInline::Text("ten".into())], vec![MdInline::Text("eleven".into())]]
+                );
+            }
+            other => panic!("expected Ol, got {other:?}"),
+        }
+    }
+
+    /// Plain text starting with a digit is NOT a list (legacy parity:
+    /// the marker needs a digit run + '.' + space on every line).
+    #[test]
+    fn digit_lead_paragraph_is_not_a_list() {
+        let blocks = parse_md("3 items to check");
+        assert_eq!(
+            blocks,
+            vec![MdBlock::Para(vec![MdInline::Text("3 items to check".into())])]
+        );
+    }
+
+    #[test]
+    fn digit_dot_no_space_is_not_a_list() {
+        let blocks = parse_md("1.2x is a number");
+        assert_eq!(
+            blocks,
+            vec![MdBlock::Para(vec![MdInline::Text("1.2x is a number".into())])]
+        );
+    }
+
+    /// Bullet lists still parse (regression guard for the shared
+    /// splitter).
+    #[test]
+    fn bullet_list_still_works() {
+        let blocks = parse_md("- a\n* b");
+        assert_eq!(
+            blocks,
+            vec![MdBlock::Ul(vec![
+                vec![MdInline::Text("a".into())],
+                vec![MdInline::Text("b".into())]
+            ])]
+        );
+    }
+
+    /// Ordered list and trailing paragraph split on the blank line.
+    #[test]
+    fn ordered_list_then_paragraph() {
+        let blocks = parse_md("1. one\n2. two\n\ntrailing text");
+        assert_eq!(
+            blocks,
+            vec![
+                MdBlock::Ol(vec![
+                    vec![MdInline::Text("one".into())],
+                    vec![MdInline::Text("two".into())]
+                ]),
+                MdBlock::Para(vec![MdInline::Text("trailing text".into())]),
+            ]
+        );
+    }
 }

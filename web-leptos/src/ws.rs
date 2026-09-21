@@ -43,9 +43,13 @@ pub fn close_current() {
 
 /// Open the session's socket. The server first replays full history
 /// (kind "history"), then streams each new events.jsonl line (kind
-/// "event"), plus out-of-band error lines (kind "error").
+/// "event") and each live model delta (kind "model_stream"), plus
+/// out-of-band error lines (kind "error").
 pub fn connect(state: &AppState, session: &str) {
     close_current();
+    // A fresh connection owns a fresh live-stream state: no stale
+    // streamed text, no phantom running tool cards.
+    state.clear_live();
 
     let w = match web_sys::window() {
         Some(w) => w,
@@ -74,12 +78,20 @@ pub fn connect(state: &AppState, session: &str) {
     let ctx_used = state.ctx_used;
     let rounds_ctxk = state.rounds_ctxk;
     let loop_running = state.loop_running;
+    let live_text = state.live_text;
+    let live_reasoning = state.live_reasoning;
+    let streaming = state.streaming;
+    let tool_pending = state.tool_pending;
 
     let on_msg = {
         let events = events;
         let ctx_used = ctx_used;
         let rounds_ctxk = rounds_ctxk;
         let loop_running = loop_running;
+        let live_text = live_text;
+        let live_reasoning = live_reasoning;
+        let streaming = streaming;
+        let tool_pending = tool_pending;
         Closure::wrap(Box::new(move |e: MessageEvent| {
             let data = match e.data().as_string() {
                 Some(d) => d,
@@ -125,6 +137,25 @@ pub fn connect(state: &AppState, session: &str) {
                         }
                         ctx_used.set(ctx);
                         rounds_ctxk.set(ctxk);
+                        // Rebuild the running tool-call set from history:
+                        // tool_call ids with no matching tool_result
+                        // (only survives when a loop died mid-tool).
+                        let pending: Vec<String> = normed
+                            .iter()
+                            .filter(|e| e.get("type").and_then(|t| t.as_str()) == Some("tool_call"))
+                            .filter_map(|e| e.get("id").and_then(|i| i.as_str()).map(String::from))
+                            .collect();
+                        let done: Vec<String> = normed
+                            .iter()
+                            .filter(|e| e.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+                            .filter_map(|e| e.get("id").and_then(|i| i.as_str()).map(String::from))
+                            .collect();
+                        tool_pending.set(
+                            pending
+                                .into_iter()
+                                .filter(|id| !done.iter().any(|d| d == id))
+                                .collect(),
+                        );
                         events.set(normed);
                         // Drive the pile engine directly (the Transcript
                         // effect is a second, redundant trigger): park
@@ -187,6 +218,31 @@ pub fn connect(state: &AppState, session: &str) {
                                 }
                             }
                         }
+                        // Live-stream bookkeeping: the canonical card
+                        // replaces the streamed one; tool ids move from
+                        // pending to resolved as their results land.
+                        match t {
+                            "assistant_message" | "error" => {
+                                live_text.set(String::new());
+                                live_reasoning.set(String::new());
+                                streaming.set(false);
+                            }
+                            "tool_call" => {
+                                if let Some(cid) = ev.get("id").and_then(|i| i.as_str()).map(String::from) {
+                                    tool_pending.update(|v| {
+                                        if !v.iter().any(|p| p == &cid) {
+                                            v.push(cid);
+                                        }
+                                    });
+                                }
+                            }
+                            "tool_result" => {
+                                if let Some(cid) = ev.get("id").and_then(|i| i.as_str()).map(String::from) {
+                                    tool_pending.update(|v| v.retain(|p| p != &cid));
+                                }
+                            }
+                            _ => {}
+                        }
                         events.update(move |old| {
                             // Replace our own optimistic card with the
                             // canonical server user_message echo (and
@@ -239,6 +295,12 @@ pub fn connect(state: &AppState, session: &str) {
                                 None => true,
                             };
                         if unexpected {
+                            // The loop died mid-model-call: drop any half-
+                            // streamed text so a stale "generating" card
+                            // does not sit next to the error card.
+                            live_text.set(String::new());
+                            live_reasoning.set(String::new());
+                            streaming.set(false);
                             let detail = match exit {
                                 Some(c) => format!("exit {c}"),
                                 None => "killed by signal".to_string(),
@@ -251,6 +313,38 @@ pub fn connect(state: &AppState, session: &str) {
                                 ),
                             });
                             events.update(|old| old.push(ev));
+                            crate::pile::on_change();
+                        }
+                    }
+                    "model_stream" => {
+                        // Live delta from the `.model-stream` side
+                        // channel: the server inlines the raw delta JSON
+                        // line (ModelDelta: text / reasoning /
+                        // tool_call_delta / done).
+                        let raw = item.get("data").cloned().unwrap_or(Value::Null);
+                        let dline = match raw {
+                            Value::String(s) => serde_json::from_str(&s).unwrap_or(Value::Null),
+                            v => v,
+                        };
+                        let dkind = dline.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+                        let delta = dline.get("delta").and_then(|d| d.as_str()).unwrap_or("");
+                        // Only text/reasoning deltas have a live target.
+                        // tool_call_delta and done carry no card of
+                        // their own; the final events do the work.
+                        if !delta.is_empty() {
+                            match dkind {
+                                "text" => {
+                                    live_text.update(|s| s.push_str(delta));
+                                    streaming.set(true);
+                                }
+                                "reasoning" => {
+                                    live_reasoning.update(|s| s.push_str(delta));
+                                    streaming.set(true);
+                                }
+                                _ => {}
+                            }
+                            // Let the pile follow the growing card
+                            // (rAF-throttled; a no-op if already parked).
                             crate::pile::on_change();
                         }
                     }

@@ -929,6 +929,20 @@ fn step_scrolls(
         st.park_bottom = true;
     }
 
+    // Live follow: while the in-flight model stream card is growing,
+    // keep the viewport parked at the bottom (same sticky flag, so a
+    // user reading history is never yanked). Re-park only when the
+    // growth has pushed the bottom more than 80px below the viewport;
+    // that bounds how often the 150 ms repark timers are armed.
+    if view.is_none() && active.is_some() && st.stick_to_bottom && st.state.streaming.get_untracked() {
+        if let Some(t) = &st.transcript {
+            let dist = t.scroll_height() as f64 - t.scroll_top() as f64 - t.client_height() as f64;
+            if dist > 80.0 {
+                st.park_bottom = true;
+            }
+        }
+    }
+
     // Park at the last message (session select → history just landed,
     // or a live event arrived while the user sat at the bottom).
     if st.park_bottom {
