@@ -241,8 +241,15 @@ struct PileState {
     /// The pile's top card (glued by transform).
     pile_face: Option<HtmlElement>,
     /// Cards currently pinned into the top deck (for clearing stale
-    /// pinning when the deck composition changes).
-    deck_layers: Vec<(HtmlElement, i32)>,
+    /// pinning when the deck composition changes). `(el, r, last_dy)`:
+    /// `last_dy` is the last `--deck-dy` written for the row, so the
+    /// gluing loop can skip re-writing an unchanged transform (the
+    /// rAF loop still runs on stream deltas at idle — rewriting a
+    /// static pin every frame was the low-FPS repaint cost).
+    deck_layers: Vec<(HtmlElement, i32, f64)>,
+    /// Cached transcript `padding-bottom` (px). `getComputedStyle`
+    /// forces a style recalc; the value is static, so read it once.
+    tr_pad_bottom: Option<f64>,
     /// Click-expanded override: deals every row regardless of scroll.
     pile_open: bool,
     /// Last observed scroll top (deal/dock are scroll-direction gated).
@@ -387,7 +394,7 @@ pub fn init(state: AppState) {
 
         // Build marker: name the running bundle so a stale cached
         // wasm/js is easy to spot (DevTools console).
-        let _ = js_sys::eval("console.log('[rushi-webui] build v0.4.2-pile')");
+        let _ = js_sys::eval("console.log('[rushi-webui] build v0.4.3-pile')");
 
         let mut ps = PileState {
             state,
@@ -396,6 +403,7 @@ pub fn init(state: AppState) {
             input_module,
             pile_face: None,
             deck_layers: Vec::new(),
+            tr_pad_bottom: None,
             pile_open: false,
             last_stop: 0.0,
             shrunken_card: None,
@@ -1251,8 +1259,8 @@ fn commit_fold(st: &mut PileState, el: &HtmlElement) {
         let tr_top = tr.get_bounding_client_rect().top();
         let now_ms = perf_now();
         let prev_deck = std::mem::take(&mut st.deck_layers);
-        let mut new_deck: Vec<(HtmlElement, i32)> = Vec::new();
-        for (le, r) in &prev_deck {
+        let mut new_deck: Vec<(HtmlElement, i32, f64)> = Vec::new();
+        for (le, r, _dy) in &prev_deck {
             if same_el(le, el) {
                 continue; // the committing card, pinned below as r=0
             }
@@ -1270,10 +1278,12 @@ fn commit_fold(st: &mut PileState, el: &HtmlElement) {
                 continue;
             }
             repin_layer(st, le, new_r, tr_top, shift, now_ms);
-            new_deck.push((le.clone(), new_r));
+            // f64::INFINITY = "no cached value yet": the gluing loop
+            // must write the pin value on its next frame.
+            new_deck.push((le.clone(), new_r, f64::INFINITY));
         }
         repin_layer(st, el, 0, tr_top, shift, now_ms);
-        new_deck.push((el.clone(), 0));
+        new_deck.push((el.clone(), 0, f64::INFINITY));
         st.deck_layers = new_deck;
         // This commit is driven by the settle watcher; retire the
         // card's watch entry (a collapse_all commit has none).
@@ -1382,9 +1392,18 @@ fn sync_unfold(st: &mut PileState) {
     let mut pending_slots: Vec<(HtmlElement, f64)> = Vec::new();
 
     let cards = iter_cards(st);
+    // Batch the natural-height reads up front: the old code read
+    // `offset_height` inside the write loop below (once per fold-exempt
+    // card), so every read after a class/attribute write forced a
+    // fresh reflow — that layout thrash is what made fast scrolls
+    // run at low FPS. One batched read pass costs a single reflow.
+    let card_h: Vec<f64> = cards
+        .iter()
+        .map(|el| el.offset_height() as f64)
+        .collect();
 
     // ── Pass 1 (forward): fold full cards, collect compact rows ───
-    for el in &cards {
+    for (ci, el) in cards.iter().enumerate() {
         // Stop at the summary card: later cards are hidden and don't
         // participate in the pile geometry.
         if st.current_summary.as_ref() == Some(el) {
@@ -1397,9 +1416,10 @@ fn sync_unfold(st: &mut PileState) {
         if fold_exempt(el) {
             // An exempt card (round summary / assistant message): a
             // full card in the flow — never folds, but its height
-            // still positions the cards below.
-            let h = if el.offset_height() > 0 {
-                el.offset_height() as f64
+            // still positions the cards below. Height from the
+            // pre-read batch above (single reflow, not per-card).
+            let h = if card_h[ci] > 0.0 {
+                card_h[ci]
             } else {
                 attr_nat_h(el, 52.0)
             };
@@ -1691,11 +1711,13 @@ fn sync_unfold(st: &mut PileState) {
         .filter(|(el, _)| el.class_list().contains("compact"))
         .collect();
     let show = if st.pile_open { 0 } else { compact.len().min(DECK_SHOW) };
-    // Previous frame's pinned layers (el, r): used to detect a layer
-    // shift (this row's r changed) and to release the pin of cards that
-    // left the deck this frame.
+    // Previous frame's pinned layers (el, r, last_dy): used to detect
+    // a layer shift and to release the pin of cards that left the deck
+    // this frame; last_dy lets us skip re-writing an unchanged
+    // transform (the rAF loop keeps running on stream deltas even at
+    // idle — rewriting static pins every frame was the low-FPS cost).
     let prev_deck = std::mem::take(&mut st.deck_layers);
-    let mut new_deck: Vec<(HtmlElement, i32)> = Vec::new();
+    let mut new_deck: Vec<(HtmlElement, i32, f64)> = Vec::new();
     for r in 0..show {
         // r=0 is the newest folded row: the readable face, the LOWEST
         // of the inverted cascade. Older layers (r>0) sit ABOVE it,
@@ -1708,7 +1730,7 @@ fn sync_unfold(st: &mut PileState) {
         // frame; the rows' flow tops moved with it, so the pin
         // offset accounts for the post-correction position.
         let base_dy = glued_y - slot_top + scroll_shift;
-        if let Some(i) = spring_idx(st, el) {
+        let w = if let Some(i) = spring_idx(st, el) {
             // Phase C: an in-flight slide spring (commit cascade, deal,
             // cancel) owns this row's transform until it settles. The
             // spring is one-shot and bounded by its settle time, so it
@@ -1721,14 +1743,28 @@ fn sync_unfold(st: &mut PileState) {
             } else {
                 st.springs[i] = sp;
             }
-            let _ = el.style().set_property("--deck-dy", &format!("{w:.1}px"));
+            w
         } else {
-            // Steady state: the static pin value, written every frame
-            // so the pinned deck sits still while the user scrolls
-            // (no spring, no chase, no "pile drags along" motion).
-            let _ = el.style().set_property("--deck-dy", &format!("{:.1}px", base_dy.round()));
+            // Steady state: the static pin value — the pinned deck sits
+            // still while the user scrolls (no spring, no chase, no
+            // "pile drags along" motion).
+            base_dy.round()
+        };
+        // Write the transform only when it actually changed (>0.05 px,
+        // sub-pixel). An unchanged re-write still forces a style
+        // recalc on the row — that is what made idle frames cost a
+        // full layout pass each one.
+        let (prev_dy, prev_r) = prev_deck
+            .iter()
+            .find(|(e, _, _)| same_el(e, el))
+            .map(|(_, pr, pd)| (*pd, *pr))
+            .unwrap_or((f64::INFINITY, -1));
+        if (w - prev_dy).abs() > 0.05 {
+            let _ = el.style().set_property("--deck-dy", &format!("{w:.1}px"));
         }
-        let _ = el.style().set_property("z-index", &format!("{}", (50 - r) as i32));
+        if r as i32 != prev_r {
+            let _ = el.style().set_property("z-index", &format!("{}", (50 - r) as i32));
+        }
         let cls = el.class_list();
         let _ = cls.add_1("deck-layer");
         if r == 0 {
@@ -1736,7 +1772,7 @@ fn sync_unfold(st: &mut PileState) {
         } else {
             let _ = cls.remove_1("deck-top");
         }
-        new_deck.push((el.clone(), r as i32));
+        new_deck.push((el.clone(), r as i32, w));
     }
     // Cards mid-fold (still full-height, clipped): pin each at the
     // r=0 slot (deck top, z 51 — above the deck's 50) so the card
@@ -1762,7 +1798,8 @@ fn sync_unfold(st: &mut PileState) {
         }
         let _ = el.style().set_property("z-index", "51");
         let _ = el.class_list().add_1("deck-layer");
-        new_deck.push((el.clone(), 0));
+        // f64::INFINITY: no cached value — the next frame writes it.
+        new_deck.push((el.clone(), 0, f64::INFINITY));
     }
     // Clear pinning from cards that left the deck. A compact row
     // pushed off the visible 4-layer stack glides back to its flow
@@ -1770,8 +1807,8 @@ fn sync_unfold(st: &mut PileState) {
     // instead of vanishing mid-cascade; anything else clears.
     // A card with a live flow spring (a dealt / leaving edge) is
     // left alone — its settle path or leave timer releases it.
-    for (el, _r) in &prev_deck {
-        if !new_deck.iter().any(|(e, _)| same_el(e, el)) {
+    for (el, _r, _dy) in &prev_deck {
+        if !new_deck.iter().any(|(e, _, _)| same_el(e, el)) {
             if compact.iter().any(|(e, _)| same_el(e, el)) {
                 leave_deck(st, el, now_t);
             } else if spring_idx(st, el).is_none() {
@@ -1852,7 +1889,7 @@ fn leave_deck(st: &mut PileState, le: &HtmlElement, now_ms: f64) {
 /// card is visible again and the gluing owns its pin; detached →
 /// retire.
 fn watch_deck_leave(st: &mut PileState, el: &HtmlElement) {
-    if st.deck_layers.iter().any(|(e, _)| same_el(e, el)) {
+    if st.deck_layers.iter().any(|(e, _, _)| same_el(e, el)) {
         // Re-promoted: visible again, gluing owns the pin from here.
         let _ = el.class_list().remove_1("deck-leave");
         spring_drop(st, el);
@@ -1899,12 +1936,23 @@ fn sync_shrink(st: &mut PileState) {
     // visible — identical to the parked-at-rest look — instead of the
     // shadow being sliced at the container's bottom edge.
     let rect = tr.get_bounding_client_rect();
-    let pad_bottom = web_sys::window()
-        .and_then(|w| w.get_computed_style(tr).ok())
-        .flatten()
-        .and_then(|cs| cs.get_property_value("padding-bottom").ok())
-        .and_then(|s| s.trim_end_matches("px").parse::<f64>().ok())
-        .unwrap_or(0.0);
+    // The transcript's padding-bottom is static: read the computed
+    // style once and cache it. `getComputedStyle` forces a style
+    // recalc; calling it every frame was the biggest layout cost in
+    // the low-FPS drag.
+    let pad_bottom = match st.tr_pad_bottom {
+        Some(v) => v,
+        None => {
+            let v = web_sys::window()
+                .and_then(|w| w.get_computed_style(tr).ok())
+                .flatten()
+                .and_then(|cs| cs.get_property_value("padding-bottom").ok())
+                .and_then(|s| s.trim_end_matches("px").parse::<f64>().ok())
+                .unwrap_or(0.0);
+            st.tr_pad_bottom = Some(v);
+            v
+        }
+    };
     let cut = rect.bottom() - pad_bottom;
 
     // Bottom-most card whose top is above the cut line (it straddles

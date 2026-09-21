@@ -32,9 +32,10 @@
   --shadow-side: 2px 0 6px rgba(75, 70, 55, 0.14), 2px 0 2px rgba(75, 70, 55, 0.08), inset 0 1px 0 rgba(255, 255, 255, 0.40);
   --groove: inset 0 1px 2px rgba(75, 70, 55, 0.20), inset 0 -1px 0 rgba(255, 255, 255, 0.50);
   --band-h: 46px;
-  /* Deck plate height = PILE_TOP(28) + COMPACT_ROW_H(64): the queue's
-     effective top truncation is the deck's BOTTOM face, not the band. */
-  --deck-h: 92px;
+  /* v0.4.3: the opaque deck plate under the pinned pile is gone
+     (--deck-h removed). The pile's boundary is now the top edge of
+     the first full card in the queue — the assistant card, which
+     keeps its full raised-card relief (.ev-assistant). */
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; padding: 0; height: 100%; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 14px; }
@@ -51,16 +52,7 @@ body.kb-anim { transition: height 0.22s ease-out; }
 #sidebar-inner { width: 240px; flex: 1; min-height: 0; display: flex; flex-direction: column; overflow-y: auto; }
 #app.sidebar-collapsed #sidebar { width: 0; min-width: 0; box-shadow: none; }
 #main { flex: 1; display: flex; flex-direction: column; overflow: hidden; position: relative; }
-#main::before { content: ''; position: absolute; top: var(--band-h); bottom: 0; left: 0; width: 14px; background: linear-gradient(to right, rgba(75, 70, 55, 0.16), rgba(75, 70, 55, 0)); /* keep the top-left corner zone as clean band surface, continuous with the sidebar top bar */ -webkit-mask-image: linear-gradient(to bottom, transparent 10px, black 30px); mask-image: linear-gradient(to bottom, transparent 10px, black 30px); pointer-events: none; z-index: 47; /* above the deck plate (z46); same z as z47 deck layer but earlier in tree order, so the deck face still paints on top */ }
-/* Deck plate: an opaque strip behind the pinned deck (z 46, just below
-   the deck layers at 47–51, above all queue cards at z auto) spanning
-   the transcript's top var(--deck-h)px. The message queue's top
-   truncation is therefore the deck's BOTTOM face: a rising full card
-   disappears under the deck stack (it will fold into it) instead of
-   being hard-clipped at the main-interface top edge. Same color as
-   --bg and the same inset top shadow + corner radius as #transcript,
-   so it reads as the clean band surface. */
-#main::after { content: ''; position: absolute; top: var(--band-h); left: 0; right: 0; height: var(--deck-h); background: var(--bg); border-top-left-radius: 14px; box-shadow: inset 0 10px 14px -10px rgba(75, 70, 55, 0.30); z-index: 46; pointer-events: none; }
+#main::before { content: ''; position: absolute; top: var(--band-h); bottom: 0; left: 0; width: 14px; background: linear-gradient(to right, rgba(75, 70, 55, 0.16), rgba(75, 70, 55, 0)); /* keep the top-left corner zone as clean band surface, continuous with the sidebar top bar */ -webkit-mask-image: linear-gradient(to bottom, transparent 10px, black 30px); mask-image: linear-gradient(to bottom, transparent 10px, black 30px); pointer-events: none; z-index: 47; /* same z as the z47 deck layer but earlier in tree order, so the deck face still paints on top */ }
 button { font-weight: 700; }
 
 .sb-header { display: flex; align-items: center; justify-content: space-between; height: var(--band-h); padding: 0 16px; border-bottom: none; box-shadow: inset 0 -1px 0 var(--border); }
@@ -259,7 +251,14 @@ button { font-weight: 700; }
 
 .ev-user { --card-bg: var(--user-bg); background: var(--user-bg); border-left: 3px solid var(--accent); }
 .ev-user .ev-badge { font-size: 11px; color: var(--accent); text-transform: uppercase; margin-bottom: 4px; }
-.ev-assistant { --card-bg: var(--assistant-bg); background: var(--assistant-bg); }
+/* Pile/queue boundary: the assistant card's TOP edge is treated
+   exactly like its bottom edge — 1px border + the same raised
+   (relief) shadow — so the card always reads as a COMPLETE card
+   even when it is the first full card under the pinned pile. With
+   the opaque deck plate gone (v0.4.3), this top edge is the visual
+   divider between the pile and the card below it: no white base
+   under the stack, just the card's own raised edge. */
+.ev-assistant { --card-bg: var(--assistant-bg); background: var(--assistant-bg); border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); box-shadow: var(--shadow); }
 .ev-tool-call { --card-bg: var(--tool-bg); background: var(--tool-bg); border-left: 3px solid var(--warn); padding: 6px 12px; }
 .ev-tool-result { --card-bg: var(--tool-bg); background: var(--tool-bg); border-left: 3px solid var(--accent2); padding: 6px 12px; }
 .ev-tool-call .ev-header, .ev-tool-result .ev-header { margin-bottom: 2px; }
