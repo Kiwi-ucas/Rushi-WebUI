@@ -413,7 +413,7 @@ pub fn init(state: AppState) {
 
         // Build marker: name the running bundle so a stale cached
         // wasm/js is easy to spot (DevTools console).
-        let _ = js_sys::eval("console.log('[rushi-webui] build v0.5.1-topgap')");
+        let _ = js_sys::eval("console.log('[rushi-webui] build v0.5.2-toprelief')");
 
         let mut ps = PileState {
             state,
@@ -1075,6 +1075,9 @@ fn clear_inline(el: &HtmlElement) {
     // card must come back visible even if the shrink pass releases it
     // later.
     let _ = s.set_property("visibility", "");
+    // A top-pinned card carries an inline upward relief shadow (see
+    // the top-edge cut line); a dealt/folded card must shed it.
+    let _ = s.set_property("box-shadow", "");
     let _ = s.remove_property("--deal-dy");
     let _ = s.remove_property("--fold-dy");
     // Velocity-matched in/out duration (a dealt card re-joining the
@@ -1950,10 +1953,21 @@ fn sync_unfold(st: &mut PileState) {
                 if nat - m > 4.0 {
                     // A slice of the card remains below the deck:
                     // cut at the cut line, relief top edge intact.
+                    // The card's own --shadow casts downward only,
+                    // so its top edge has no visible relief of its
+                    // own. Add an upward drop shadow (mirroring the
+                    // bottom edge's downward shadow into the input
+                    // padding) so the rounded top + inset highlight
+                    // read as a raised boundary in the clean gap
+                    // above the cut line.
                     let _ = s.set_property("margin-top", &format!("{push:.1}px"));
                     let _ = s.set_property("height", &format!("{h:.1}px"));
                     let _ = s.set_property("overflow", "hidden");
                     let _ = s.remove_property("visibility");
+                    let _ = s.set_property(
+                        "box-shadow",
+                        "var(--shadow), 0 -2px 5px rgba(75, 70, 55, 0.16), 0 -1px 2px rgba(75, 70, 55, 0.10)",
+                    );
                 } else {
                     // Fully behind the deck: the deck face is the
                     // boundary. Hide the card but keep its layout
@@ -1962,6 +1976,7 @@ fn sync_unfold(st: &mut PileState) {
                     let _ = s.set_property("height", &format!("{h:.1}px"));
                     let _ = s.set_property("overflow", "hidden");
                     let _ = s.set_property("visibility", "hidden");
+                    let _ = s.set_property("box-shadow", "");
                 }
                 st.top_pin = Some((el.clone(), m));
             }
@@ -2208,6 +2223,7 @@ fn release_top_pin(el: &HtmlElement) {
     let _ = s.set_property("height", "");
     let _ = s.set_property("overflow", "");
     let _ = s.set_property("visibility", "");
+    let _ = s.set_property("box-shadow", "");
     let _ = s.remove_property("transform"); // legacy v0.4.4 residue
 }
 
