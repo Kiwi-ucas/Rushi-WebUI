@@ -64,8 +64,8 @@ body.kb-anim { transition: height 0.22s ease-out; }
 #main::after { content: ''; position: absolute; top: var(--band-h); left: 0; right: 0; height: 28px; background: var(--bg); border-top-left-radius: 14px; box-shadow: inset 0 10px 14px -10px rgba(75, 70, 55, 0.30); z-index: 46; pointer-events: none; }
 /* v0.5.7: in flat mode there is no deck, so the cover has nothing to
    hide — it just sits over the tops of cards scrolling up (the "white
-   mask over cards" report). pile::init tags #app with .flat-mode. */
-#app.flat-mode #main::after { display: none; }
+   mask over cards" report). pile::init tags <body> with .flat-mode. */
+body.flat-mode #main::after { display: none; }
 button { font-weight: 700; }
 
 .sb-header { display: flex; align-items: center; justify-content: space-between; height: var(--band-h); padding: 0 16px; border-bottom: none; box-shadow: inset 0 -1px 0 var(--border); }

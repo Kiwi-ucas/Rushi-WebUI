@@ -458,14 +458,18 @@ pub fn init(state: AppState) {
             .ok()
             .map(|s| !s.contains("pile=1"))
             .unwrap_or(true);
-        // v0.5.7: tag the app in flat mode so CSS can drop the
+        // v0.5.7: tag <body> in flat mode so CSS can drop the
         // pile-era top-zone mask (#main::after). With no deck, that
-        // 28px band just covers the tops of cards scrolling up.
-        // ?pile=1 (deck engine) keeps it — the cover exists to hide
-        // the card sliver between the header band and the deck.
+        // 28px band just covers the tops of cards scrolling up. We
+        // tag <body> (not #app / #transcript) because #app has a
+        // reactive class binding that Leptos would overwrite on a
+        // sidebar-toggle re-render, while <body> is never owned by
+        // the renderer. ?pile=1 (deck engine) keeps the mask — the
+        // cover exists to hide the card sliver between the header
+        // band and the deck.
         if flat {
-            if let Some(a) = doc.get_element_by_id("app") {
-                let _ = a.unchecked_into::<HtmlElement>().class_list().add_1("flat-mode");
+            if let Some(b) = doc.body() {
+                let _ = b.class_list().add_1("flat-mode");
             }
         }
 
