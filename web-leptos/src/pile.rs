@@ -453,7 +453,7 @@ pub fn init(state: AppState) {
 
         // Build marker: name the running bundle so a stale cached
         // wasm/js is easy to spot (DevTools console).
-        let _ = js_sys::eval("console.log('[rushi-webui] build v0.5.8-flat')");
+        let _ = js_sys::eval("console.log('[rushi-webui] build v0.5.9-flat')");
 
         // Flat mode: default is the deck-less transcript (basic
         // usability); `?pile=1` restores the full card-deck engine.
@@ -1195,13 +1195,22 @@ fn sync_stick(st: &mut PileState) {
     let delta = s_top - st.last_stop;
     st.last_stop = s_top;
     let d = range - s_top; // distance to the transcript bottom
-    if delta.abs() > 0.5 && d > 80.0 {
-        st.stick_to_bottom = false; // user scrolled up to read history
+    // v0.5.9: intent-gated release / re-arm. The v0.5.6 rule only
+    // released when the user had climbed > 80 px off the bottom, so
+    // INSIDE that band the per-frame bottom pin kept snapping the
+    // viewport back while the user scrolled up — every small
+    // wheel/trackpad step was erased ("stuck at the bottom, must
+    // scroll hard to break free"). Now: ANY upward user scroll
+    // releases the follow immediately, at any distance; the follow
+    // re-arms only when the user's own downward scroll lands within
+    // 80 px of the bottom. Pure content growth (delta ≈ 0) never
+    // toggles the flag, so a watcher at the bottom keeps following
+    // and a reader mid-transcript is never yanked.
+    if delta < -0.5 {
+        st.stick_to_bottom = false; // user is reading history
     }
-    // Re-arm whenever the viewport rests within 80px of the bottom:
-    // watching the feed or just returned.
-    if d <= 80.0 {
-        st.stick_to_bottom = true;
+    if delta > 0.5 && d <= 80.0 {
+        st.stick_to_bottom = true; // user returned to the bottom: follow
     }
 }
 
@@ -1322,8 +1331,9 @@ fn center_round_chip(st: &PileState, i: usize) {
 
 /// Chip click. Pile mode keeps the legacy round filter (`view_round`
 /// → fold + park). Flat mode: chips are a scroll navigator over the
-/// fully-tiled transcript — glide to the round's opening card and
-/// light the chip (the detector confirms it as the glide lands).
+/// fully-tiled transcript — glide to the round's LAST card (the
+/// round's conclusion, not its opening user message) and light the
+/// chip (the detector confirms it as the glide lands).
 pub fn nav_to_round(i: usize) {
     with_pile(|cell| {
         let st = cell.borrow();
@@ -1342,7 +1352,10 @@ pub fn nav_to_round(i: usize) {
             return;
         };
         let n = events.len();
-        let anchor_ev = (r.start..r.end.min(n)).find(|&j| {
+        // v0.5.9: the jump target is the round's END — its last
+        // rendered card (the summary / final reply of that round),
+        // not the opening user message.
+        let anchor_ev = (r.start..r.end.min(n)).rev().find(|&j| {
             events
                 .get(j)
                 .map(|e| e.get("type").and_then(|t| t.as_str()) != Some("ext_status"))
@@ -1376,6 +1389,18 @@ pub fn nav_to_round(i: usize) {
         let t2 = tr.clone();
         let to = gloo_timers::callback::Timeout::new(500, move || {
             let _ = t2.style().set_property("scroll-behavior", "auto");
+            // Re-sync the sticky delta base to where the glide ended
+            // (the user may have scrolled during the animation); a
+            // stale last_stop would read the glide as user motion on
+            // the next step and toggle the follow flag.
+            with_pile(|cell| {
+                if let Some(rc) = cell.borrow().as_ref() {
+                    let mut s = rc.borrow_mut();
+                    s.last_stop = t2.scroll_top() as f64;
+                    s.last_round_top = t2.scroll_top() as f64;
+                    s.last_round_events_len = s.state.events.get_untracked().len();
+                }
+            });
         });
         LEAKED.with(|l| l.borrow_mut().push(Box::new(to)));
     });
