@@ -33,49 +33,55 @@ pub fn Transcript(state: AppState) -> impl IntoView {
 
     view! {
         <div id="transcript">
+            // v0.5.14: the in-flight card is the LAST ITEM OF THIS LIST,
+            // not a separate sibling node. Even keys index real events
+            // (event i -> key 2i); while `streaming`, one extra odd key
+            // (2n+1) renders the assistant card being written, in its
+            // final position. When the final `assistant_message` event
+            // lands, the list simply gains that event (key 2n) and the
+            // sentinel key 2n+1 drops: the card is updated IN PLACE,
+            // never deleted-and-replaced, so the content above the
+            // viewport does not change height and the viewport never
+            // re-clamps at round end. (The pile engine's iter_cards
+            // skips .ev-streaming, so card<->event mapping is intact.)
             <For
                 // All cards stay in the DOM (even in a round view); the
                 // pile engine adds .hid to cards after the viewed
                 // summary — the legacy structure.
-                each=move || all_card_indices(events.get().len())
-                key=|&i| i
-                children=move |i| {
-                    event_card_view(i, events, state)
+                each=move || {
+                    let n = events.get().len();
+                    let live = state.streaming.get();
+                    (0..(n + if live { 1 } else { 0 }))
+                        .map(|i| if i < n { i * 2 } else { i * 2 + 1 })
+                        .collect::<Vec<usize>>()
+                }
+                key=|&k| k
+                children=move |k| {
+                    if k % 2 == 0 {
+                        event_card_view(k / 2, events, state)
+                    } else {
+                        streaming_card_view(state)
+                    }
                 }
             />
-            // Streaming card: the in-flight model call, rendered live
-            // off the `.model-stream` side channel. No `event` class
-            // token, so the pile engine's iter_cards ignores it; it
-            // rides in the flow at the bottom and is replaced by the
-            // final assistant_message card when that event lands.
-            <Show
-                when=move || state.streaming.get()
-                fallback=|| ()
-            >
-                { live_card_view(state) }
-            </Show>
             <div id="scroll-spacer" />
         </div>
     }
 }
 
-/// The in-progress assistant card: streamed thinking block (open) +
-/// streamed body rendered as markdown at a 60fps budget. Both
-/// children are reactive off the `live_reasoning` / `live_text`
-/// signals, so each delta updates the card in place. The body is
-/// re-parsed on every delta (a `Memo` keyed on the text signal) and
-/// rendered with the SAME block renderer as the final card, so the
-/// live card and the final `assistant_message` card look identical —
-/// headings, lists and code blocks grow into place as the model
-/// writes, instead of showing raw pre-wrapped source.
-fn live_card_view(state: AppState) -> AnyView {
+/// v0.5.14: the in-flight assistant card — the SAME logical card that
+/// becomes the final `assistant_message` card. It streams in place and
+/// finalizes in place (chrome diff only: the running marker goes away,
+/// usage / tool chips may appear), so no node is ever swapped under the
+/// viewport and the follow never has to survive a delete+insert.
+fn streaming_card_view(state: AppState) -> AnyView {
     let live_text = state.live_text;
     let live_reasoning = state.live_reasoning;
     let v = view! {
-        <div class="ev-live enter">
+        <div class="event ev-assistant ev-streaming enter">
             <span class="ev-header">
-                <span class="ev-type">agent</span>
-                <span class="ev-running-dot" />
+                <span class="ev-type">{ "assistant message" }</span>
+                <span class="ev-running">{ "generating" }</span>
             </span>
             <Show
                 when=move || !live_reasoning.get().is_empty()
@@ -88,7 +94,7 @@ fn live_card_view(state: AppState) -> AnyView {
                     </div>
                 </details>
             </Show>
-            <div class="ev-content ev-live-text">
+            <div class="ev-content">
                 { live_md_view(live_text) }
             </div>
         </div>

@@ -338,9 +338,11 @@ struct PileState {
     last_touch_y: Option<f64>,
     /// v0.5.12: a passive bottom clamp was detected on the previous
     /// flat step (a scroll-top drop with no user input event — the
-    /// content shrank above the viewport, i.e. live-card
-    /// finalization). The flat step consumes it with a same-frame
-    /// settle pull so the clamped position is never painted.
+    /// content shrank above the viewport). The flat step consumes it
+    /// with a same-frame settle pull so the clamped position is never
+    /// painted. v0.5.14: finalization no longer shrinks the content
+    /// (the in-flight card finalizes in place); this now covers the
+    /// residual shrink cases (thinking-block collapse, error swaps).
     passive_clamp: bool,
     /// v0.5.12: stick_to_bottom flip history (last 6 entries,
     /// "<perf.now ms> <reason>"), surfaced by __rushiPile() so a
@@ -482,7 +484,7 @@ pub fn init(state: AppState) {
 
         // Build marker: name the running bundle so a stale cached
         // wasm/js is easy to spot (DevTools console).
-        let _ = js_sys::eval("console.log('[rushi-webui] build v0.5.13-flat')");
+        let _ = js_sys::eval("console.log('[rushi-webui] build v0.5.14-flat')");
 
         // Flat mode: default is the deck-less transcript (basic
         // usability); `?pile=1` restores the full card-deck engine.
@@ -1384,9 +1386,10 @@ fn sync_stick(st: &mut PileState) {
     // v0.5.10: release / re-arm driven by user INPUT, not by the raw
     // delta. The v0.5.9 rule read the delta as user motion, but a
     // PASSIVE delta — the browser clamping the viewport up when the
-    // content above it shrinks (live-card finalization: `.ev-live`
-    // collapses and a shorter final card lands) — looks identical to
-    // a user scroll up. That released the follow the moment a round's
+    // content above it shrinks (v0.5.14 finalizes the in-flight card
+    // in place, but collapsing a thinking block or an error-card swap
+    // still shrinks content) — looks identical to a user scroll up.
+    // That released the follow the moment a round's
     // stream ended, so the viewport bounced to the new card's top
     // and stopped following. Wheel / touch inputs (captured in init)
     // carry the real intent; the frame pass only covers what no input
@@ -1637,7 +1640,13 @@ fn iter_cards(st: &PileState) -> Vec<HtmlElement> {
     let mut out = Vec::new();
     for i in 0..n {
         if let Some(el) = coll.item(i) {
-            if el.class_list().contains("event") {
+            // v0.5.14: the streaming sentinel card carries the .event
+            // class (it IS the in-flight assistant card) but maps to NO
+            // event yet — skip it so card k stays the k-th NON-ext
+            // event card (the whole engine's index math).
+            if el.class_list().contains("event")
+                && !el.class_list().contains("ev-streaming")
+            {
                 out.push(el.unchecked_into::<HtmlElement>());
             }
         }

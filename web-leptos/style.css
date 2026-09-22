@@ -19,8 +19,10 @@
      The legacy translucent tints are replaced by opaque equivalents
      over --bg (#faf9f5) so the pinned deck stack reads clean. */
   --user-bg: #e8eee6;
-  --assistant-bg: var(--bg); /* light beige (浅米黄 #faf9f5), opaque
-     equivalent of the original transparent face over the rice base */
+  --assistant-bg: var(--tool-bg); /* v0.5.14: agent-output cards share ONE face — the
+     generate card, final assistant cards and tool call/result cards are
+     all the same color (the user flagged the generate vs tool-call
+     mismatch). User cards keep --user-bg, errors keep --error-bg. */
   --tool-bg: #f1eee3;
   --error-bg: #f3e8e2;
   /* raised-block shadows (warm, on rice): dark fall + top-edge light = extruded relief */
@@ -34,8 +36,8 @@
   /* v0.5.12: scrollbar relief pair — a sunken channel track + a raised
      thumb, both clearly off the face color (the v0.5.11 thumb was
      --bg-elev on a --bg face: nearly invisible). */
-  --scroll-track: #e6e0cd;
-  --scroll-thumb: #d3cab0;
+  --scroll-track: #d8cfb5;
+  --scroll-thumb: #b7a87f;
   --band-h: 46px;
   /* v0.4.3: the opaque deck plate under the pinned pile is gone
      (--deck-h removed). The pile's boundary is now the top edge of
@@ -240,21 +242,22 @@ button { font-weight: 700; }
    harmless: no fill-mode, base style is opacity 1 / transform none. */
 .event.enter { animation: fadeIn 0.15s ease-in; }
 @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
-/* Streaming card: the in-flight model call, rendered live off the
-   .model-stream side channel. Mirrors the .event card chrome but carries
-   NO `.event` token, so the pile engine's iter_cards ignores it and the
-   fold/deal math is unaffected. Replaced by the final .ev-assistant card
-   when the assistant_message event lands. */
-.ev-live { position: relative; margin-bottom: 12px; border-radius: 8px; padding: 10px 14px; /* v0.5.13: the in-flight card shares the tool cards' face (--tool-bg) — one color for all "in progress / execution" cards; the design flagged the live-card vs tool-call mismatch. */ --card-bg: var(--tool-bg); background: var(--tool-bg); box-shadow: var(--shadow); border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
-.ev-live.enter { animation: fadeIn 0.15s ease-in; }
-.ev-live .ev-type::after { content: '… generating'; margin-left: 6px; color: var(--text-muted); }
-.ev-live .ev-content.ev-live-text { white-space: pre-wrap; font-family: inherit; }
+/* v0.5.14: the in-flight card is a real .event ev-assistant card — the
+   sentinel item of the transcript's card list (transcript.rs) — so it
+   gets the .event/.ev-assistant chrome and face for free: one color
+   for every agent-activity card (streaming, final, tool). The pile
+   engine skips it via this .ev-streaming token (iter_cards), so the
+   card<->event mapping is unaffected. It finalizes IN PLACE when the
+   assistant_message event lands: same list slot, chrome diff only
+   (the running marker goes away, usage/tool chips may appear). */
+.ev-streaming .ev-running { margin-left: 8px; }
+.ev-streaming.enter { animation: fadeIn 0.15s ease-in; }
 /* Running marker on a tool_call card while its tool_result has not
    landed yet. A small pulsing dot reads as "in progress". */
 .ev-running { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 700; color: var(--text-muted); }
 .ev-running::before { content: ''; width: 7px; height: 7px; border-radius: 50%; background: var(--accent, #6cc); animation: ev-pulse 1.1s ease-in-out infinite; }
 @keyframes ev-pulse { 0%, 100% { opacity: 0.35; transform: scale(0.85); } 50% { opacity: 1; transform: scale(1); } }
-@media (prefers-reduced-motion: reduce) { .ev-live.enter { animation: none; } .ev-running::before { animation: none; opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .ev-streaming.enter { animation: none; } .ev-running::before { animation: none; opacity: 1; } }
 /* deal out of the pile — the mirror of the dock (pass 1): the card
    peels off when its flow slot has passed the deck's BOTTOM edge
    (PILE_TOP + COMPACT_ROW_H + PILE_BAND, pile.rs pass 2). The card
@@ -436,10 +439,11 @@ button { font-weight: 700; }
    v0.5.12: contrast pass — the v0.5.11 thumb was face-colored
    (--bg-elev) and nearly invisible; now a dedicated darker pair
    (--scroll-track / --scroll-thumb) with a real raised shadow. */
-#transcript, #msg-input { scrollbar-width: thin; scrollbar-color: var(--scroll-thumb) var(--scroll-track); }
-#transcript::-webkit-scrollbar, #msg-input::-webkit-scrollbar { width: 10px; height: 10px; background: transparent; }
-#transcript::-webkit-scrollbar-track, #msg-input::-webkit-scrollbar-track { background: var(--scroll-track); box-shadow: inset 1px 0 2px rgba(75, 70, 55, 0.14), inset -1px 0 2px rgba(75, 70, 55, 0.14); }
-#transcript::-webkit-scrollbar-thumb, #msg-input::-webkit-scrollbar-thumb { background: var(--scroll-thumb); border-radius: 6px; border: 2px solid transparent; background-clip: padding-box; box-shadow: 0 1px 2px rgba(75, 70, 55, 0.30), inset 0 1px 0 rgba(255, 255, 255, 0.50), inset 0 -1px 0 rgba(75, 70, 55, 0.18); }
+#transcript, #msg-input, .ev-result, .ev-args { scrollbar-width: thin; scrollbar-color: var(--scroll-thumb) var(--scroll-track); }
+#transcript::-webkit-scrollbar, #msg-input::-webkit-scrollbar, .ev-result::-webkit-scrollbar, .ev-args::-webkit-scrollbar { width: 10px; height: 10px; background: transparent; }
+#transcript::-webkit-scrollbar-track, #msg-input::-webkit-scrollbar-track, .ev-result::-webkit-scrollbar-track, .ev-args::-webkit-scrollbar-track { background: var(--scroll-track); box-shadow: inset 1px 0 2px rgba(75, 70, 55, 0.14), inset -1px 0 2px rgba(75, 70, 55, 0.14); }
+/* v0.5.14: the thumb needed a stronger drop shadow to read against the darker track (round-5: "滚动条看不清楚"). */
+#transcript::-webkit-scrollbar-thumb, #msg-input::-webkit-scrollbar-thumb, .ev-result::-webkit-scrollbar-thumb, .ev-args::-webkit-scrollbar-thumb { background: var(--scroll-thumb); border-radius: 6px; border: 2px solid transparent; background-clip: padding-box; box-shadow: 0 1px 4px rgba(75, 70, 55, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.45), inset 0 -1px 0 rgba(75, 70, 55, 0.30); }
 
 /* v0.5.13: the loop-in-progress marker, in the gap between the last
    card and the input box. Redrawn from the v0.5.12 three-dot slot
