@@ -94,7 +94,8 @@ button { font-weight: 700; }
 #session-actions button:hover { box-shadow: var(--shadow-hover); }
 #session-actions button:active { transform: translateY(1px); box-shadow: var(--shadow-pressed); }
 
-#session-actions button.running { color: var(--accent2); }
+/* v0.5.6: the sidebar start/stop buttons were folded into #btn-send,
+   so the .running tint on #session-actions buttons is dead. */
 #goal-panel { margin: 0; padding: 10px 12px; background: var(--bg); box-shadow: var(--shadow); border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: 8px; }
 #goal-panel .goal-header { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; color: var(--text-muted); }
 #goal-body { font-size: 13px; line-height: 1.4; }
@@ -135,6 +136,16 @@ button { font-weight: 700; }
 #ctx-k { color: var(--text-muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
 
 #transcript { flex: 1; overflow-y: auto; padding: 28px 16px 20px; scroll-behavior: smooth; border-top-left-radius: 14px; box-shadow: inset 0 10px 14px -10px rgba(75, 70, 55, 0.30); overflow-anchor: none; }
+/* v0.5.6: session-entry transition (the early webui's quick fade + rise).
+   One-shot, re-triggered by pile::on_history_loaded: remove class, force
+   a style flush, re-add. 180 ms — noticeable, not heavy. */
+#transcript.transcript-in { animation: transcript-in 0.18s ease-out; }
+@keyframes transcript-in {
+  from { opacity: 0; transform: translateY(6px); }
+}
+@media (prefers-reduced-motion: reduce) {
+  #transcript.transcript-in { animation: none; }
+}
 #scroll-spacer { height: 0; }
 .hid { display: none !important; }
 /* compact row + card pile: a folded card stays a VISIBLE 52px
@@ -371,9 +382,12 @@ button { font-weight: 700; }
   .qsel-panel { animation: none; }
   .qsel-chev { transition: none; }
 }
-#msg-input { flex: 1; background: var(--bg-elev); border: 1px solid var(--border); color: var(--text); border-radius: 8px; padding: 9px 12px; /* 14px = same as the message text (.ev-content); legacy 16px was an iOS auto-zoom threshold, superseded */ font-size: 14px; line-height: 21px; resize: none; height: 40px; box-sizing: border-box; overflow-y: auto; font-family: inherit; box-shadow: var(--groove); }
+#msg-input { flex: 1; background: var(--bg-elev); border: 1px solid var(--border); color: var(--text); border-radius: 8px; padding: 9px 12px; /* 14px = same as the message text (.ev-content); legacy 16px was an iOS auto-zoom threshold, superseded */ font-size: 14px; line-height: 21px; resize: none; height: 40px; box-sizing: border-box; overflow-y: auto; font-family: inherit; box-shadow: var(--groove); transition: height 0.12s ease; }
 #msg-input:focus { outline: none; border-color: var(--accent); }
-#btn-send { background: var(--accent); color: var(--bg); border: none; border-radius: 8px; padding: 10px 18px; cursor: pointer; font-size: 14px; font-weight: 600; box-shadow: var(--shadow); transition: box-shadow .12s ease, transform .12s ease; height: 40px; box-sizing: border-box; display: flex; align-items: center; }
+#btn-send { background: var(--accent); color: var(--bg); border: none; border-radius: 8px; min-width: 46px; padding: 10px 14px; cursor: pointer; font-size: 16px; font-weight: 700; box-shadow: var(--shadow); transition: box-shadow .12s ease, transform .12s ease, background-color .12s ease; height: 40px; box-sizing: border-box; display: flex; align-items: center; justify-content: center; }
+/* v0.5.6: start/stop loop folded into send — the green triangle is the
+   idle/send state; the red square means the loop is running (click = stop). */
+#btn-send.stop { background: var(--danger); }
 #btn-send:hover { box-shadow: var(--shadow-hover); }
 #btn-send:active { transform: translateY(1px); box-shadow: var(--shadow-pressed); }
 #btn-send:hover { opacity: 0.9; }

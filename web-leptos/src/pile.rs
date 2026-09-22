@@ -448,7 +448,7 @@ pub fn init(state: AppState) {
 
         // Build marker: name the running bundle so a stale cached
         // wasm/js is easy to spot (DevTools console).
-        let _ = js_sys::eval("console.log('[rushi-webui] build v0.5.5-flat')");
+        let _ = js_sys::eval("console.log('[rushi-webui] build v0.5.6-flat')");
 
         // Flat mode: default is the deck-less transcript (basic
         // usability); `?pile=1` restores the full card-deck engine.
@@ -554,9 +554,14 @@ pub fn init(state: AppState) {
         }
 
         // window resize + sidebar transitionend → input gutter (legacy).
+        // v0.5.6: also re-fit the auto-sizing input box (its cap is a
+        // third of the main panel height).
         {
             let vt: EventTarget = w.clone().unchecked_into();
-            let on_resize = Closure::<dyn Fn()>::new(|| sync_input_gutter());
+            let on_resize = Closure::<dyn Fn()>::new(|| {
+                sync_input_gutter();
+                crate::ui::size_msg_input();
+            });
             let _ = vt.add_event_listener_with_callback("resize", on_resize.as_js_value().unchecked_ref::<js_sys::Function>());
             ps.resize_cb = Some(on_resize);
         }
@@ -730,6 +735,17 @@ pub fn on_history_loaded() {
         // Landing on the last message means we're at the bottom:
         // follow the live feed from here.
         st.stick_to_bottom = true;
+        // v0.5.6: quick "enter session" transition — a one-shot fade +
+        // 6 px rise on the whole transcript (style.css
+        // `.transcript-in`, ~180 ms; the early webui's simple, fast
+        // transition). Re-trigger by removing the class, forcing a
+        // style flush (an offset read), and re-adding it.
+        if let Some(t) = &st.transcript {
+            let cls = t.class_list();
+            let _ = cls.remove_1("transcript-in");
+            let _ = t.offset_height();
+            let _ = cls.add_1("transcript-in");
+        }
     });
     on_change();
 }
@@ -811,6 +827,28 @@ fn step_full(st: &mut PileState) {
     if st.flat {
         sync_stick(st);
         step_scrolls(st, &events, &active, view);
+        // Tight follow (v0.5.6): while the user is following (sticky)
+        // and in the live view, pin the viewport bottom every frame,
+        // so ANY content growth — streaming deltas, landed event
+        // cards, post-flush re-renders — keeps the newest card on the
+        // bottom edge with no 80 px lag and no bottom-edge pulse.
+        // Idle frames (nothing grew) write nothing (dist ≈ 0); a
+        // user scroll-up released the sticky flag in sync_stick, so
+        // the pin never yanks a reader.
+        if st.stick_to_bottom && view.is_none() && active.is_some() {
+            if let Some(t) = &st.transcript {
+                let dist = t.scroll_height() as f64 - t.scroll_top() as f64 - t.client_height() as f64;
+                if dist > 0.5 {
+                    // Instant, not the CSS `scroll-behavior:smooth`:
+                    // a per-frame animation would lag the growth and
+                    // re-trigger itself. The follow reads smooth
+                    // because each frame moves a few px.
+                    let _ = t.style().set_property("scroll-behavior", "auto");
+                    t.set_scroll_top(t.scroll_height());
+                    st.last_stop = t.scroll_top() as f64;
+                }
+            }
+        }
         return;
     }
 
@@ -1112,17 +1150,31 @@ fn park_to_bottom(st: &mut PileState, repark: bool) {
 }
 
 /// Flat-mode sticky-bottom detection. Mirror of the sticky gate in
-/// `sync_unfold`, without the pile machinery: distance to the bottom
-/// > 80px means the user is reading history (release the follow),
-/// within 80px re-arms it. Runs on every scheduled frame in flat
-/// mode, so scroll events and stream deltas both keep the flag fresh.
+/// `sync_unfold`, driven by USER motion only (the v0.5.6 fix): a user
+/// scroll that ends > 80px above the bottom releases the live follow
+/// (they're reading history); content GROWTH (delta ≈ 0, scroll_top
+/// unchanged) must never clear it — that is what keeps the viewport
+/// following a streaming card as it grows. The v0.5.5 version
+/// recomputed `stick_to_bottom = d <= 80` every frame, so the
+/// distance itself grew with the content and the flag released at the
+/// worst moment (mid-stream), which is exactly the "no auto-follow"
+/// symptom. `last_stop` is synced by every programmatic scroll, so
+/// `delta` measures user motion only.
 fn sync_stick(st: &mut PileState) {
     let Some(tr) = &st.transcript else { return };
     let s_top = tr.scroll_top() as f64;
     let range = tr.scroll_height() as f64 - tr.client_height() as f64;
-    let d = range - s_top;
-    st.stick_to_bottom = d <= 80.0;
+    let delta = s_top - st.last_stop;
     st.last_stop = s_top;
+    let d = range - s_top; // distance to the transcript bottom
+    if delta.abs() > 0.5 && d > 80.0 {
+        st.stick_to_bottom = false; // user scrolled up to read history
+    }
+    // Re-arm whenever the viewport rests within 80px of the bottom:
+    // watching the feed or just returned.
+    if d <= 80.0 {
+        st.stick_to_bottom = true;
+    }
 }
 
 // ── DOM traversal helpers ──────────────────────────────────────────
@@ -2682,6 +2734,10 @@ fn on_vv_event() {
                 let _ = body.style().set_property("height", &format!("{h:.0}px"));
             }
         }
+        // v0.5.6: the auto-size input's cap tracks the main panel
+        // height — re-fit it when the keyboard lifts/drops the
+        // viewport.
+        crate::ui::size_msg_input();
         sync_shrink(&mut st, &cards);
         sync_last_win(&mut st, &cards);
     });

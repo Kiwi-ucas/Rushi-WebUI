@@ -141,31 +141,10 @@ pub fn new_session(state: AppState) {
     });
 }
 
-pub fn start_loop(state: AppState) {
-    let Some(id) = state.active_session.get() else {
-        if let Some(w) = web_sys::window() {
-            let _ = w.alert_with_message("Select or create a session first");
-        }
-        return;
-    };
-    if ws::is_open() {
-        // The server's loop_status frame flips the flag once the spawn
-        // succeeds (or confirms an already-running loop).
-        ws::send_command(&id, &json!({ "kind": "start" }));
-    } else {
-        let s = state;
-        spawn_local(async move {
-            match api::start_loop(&id).await {
-                Ok(()) => s.loop_running.set(true),
-                Err(e) => {
-                    if let Some(w) = web_sys::window() {
-                        let _ = w.alert_with_message(&format!("start failed: {e}"));
-                    }
-                }
-            }
-        });
-    }
-}
+// v0.5.6: start_loop lived here for the sidebar start button; the
+// loop start is now folded into do_send (ensure-loop-running), so
+// the standalone function is gone. stop_loop remains (the send
+// button's red-square state calls it).
 
 pub fn stop_loop(state: AppState) {
     let Some(id) = state.active_session.get() else { return };
@@ -282,10 +261,6 @@ pub fn Sidebar(state: AppState) -> impl IntoView {
         if collapsed.get() { "collapsed".to_string() } else { String::new() }
     };
 
-    let start_cls = move || {
-        if loop_running.get() { "running".to_string() } else { String::new() }
-    };
-
     view! {
         <aside id="sidebar" class=sidebar_cls>
             <div id="sidebar-inner">
@@ -371,19 +346,6 @@ pub fn Sidebar(state: AppState) -> impl IntoView {
                         on:click=move |_| { new_session(state); }
                     >
                         { "+ New Session" }
-                    </button>
-                    <button
-                        id="btn-start"
-                        class=start_cls
-                        on:click=move |_| { start_loop(state); }
-                    >
-                        { "\u{25B6} Start Loop" }
-                    </button>
-                    <button
-                        id="btn-stop"
-                        on:click=move |_| { stop_loop(state); }
-                    >
-                        { "\u{25A0} Stop Loop" }
                     </button>
                 </div>
                 <div id="status-bar">
@@ -931,7 +893,31 @@ pub fn DeleteConfirmDialog(state: AppState) -> impl IntoView {
     }
 }
 
-// ── input module (port of doSend / keydown) ───────────────────────
+// ── input module (port of doSend / key) ───────────────────────────
+
+/// v0.5.6: auto-fit #msg-input to its content. The height grows with
+/// the text but caps at one third of the main panel (#main) so a wall
+/// of text can't swallow the UI; past the cap the textarea scrolls
+/// internally (#msg-input already has `overflow-y: auto`). One
+/// reflow per call (height:auto → measure → set px). Called on every
+/// input event, after programmatic clears, and on window resize /
+/// keyboard lift (the pile engine's resize + vv handlers).
+pub fn size_msg_input() {
+    let Some(w) = web_sys::window() else { return };
+    let Some(doc) = w.document() else { return };
+    let Some(ta) = doc.get_element_by_id("msg-input").map(|e| e.unchecked_into::<web_sys::HtmlElement>()) else {
+        return;
+    };
+    let cap = doc
+        .get_element_by_id("main")
+        .map(|m| m.unchecked_into::<web_sys::HtmlElement>())
+        .map(|m| m.client_height() as f64 * (1.0 / 3.0))
+        .unwrap_or(120.0);
+    let _ = ta.style().set_property("height", "auto");
+    let h = (ta.scroll_height() as f64).clamp(40.0, cap.max(40.0));
+    let _ = ta.style().set_property("height", &format!("{h:.0}px"));
+}
+
 /// One row of the queue-mode popup (direct / steer / follow). A
 /// raised-look option button: hover tucks it into the panel
 /// (groove), the active one gets an accent tick.
@@ -961,6 +947,9 @@ fn qsel_opt(
 #[component]
 pub fn InputModule(state: AppState) -> impl IntoView {
     let msg = RwSignal::new(String::new());
+    // v0.5.6: the send button doubles as the loop start/stop control
+    // (green triangle = send + start; red square = stop).
+    let loop_running = state.loop_running;
     // Queue-mode picker (direct/steer/follow). A custom popup instead
     // of the native <select>: the OS-rendered dropdown list can't be
     // themed, so the panel is our own DOM, styled with the same rice
@@ -1015,12 +1004,14 @@ pub fn InputModule(state: AppState) -> impl IntoView {
                     placeholder="Send a message... (Ctrl+Enter to send)"
                     rows="1"
                     bind:value=msg
+                    on:input=move |_| { size_msg_input(); }
                     on:keydown=move |e: KeyboardEvent| {
                         if e.key() == "Enter" && (e.ctrl_key() || e.meta_key()) {
                             e.prevent_default();
                             let q = qsel_value.get().clone();
                             let text = msg.get();
                             msg.set(String::new());
+                            size_msg_input();
                             let s = state;
                             spawn_local(async move {
                                 do_send(s, text, q).await;
@@ -1030,17 +1021,41 @@ pub fn InputModule(state: AppState) -> impl IntoView {
                 />
                 <button
                     id="btn-send"
+                    class=move || {
+                        // v0.5.6: the send button doubles as the loop
+                        // control (the sidebar start/stop buttons were
+                        // folded in). Green triangle = idle/send, red
+                        // square = loop running (click stops it).
+                        if loop_running.get() { "stop".to_string() } else { String::new() }
+                    }
+                    title=move || {
+                        if loop_running.get() {
+                            "Stop loop".to_string()
+                        } else {
+                            "Send (starts the loop)".to_string()
+                        }
+                    }
                     on:click=move |_| {
+                        if loop_running.get() {
+                            // Red square: the loop is running, so this
+                            // click stops it (the old #btn-stop).
+                            stop_loop(state);
+                            return;
+                        }
+                        // Green triangle: send the message; do_send
+                        // ensures the loop is running (the old
+                        // #btn-start). An empty message does nothing.
                         let q = qsel_value.get().clone();
                         let text = msg.get();
                         msg.set(String::new());
+                        size_msg_input();
                         let s = state;
                         spawn_local(async move {
                             do_send(s, text, q).await;
                         });
                     }
                 >
-                    { "Send" }
+                    { move || if loop_running.get() { "\u{25A0}" } else { "\u{25B6}" } }
                 </button>
             </div>
         </div>
