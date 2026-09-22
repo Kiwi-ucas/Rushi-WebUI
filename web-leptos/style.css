@@ -19,10 +19,11 @@
      The legacy translucent tints are replaced by opaque equivalents
      over --bg (#faf9f5) so the pinned deck stack reads clean. */
   --user-bg: #e8eee6;
-  --assistant-bg: var(--tool-bg); /* v0.5.14: agent-output cards share ONE face — the
-     generate card, final assistant cards and tool call/result cards are
-     all the same color (the user flagged the generate vs tool-call
-     mismatch). User cards keep --user-bg, errors keep --error-bg. */
+  --assistant-bg: var(--bg); /* v0.5.14b: the FINAL assistant card keeps the light
+     beige face (--bg) the user expected ("之前是浅米色"); only the in-flight
+     .ev-streaming card is overridden to the tool face (--tool-bg) so it still
+     matches tool call/result cards (round-6 ②). User cards keep --user-bg,
+     errors keep --error-bg. */
   --tool-bg: #f1eee3;
   --error-bg: #f3e8e2;
   /* raised-block shadows (warm, on rice): dark fall + top-edge light = extruded relief */
@@ -321,6 +322,13 @@ button { font-weight: 700; }
    divider between the pile and the card below it: no white base
    under the stack, just the card's own raised edge. */
 .ev-assistant { --card-bg: var(--assistant-bg); background: var(--assistant-bg); border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); box-shadow: var(--shadow); }
+/* v0.5.14b: the in-flight card (the sentinel item of the card list)
+   keeps the tool face so generate reads the same as tool call/result
+   cards (round-6 ②); on finalization the .ev-streaming class drops and
+   the SAME card reverts to the light --assistant-bg face — the color
+   step IS the "settled" cue. Two-class specificity so this wins over
+   .ev-assistant regardless of source order. */
+.ev-assistant.ev-streaming { --card-bg: var(--tool-bg); background: var(--tool-bg); }
 .ev-tool-call { --card-bg: var(--tool-bg); background: var(--tool-bg); border-left: 3px solid var(--warn); padding: 6px 12px; }
 .ev-tool-result { --card-bg: var(--tool-bg); background: var(--tool-bg); border-left: 3px solid var(--accent2); padding: 6px 12px; }
 .ev-tool-call .ev-header, .ev-tool-result .ev-header { margin-bottom: 2px; }
@@ -445,24 +453,32 @@ button { font-weight: 700; }
 /* v0.5.14: the thumb needed a stronger drop shadow to read against the darker track (round-5: "滚动条看不清楚"). */
 #transcript::-webkit-scrollbar-thumb, #msg-input::-webkit-scrollbar-thumb, .ev-result::-webkit-scrollbar-thumb, .ev-args::-webkit-scrollbar-thumb { background: var(--scroll-thumb); border-radius: 6px; border: 2px solid transparent; background-clip: padding-box; box-shadow: 0 1px 4px rgba(75, 70, 55, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.45), inset 0 -1px 0 rgba(75, 70, 55, 0.30); }
 
-/* v0.5.13: the loop-in-progress marker, in the gap between the last
-   card and the input box. Redrawn from the v0.5.12 three-dot slot
-   (too plain, per user): a sunken well holding a rotating accent arc
-   around a raised, gently pulsing dot — the whole thing in relief
-   language (the well is groove-sunken, the dot carries --shadow).
-   Visible only while the active session's loop runs; pure
-   decoration, so it never takes input. */
-#loop-indicator { display: flex; align-items: center; justify-content: center; height: 36px; flex: none; pointer-events: none; }
-#loop-indicator .loop-well { position: relative; width: 36px; height: 36px; border-radius: 50%; background: var(--bg-elev); box-shadow: var(--groove), inset 0 2px 4px rgba(75, 70, 55, 0.10); display: flex; align-items: center; justify-content: center; }
-#loop-indicator .loop-arc { position: absolute; inset: 5px; border-radius: 50%; background: conic-gradient(from 0turn, transparent 0turn, var(--accent) 1turn); -webkit-mask: radial-gradient(circle, transparent 39%, #000 41%); mask: radial-gradient(circle, transparent 39%, #000 41%); animation: loop-arc-spin 0.9s linear infinite; }
-#loop-indicator .loop-dot { position: relative; z-index: 1; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); box-shadow: var(--shadow); animation: loop-dot-pulse 1.1s ease-in-out infinite; }
-@keyframes loop-arc-spin { to { transform: rotate(1turn); } }
-@keyframes loop-dot-pulse {
-  0%, 100% { transform: scale(0.85); opacity: 0.7; }
-  50% { transform: scale(1.15); opacity: 1; }
+/* v0.5.15: the loop-in-progress marker, in the gap between the last
+   card and the input box — fully replaced the v0.5.13 sunken well +
+   rotating conic arc + pulsing dot with the castepsui three-ring
+   "breathing" design (the .brand-logo rings on the castepsui join
+   screen). The rings are three concentric circles, radii static; a
+   staggered opacity/scale pulse makes a light wave travel outer ->
+   inner, reading as swell/shrink (the "breath" illusion — no ring
+   ever actually moves its radius). Sushi cross-section, inner->outer:
+   rice cream / nori green / tuna salmon. Purely decorative, so it
+   never takes input. */
+#loop-indicator { display: flex; align-items: center; justify-content: center; height: 40px; flex: none; pointer-events: none; }
+/* 36px square canvas; overflow visible so the scale pulse (up to
+   ~1.06x on the outer ring) never clips the stroke. */
+#loop-indicator .loop-rings { width: 36px; height: 36px; overflow: visible; filter: drop-shadow(0 1px 5px rgba(204, 120, 92, 0.22)); }
+#loop-indicator .loop-ring { fill: none; stroke-width: 3; opacity: 0.45; transform-origin: center; transform-box: fill-box; animation: loop-ring-pulse 4s ease-in-out infinite; }
+/* Wave travels outer -> inner: the outer ring leads, each inner ring
+   lags by 0.6s (same 4s/0.6s cadence as the castepsui reference). */
+#loop-indicator .loop-ring.lg-out { stroke: var(--accent-salmon); } /* tuna, outer */
+#loop-indicator .loop-ring.lg-mid { stroke: var(--accent); }        /* nori, mid */
+#loop-indicator .loop-ring.lg-in  { stroke: var(--bg-elev); }      /* rice, inner */
+@keyframes loop-ring-pulse {
+  0%, 100% { opacity: 0.45; transform: scale(1); }
+  50% { opacity: 1; transform: scale(1.06); }
 }
 @media (prefers-reduced-motion: reduce) {
-  #loop-indicator .loop-arc, #loop-indicator .loop-dot { animation: none; }
+  #loop-indicator .loop-ring { animation: none; opacity: 0.7; }
 }
 #btn-send { background: var(--accent); color: var(--bg); border: none; border-radius: 8px; min-width: 46px; padding: 10px 14px; cursor: pointer; font-size: 16px; font-weight: 700; box-shadow: var(--shadow); transition: box-shadow .12s ease, transform .12s ease, background-color .12s ease; height: 40px; box-sizing: border-box; display: flex; align-items: center; justify-content: center; }
 /* v0.5.6: start/stop loop folded into send — the green triangle is the
