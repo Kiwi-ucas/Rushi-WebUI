@@ -265,6 +265,12 @@ struct PileState {
     last_spacer_h: f64,
     /// Click-expanded override: deals every row regardless of scroll.
     pile_open: bool,
+    /// Flat mode: no card deck, no card surgery. The transcript stays
+    /// a plain list of natural-height cards in one scroll flow; only
+    /// the stick/park scroll bookkeeping runs (sync_stick +
+    /// step_scrolls). Default ON; `?pile=1` in the URL restores the
+    /// full card-deck engine (reload switches modes).
+    flat: bool,
     /// Last observed scroll top (deal/dock are scroll-direction gated).
     last_stop: f64,
     /// Card currently height-shrunk at the cut line.
@@ -442,7 +448,16 @@ pub fn init(state: AppState) {
 
         // Build marker: name the running bundle so a stale cached
         // wasm/js is easy to spot (DevTools console).
-        let _ = js_sys::eval("console.log('[rushi-webui] build v0.5.4-unified')");
+        let _ = js_sys::eval("console.log('[rushi-webui] build v0.5.5-flat')");
+
+        // Flat mode: default is the deck-less transcript (basic
+        // usability); `?pile=1` restores the full card-deck engine.
+        // The mode is fixed at page load; a reload switches it.
+        let flat = w.location()
+            .search()
+            .ok()
+            .map(|s| !s.contains("pile=1"))
+            .unwrap_or(true);
 
         let mut ps = PileState {
             state,
@@ -454,6 +469,7 @@ pub fn init(state: AppState) {
             tr_pad_bottom: None,
             last_spacer_h: -1.0,
             pile_open: false,
+            flat: flat,
             last_stop: 0.0,
             shrunken_card: None,
             top_pin: None,
@@ -657,7 +673,8 @@ fn register_debug_hook(w: &web_sys::Window) {
                         .filter(|el| el.class_list().contains("compact"))
                         .count();
                     format!(
-                        "init=1 steps={} fold_applied={} compact={}/{} events={} cards={} pile_face={} pile_open={} kb_open={} summary={} park_bottom={} stick={} stall_reported={} active={:?} view={:?} last_panic={} dbg=[{}]",
+                        "init=1 flat={} steps={} fold_applied={} compact={}/{} events={} cards={} pile_face={} pile_open={} kb_open={} summary={} park_bottom={} stick={} stall_reported={} active={:?} view={:?} last_panic={} dbg=[{}]",
+                        st.flat,
                         st.steps,
                         st.fold_applied,
                         compact,
@@ -784,6 +801,16 @@ fn step_full(st: &mut PileState) {
         st.fold_watch.clear();
         release_shrink(st);
         set_spacer_height(st, 0.0);
+        return;
+    }
+
+    // Flat mode: no card deck, no card surgery, no cut lines. The
+    // transcript stays a plain list of natural-height cards in one
+    // scroll flow; only the sticky-bottom detection and the park /
+    // auto-follow bookkeeping run.
+    if st.flat {
+        sync_stick(st);
+        step_scrolls(st, &events, &active, view);
         return;
     }
 
@@ -1084,6 +1111,20 @@ fn park_to_bottom(st: &mut PileState, repark: bool) {
     }
 }
 
+/// Flat-mode sticky-bottom detection. Mirror of the sticky gate in
+/// `sync_unfold`, without the pile machinery: distance to the bottom
+/// > 80px means the user is reading history (release the follow),
+/// within 80px re-arms it. Runs on every scheduled frame in flat
+/// mode, so scroll events and stream deltas both keep the flag fresh.
+fn sync_stick(st: &mut PileState) {
+    let Some(tr) = &st.transcript else { return };
+    let s_top = tr.scroll_top() as f64;
+    let range = tr.scroll_height() as f64 - tr.client_height() as f64;
+    let d = range - s_top;
+    st.stick_to_bottom = d <= 80.0;
+    st.last_stop = s_top;
+}
+
 // ── DOM traversal helpers ──────────────────────────────────────────
 /// Live `#transcript .event` nodes (cards only; the spacer div and
 /// any non-card children are skipped). Takes the caller's `&PileState`
@@ -1377,6 +1418,9 @@ fn commit_fold(st: &mut PileState, el: &HtmlElement) {
 /// keyframe animations bridge the gap between the pinned deck
 /// position and the card's flow position so the motion is smooth.
 fn sync_unfold(st: &mut PileState, cards: &[HtmlElement]) {
+    if st.flat {
+        return; // flat mode: no deck, no card surgery.
+    }
     // Block-scoped transcript access: the spring bookkeeping in the
     // passes below needs `st` mutable, which a live `&st.transcript`
     // borrow would forbid.
@@ -2145,6 +2189,9 @@ fn clear_deck(el: &HtmlElement) {
 // never moves. This restores the bottom card's intact relief that a
 // plain overflow clip would otherwise slice off.
 fn sync_shrink(st: &mut PileState, cards: &[HtmlElement]) {
+    if st.flat {
+        return; // flat mode: no cut line, no shrink.
+    }
     let Some(tr) = &st.transcript else { return };
     // Cut line = the content-box bottom (the transcript's border-box
     // bottom minus its bottom padding). Shrinking the straddling card
@@ -2317,6 +2364,9 @@ fn set_spacer_height(st: &mut PileState, h: f64) {
 /// so total content height — and the user's scroll position — stays
 /// constant.
 fn sync_last_win(st: &mut PileState, cards: &[HtmlElement]) {
+    if st.flat {
+        return; // flat mode: no window cap.
+    }
     let Some(tr) = &st.transcript else { return };
     // Gate: only when the deck is pinned (pile closed).
     if st.pile_open {
@@ -2532,6 +2582,9 @@ pub fn toggle_pile_open() {
 }
 
 fn set_pile_open(st: &mut PileState, v: bool) {
+    if st.flat {
+        return; // flat mode: there is no pile to open or close.
+    }
     if st.pile_open == v {
         return;
     }
