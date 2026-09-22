@@ -55,6 +55,14 @@ fn set_collapsed(collapsed: bool) {
 
 // ── session selection / mutation helpers ──────────────────────────
 pub fn select_session(state: AppState, name: &str) {
+    // v0.5.13: leaving a session consumes its "loop finished, not
+    // viewed since" green bar — the lamp stays while the session is
+    // viewed and is released only when the user switches away.
+    if state.active_session.get().as_deref() != Some(name) {
+        if let Some(old) = state.active_session.get() {
+            state.loop_done_unviewed.write().remove(&old);
+        }
+    }
     state.active_session.set(Some(name.to_string()));
     state.events.set(Vec::new());
     state.view_round.set(None);
@@ -288,13 +296,30 @@ pub fn Sidebar(state: AppState) -> impl IntoView {
                             let click_name = s_name.clone();
                             let menu_name = s_name.clone();
                             let item_cls_name = s_name.clone();
+                            let looping_set = state.looping_sessions;
+                            let done_set = state.loop_done_unviewed;
                             let item_cls = move || {
                                 let mut c = String::from("session-item");
-                                if active.get().as_deref() == Some(item_cls_name.as_str()) {
+                                let is_active =
+                                    active.get().as_deref() == Some(item_cls_name.as_str());
+                                // v0.5.13: server-driven per-session loop
+                                // state. A session looping in the
+                                // background gets its breathing lamp on
+                                // a relief card in the background color;
+                                // a finished-but-unviewed loop shows a
+                                // static green bar.
+                                let looping = looping_set.get().contains(item_cls_name.as_str());
+                                let done = done_set.get().contains(item_cls_name.as_str());
+                                if is_active {
                                     c.push_str(" active");
-                                    if loop_running.get() {
+                                    if looping || loop_running.get() {
                                         c.push_str(" running");
                                     }
+                                } else if looping {
+                                    c.push_str(" running running-bg");
+                                }
+                                if done && !looping {
+                                    c.push_str(" done");
                                 }
                                 c
                             };

@@ -77,9 +77,8 @@ fn App() -> impl IntoView {
                 // the last card and the input box.
                 <Show when=move || state.loop_running.get() fallback=|| ()>
                     <div id="loop-indicator">
-                        <div class="loop-slot">
-                            <div class="loop-dot" />
-                            <div class="loop-dot" />
+                        <div class="loop-well">
+                            <div class="loop-arc" />
                             <div class="loop-dot" />
                         </div>
                     </div>

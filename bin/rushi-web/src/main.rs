@@ -341,6 +341,20 @@ async fn ws_session(socket: WebSocket, st: AppState, session: String) {
         }
     }
 
+    // 1b. Sidebar lamp snapshot: which sessions have a live loop
+    // right now, so a fresh browser can light the breathing lamps of
+    // sessions it never saw start (v0.5.13).
+    {
+        let running = st.loops.running_sessions().await;
+        let payload = format!(
+            "[{{\"kind\":\"loops\",\"data\":{}}}]",
+            serde_json::to_string(&running).unwrap_or_else(|_| "[]".into())
+        );
+        if sock_tx.send(Message::text(payload)).await.is_err() {
+            return;
+        }
+    }
+
     // 2. Watcher task: tail events.jsonl, push new lines over a channel.
     let path = st.sessions.events_path(&session);
     let (line_tx, mut line_rx) = tokio::sync::mpsc::channel::<String>(256);
@@ -393,20 +407,28 @@ async fn ws_session(socket: WebSocket, st: AppState, session: String) {
                 None => break, // stream watcher finished
             },
             ev = loop_rx.recv() => match ev {
-                Ok(e) if e.session == session => {
-                    let frame = serde_json::json!([
-                        {
-                            "kind": "loop_status",
-                            "running": e.running,
-                            "exit": e.exit,
-                            "stopped": e.stopped,
-                        }
-                    ]);
+                Ok(e) => {
+                    // v0.5.13: forward loop events for EVERY session,
+                    // tagged with the session name — each client's
+                    // sidebar needs the loop state of sessions it is
+                    // not viewing (breathing lamps, green done bars).
+                    // Clients scope the per-socket global flag and the
+                    // error card to their own session by name.
+                    let mut obj = serde_json::json!({
+                        "kind": "loop_status",
+                        "session": e.session,
+                        "running": e.running,
+                        "exit": e.exit,
+                        "stopped": e.stopped,
+                    });
+                    if let Some(d) = &e.detail {
+                        obj["detail"] = serde_json::Value::String(d.clone());
+                    }
+                    let frame = serde_json::json!([obj]);
                     if sock_tx.send(Message::text(frame.to_string())).await.is_err() {
                         break;
                     }
                 }
-                Ok(_) => {} // event for another session
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                     tracing::warn!(%n, "loop_status frames lagged for {session}");
                 }
@@ -447,7 +469,7 @@ async fn ws_session(socket: WebSocket, st: AppState, session: String) {
                                             // A loop is alive (tracked here or a stale pid) —
                                             // confirm running instead of alarming the client.
                                             let frame = serde_json::json!([
-                                                { "kind": "loop_status", "running": true }
+                                                { "kind": "loop_status", "session": session, "running": true }
                                             ]);
                                             let _ = sock_tx.send(Message::text(frame.to_string())).await;
                                         } else {
@@ -537,6 +559,7 @@ async fn main() -> anyhow::Result<()> {
     let mut sessions_root: Option<PathBuf> = None;
     let mut loop_cmd: Vec<String> = vec!["rushi".into(), "run".into()];
     let mut ext_dirs: Vec<PathBuf> = Vec::new();
+    let mut config_path: Option<PathBuf> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -567,6 +590,10 @@ async fn main() -> anyhow::Result<()> {
                     ext_dirs.push(PathBuf::from(d));
                 }
             }
+            "--config" => {
+                i += 1;
+                config_path = args.get(i).map(PathBuf::from);
+            }
             "--help" | "-h" => {
                 println!(
                     "rushi-web: WebUI front-end for the rushi harness\n\
@@ -575,7 +602,10 @@ async fn main() -> anyhow::Result<()> {
                      \t  --port <PORT>          bind port (default 8480)\n\
                      \t  --sessions-root <DIR>  session directory\n\
                      \t  --loop-cmd <CMD...>    loop command (default: rushi run)\n\
-                     \t  --ext-dir <DIR>        UI-extension directory (repeatable)"
+                     \t  --ext-dir <DIR>        UI-extension directory (repeatable)\n\
+                     \t  --config <FILE>        kernel config.toml to pin for spawned loops\n\
+                     \t                       (exported to them as $CONFIG; any session working\n\
+                     \t                       directory then stays a valid working directory)"
                 );
                 return Ok(());
             }
@@ -593,6 +623,7 @@ async fn main() -> anyhow::Result<()> {
         sessions_root: sessions_root.unwrap_or_else(|| PathBuf::from("sessions")),
         loop_cmd,
         ext_dirs,
+        config_path,
     });
 
     let sessions = Arc::new(SessionManager::new(cfg.clone()));

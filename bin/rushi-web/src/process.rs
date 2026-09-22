@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 
@@ -22,6 +23,10 @@ pub struct LoopEvent {
     /// process group). Clients suppress the "stopped unexpectedly" card
     /// for intentional stops.
     pub stopped: bool,
+    /// On an abnormal (non-intentional) exit: the tail of the loop's
+    /// stderr (`sessions/<id>/loop.stderr`), so the UI can show *why*
+    /// the loop died instead of the session going silent.
+    pub detail: Option<String>,
 }
 
 /// Tracks running agent-loop processes by session name.
@@ -105,7 +110,67 @@ impl LoopManager {
                     .map(|p| p.to_path_buf())
                     .unwrap_or_else(|| std::path::PathBuf::from("."))
             });
-            cmd.current_dir(cwd);
+            cmd.current_dir(&cwd);
+            // Pin the loop's config regardless of the working directory.
+            // The loop's own resolution chain is $CONFIG → --config →
+            // <exe_dir>/../config.toml → CWD/config.toml; here the webui
+            // front-end's `--config` wins, then the inherited $CONFIG,
+            // then the two fallbacks. The winner is exported to the
+            // child so a session working directory may be ANY existing
+            // directory. When nothing resolves, fail here with a clear
+            // message instead of spawning a loop that dies at startup.
+            let cfg_pin = {
+                let inherited = std::env::var("CONFIG").ok();
+                match (&self.cfg.config_path, inherited.as_deref()) {
+                    (Some(p), _) if p.exists() => p.to_path_buf(),
+                    (Some(p), _) => {
+                        return Err(anyhow!(
+                            "config file not found: {} (from --config)",
+                            p.display()
+                        ));
+                    }
+                    (None, Some(e)) if std::path::Path::new(e).exists() => {
+                        std::path::PathBuf::from(e)
+                    }
+                    (None, Some(e)) => {
+                        return Err(anyhow!("config file not found: {} (from $CONFIG)", e));
+                    }
+                    _ => {
+                        // Fallback chain, mirroring the kernel's
+                        // resolve_config_path (side-by-side, then CWD).
+                        let exe = std::path::Path::new(&cmd0);
+                        let side = exe
+                            .parent()
+                            .map(|d| d.join(".."))
+                            .map(|d| d.join("config.toml"));
+                        let cwd_cfg = cwd.join("config.toml");
+                        let found = [side.clone(), Some(cwd_cfg.clone())]
+                            .into_iter()
+                            .flatten()
+                            .find(|p| p.exists());
+                        match found {
+                            Some(p) => p,
+                            None => {
+                                let side_desc = side
+                                    .map(|p| p.display().to_string())
+                                    .unwrap_or_else(|| "(no dir)".into());
+                                return Err(anyhow!(
+                                    "no config.toml resolvable for the loop: \
+                                     no --config, no $CONFIG, side-by-side {} missing, \
+                                     {} missing; pass --config <file> to rushi-web",
+                                    side_desc,
+                                    cwd_cfg.display()
+                                ));
+                            }
+                        }
+                    }
+                }
+            };
+            // Make the pin absolute: the loop resolves $CONFIG relative
+            // to its own CWD (the session working directory), so a
+            // relative pin would point at the wrong file.
+            let cfg_pin = std::fs::canonicalize(&cfg_pin).unwrap_or(cfg_pin);
+            cmd.env("CONFIG", cfg_pin.display().to_string());
             cmd.stdin(Stdio::null());
             cmd.stdout(Stdio::null());
             // Keep stderr on disk: a loop that dies at startup (e.g. it
@@ -148,17 +213,28 @@ impl LoopManager {
                 running: true,
                 exit: None,
                 stopped: false,
+                detail: None,
             });
 
             // Watch the child; publish its exit to the WS clients.
             {
                 let events = self.events.clone();
                 let killed = self.killed.clone();
+                let sessions_root = self.cfg.sessions_root.clone();
                 let s = session.to_string();
                 tokio::spawn(async move {
                     let status = child.wait().await;
                     let exit = status.ok().and_then(|st| st.code());
                     let stopped = killed.write().await.remove(&s);
+                    // An abnormal exit (crash / signal, not an intentional
+                    // stop) carries the stderr tail so the UI can show why
+                    // the loop died instead of the session going silent.
+                    let abnormal = !stopped && exit.map_or(true, |code| code != 0);
+                    let detail = if abnormal {
+                        stderr_tail(&sessions_root.join(&s).join("loop.stderr"), 4000)
+                    } else {
+                        None
+                    };
                     if let Some(code) = exit {
                         info!(session = %s, pid, code, stopped, "loop exited");
                     } else {
@@ -169,6 +245,7 @@ impl LoopManager {
                         running: false,
                         exit,
                         stopped,
+                        detail,
                     });
                 });
             }
@@ -224,10 +301,44 @@ impl LoopManager {
         let map = self.inner.read().await;
         map.get(session).map(|&pid| is_pid_alive(pid)).unwrap_or(false)
     }
+
+    /// Names of every session with a live loop process — the
+    /// server-side truth for the clients' sidebar lamps, sent as a
+    /// `loops` frame on every WS connect so a fresh browser can light
+    /// the breathing lamps of sessions it has not seen start.
+    pub async fn running_sessions(&self) -> Vec<String> {
+        let map = self.inner.read().await;
+        map.iter()
+            .filter(|&(_, &pid)| is_pid_alive(pid))
+            .map(|(s, _)| s.clone())
+            .collect()
+    }
 }
 
 /// Signal-0 liveness probe. Public so the loop-state endpoint can
 /// check a `loop.pid` left by a previous server instance or the TUI.
 pub fn is_pid_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+/// Read the last `max_bytes` of a file (the loop's `loop.stderr`
+/// capture), trimmed. Returns `None` when the file is missing or has
+/// no content. Used to explain abnormal loop exits in the UI.
+fn stderr_tail(path: &Path, max_bytes: usize) -> Option<String> {
+    let data = std::fs::read(path).ok()?;
+    if data.is_empty() {
+        return None;
+    }
+    let mut start = data.len().saturating_sub(max_bytes);
+    // Advance past a UTF-8 continuation byte (0b10xxxxxx) so the slice
+    // never splits a character.
+    while start < data.len() && data[start] & 0xC0 == 0x80 {
+        start += 1;
+    }
+    let text = String::from_utf8_lossy(&data[start..]).trim().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
 }

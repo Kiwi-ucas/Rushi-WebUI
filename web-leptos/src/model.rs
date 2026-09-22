@@ -129,6 +129,15 @@ pub struct AppState {
     /// detector; pile mode leaves it None (chips are driven by
     /// `view_round` there), so the chip "on" state ORs the two.
     pub round_active: RwSignal<Option<usize>>,
+    /// v0.5.13: sessions that have a live loop process RIGHT NOW
+    /// (server-driven: the "loops" snapshot on connect + each
+    /// "loop_status" frame). The sidebar shows a breathing lamp on
+    /// ANY of these — not just the session being viewed.
+    pub looping_sessions: RwSignal<std::collections::HashSet<String>>,
+    /// v0.5.13: sessions whose loop ended but which have not been
+    /// re-viewed since: the sidebar card shows a static green lamp
+    /// until the user opens the session; leaving it again clears it.
+    pub loop_done_unviewed: RwSignal<std::collections::HashSet<String>>,
 }
 
 impl AppState {
@@ -156,6 +165,8 @@ impl AppState {
             streaming: RwSignal::new(false),
             tool_pending: RwSignal::new(Vec::new()),
             round_active: RwSignal::new(None),
+            looping_sessions: RwSignal::new(std::collections::HashSet::new()),
+            loop_done_unviewed: RwSignal::new(std::collections::HashSet::new()),
         }
     }
 

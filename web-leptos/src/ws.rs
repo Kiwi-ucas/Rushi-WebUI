@@ -82,6 +82,9 @@ pub fn connect(state: &AppState, session: &str) {
     let live_reasoning = state.live_reasoning;
     let streaming = state.streaming;
     let tool_pending = state.tool_pending;
+    let looping = state.looping_sessions;
+    let done_unviewed = state.loop_done_unviewed;
+    let session_name = session.to_string();
 
     let on_msg = {
         let events = events;
@@ -92,6 +95,9 @@ pub fn connect(state: &AppState, session: &str) {
         let live_reasoning = live_reasoning;
         let streaming = streaming;
         let tool_pending = tool_pending;
+        let looping = looping;
+        let done_unviewed = done_unviewed;
+        let session_name = session_name;
         Closure::wrap(Box::new(move |e: MessageEvent| {
             let data = match e.data().as_string() {
                 Some(d) => d,
@@ -280,40 +286,93 @@ pub fn connect(state: &AppState, session: &str) {
                         events.update(|old| old.push(ev));
                         crate::pile::on_change();
                     }
+                    "loops" => {
+                        // v0.5.13: connect-time snapshot of the
+                        // server-side running-loop set — resync the
+                        // sidebar lamps on (re)connect.
+                        let mut set: std::collections::HashSet<String> =
+                            std::collections::HashSet::new();
+                        if let Some(a) = item.get("data").and_then(|v| v.as_array()) {
+                            for v in a {
+                                if let Some(s) = v.as_str() {
+                                    set.insert(s.to_string());
+                                }
+                            }
+                        }
+                        *looping.write() = set;
+                    }
                     "loop_status" => {
                         let running = item.get("running").and_then(|v| v.as_bool()).unwrap_or(false);
                         let exit = item.get("exit").and_then(|v| v.as_i64());
                         let stopped = item.get("stopped").and_then(|v| v.as_bool()).unwrap_or(false);
-                        loop_running.set(running);
-                        // An unexpected death (non-zero exit or killed by a
-                        // signal, not our stop command) gets a card so the
-                        // user can see the loop died and where to look.
-                        let unexpected = !running
-                            && !stopped
-                            && match exit {
-                                Some(c) => c != 0,
-                                None => true,
-                            };
-                        if unexpected {
-                            // The loop died mid-model-call: drop any half-
-                            // streamed text so a stale "generating" card
-                            // does not sit next to the error card.
-                            live_text.set(String::new());
-                            live_reasoning.set(String::new());
-                            streaming.set(false);
-                            let detail = match exit {
-                                Some(c) => format!("exit {c}"),
-                                None => "killed by signal".to_string(),
-                            };
-                            let ev = serde_json::json!({
-                                "type": "error",
-                                "ts": crate::timeutil::now_iso(),
-                                "message": format!(
-                                    "loop stopped unexpectedly ({detail}); check loop.stderr in the session folder"
-                                ),
-                            });
-                            events.update(|old| old.push(ev));
-                            crate::pile::on_change();
+                        // The server's waiter attaches the tail of the
+                        // loop's stderr when the death is abnormal, so
+                        // the card shows *why* the loop died instead of
+                        // just pointing at a file.
+                        let detail = item.get("detail").and_then(|v| v.as_str()).map(String::from);
+                        // v0.5.13: the frame carries its session — the
+                        // server forwards every session's loop events to
+                        // every client so each sidebar can light lamps
+                        // for sessions that are not open. Frames for
+                        // other sessions only touch the lamp sets; the
+                        // global flag and the error card apply to this
+                        // socket's session only.
+                        let sname = item
+                            .get("session")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        {
+                            let mut ls = looping.write();
+                            let mut du = done_unviewed.write();
+                            if running {
+                                ls.insert(sname.clone());
+                                du.remove(&sname);
+                            } else {
+                                ls.remove(&sname);
+                                du.insert(sname.clone());
+                            }
+                        }
+                        if sname == session_name {
+                            loop_running.set(running);
+                            // An unexpected death (non-zero exit or
+                            // killed by a signal, not our stop command)
+                            // gets a card so the user can see the loop
+                            // died and where to look.
+                            let unexpected = !running
+                                && !stopped
+                                && match exit {
+                                    Some(c) => c != 0,
+                                    None => true,
+                                };
+                            if unexpected {
+                                // The loop died mid-model-call: drop any
+                                // half- streamed text so a stale
+                                // "generating" card does not sit next to
+                                // the error card.
+                                live_text.set(String::new());
+                                live_reasoning.set(String::new());
+                                streaming.set(false);
+                                let exit_desc = match exit {
+                                    Some(c) => format!("exit {c}"),
+                                    None => "killed by signal".to_string(),
+                                };
+                                let message = match detail {
+                                    Some(d) if !d.is_empty() => format!(
+                                        "loop stopped unexpectedly ({exit_desc}):\n{d}"
+                                    ),
+                                    _ => format!(
+                                        "loop stopped unexpectedly ({exit_desc}); check loop.stderr in the session folder"
+                                    ),
+                                };
+                                let ev = serde_json::json!({
+                                    "type": "error",
+                                    "ts": crate::timeutil::now_iso(),
+                                    "message": message,
+                                });
+                                events.update(|old| old.push(ev));
+                                crate::pile::on_change();
+                            }
                         }
                     }
                     "model_stream" => {
