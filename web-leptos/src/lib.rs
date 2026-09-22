@@ -73,6 +73,17 @@ fn App() -> impl IntoView {
                 >
                     <ui::Welcome state=state />
                 </Show>
+                // v0.5.11: loop-in-progress marker in the gap between
+                // the last card and the input box.
+                <Show when=move || state.loop_running.get() fallback=|| ()>
+                    <div id="loop-indicator">
+                        <div class="loop-slot">
+                            <div class="loop-dot" />
+                            <div class="loop-dot" />
+                            <div class="loop-dot" />
+                        </div>
+                    </div>
+                </Show>
                 <ui::InputModule state=state />
             </main>
             <ui::NewSessionDialog state=state />

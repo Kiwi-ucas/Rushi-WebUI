@@ -52,7 +52,7 @@ body.kb-anim { transition: height 0.22s ease-out; }
 #sidebar-inner { width: 240px; flex: 1; min-height: 0; display: flex; flex-direction: column; overflow-y: auto; }
 #app.sidebar-collapsed #sidebar { width: 0; min-width: 0; box-shadow: none; }
 #main { flex: 1; display: flex; flex-direction: column; overflow: hidden; position: relative; }
-#main::before { content: ''; position: absolute; top: var(--band-h); bottom: 0; left: 0; width: 14px; background: linear-gradient(to right, rgba(75, 70, 55, 0.16), rgba(75, 70, 55, 0)); /* keep the top-left corner zone as clean band surface, continuous with the sidebar top bar */ -webkit-mask-image: linear-gradient(to bottom, transparent 10px, black 30px); mask-image: linear-gradient(to bottom, transparent 10px, black 30px); pointer-events: none; z-index: 47; /* same z as the z47 deck layer but earlier in tree order, so the deck face still paints on top */ }
+#main::before { content: ''; position: absolute; top: var(--band-h); bottom: 0; left: 0; width: 14px; background: linear-gradient(to right, rgba(75, 70, 55, 0.16), rgba(75, 70, 55, 0)); /* v0.5.11: the left-edge relief now runs from the band bottom, wrapping the top-left corner (the v0.5.7 10px mask cut was what left the corner relief-less) */ -webkit-mask-image: linear-gradient(to bottom, transparent 0px, black 24px); mask-image: linear-gradient(to bottom, transparent 0px, black 24px); pointer-events: none; z-index: 47; /* same z as the z47 deck layer but earlier in tree order, so the deck face still paints on top */ }
 /* Top-zone cover (v0.4.5): the strip between the header band and the
    deck (transcript 0..PILE_TOP=28px, the zone above the topmost deck
    row). Opaque rice, same top chrome as #transcript so it reads as the
@@ -64,8 +64,16 @@ body.kb-anim { transition: height 0.22s ease-out; }
 #main::after { content: ''; position: absolute; top: var(--band-h); left: 0; right: 0; height: 28px; background: var(--bg); border-top-left-radius: 14px; box-shadow: inset 0 10px 14px -10px rgba(75, 70, 55, 0.30); z-index: 46; pointer-events: none; }
 /* v0.5.7: in flat mode there is no deck, so the cover has nothing to
    hide — it just sits over the tops of cards scrolling up (the "white
-   mask over cards" report). pile::init tags <body> with .flat-mode. */
-body.flat-mode #main::after { display: none; }
+   mask over cards" report). pile::init tags <body> with .flat-mode.
+   v0.5.11: the flat strip comes back as a SHADOW-ONLY layer — a
+   transparent fall-shadow from the header band onto the cards
+   scrolling underneath. The band's relief now paints OVER the cards
+   (the "cards and top look flush" report); the v0.5.7 opaque rice
+   cover is gone, so the card tops stay fully visible. */
+body.flat-mode #main::after {
+  background: linear-gradient(to bottom, rgba(75, 70, 55, 0.22), rgba(75, 70, 55, 0));
+  box-shadow: none;
+}
 button { font-weight: 700; }
 
 .sb-header { display: flex; align-items: center; justify-content: space-between; height: var(--band-h); padding: 0 16px; border-bottom: none; box-shadow: inset 0 -1px 0 var(--border); }
@@ -114,7 +122,7 @@ button { font-weight: 700; }
 .goal-actions { display: flex; flex-wrap: wrap; gap: 4px; }
 .goal-actions button { background: var(--bg-elev); border: none; color: var(--text-muted); border-radius: 4px; padding: 2px 7px; font-size: 12px; cursor: pointer; box-shadow: var(--shadow); }
 .goal-actions button:hover { color: var(--text); box-shadow: var(--shadow-hover); }
-#input-module { margin: 10px 16px 12px; padding: 10px 14px; background: var(--bg); box-shadow: var(--shadow-hover); border-radius: 8px; display: flex; flex-direction: column; gap: 8px; position: relative; }
+#input-module { margin: 10px 20px 12px 28px; padding: 10px 14px; background: var(--bg); box-shadow: var(--shadow-hover); border-radius: 8px; display: flex; flex-direction: column; gap: 8px; position: relative; }
 #status-strip { display: flex; gap: 14px; font-size: 13px; color: var(--text-muted); font-family: "SF Mono", Consolas, monospace; min-height: 20px; align-items: center; overflow-x: auto; white-space: nowrap; }
 #status-strip:empty { display: none; }
 #status-strip .chip { display: inline-flex; align-items: center; gap: 4px; border: none; background: var(--bg-elev); border-radius: 9px; padding: 2px 8px; box-shadow: var(--shadow); font-weight: 700; }
@@ -143,7 +151,7 @@ button { font-weight: 700; }
 #ctx-pct { min-width: 32px; text-align: right; color: var(--text-muted); font-variant-numeric: tabular-nums; }
 #ctx-k { color: var(--text-muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
 
-#transcript { flex: 1; overflow-y: auto; padding: 28px 16px 20px; scroll-behavior: smooth; border-top-left-radius: 14px; box-shadow: inset 0 10px 14px -10px rgba(75, 70, 55, 0.30); overflow-anchor: none; }
+#transcript { flex: 1; overflow-y: auto; padding: 28px 20px 20px 28px; scroll-behavior: smooth; border-top-left-radius: 14px; box-shadow: inset 0 10px 14px -10px rgba(75, 70, 55, 0.30); overflow-anchor: none; }
 /* v0.5.6: session-entry transition (the early webui's quick fade + rise).
    One-shot, re-triggered by pile::on_history_loaded: remove class, force
    a style flush, re-add. 180 ms — noticeable, not heavy. */
@@ -391,7 +399,37 @@ button { font-weight: 700; }
   .qsel-chev { transition: none; }
 }
 #msg-input { flex: 1; background: var(--bg-elev); border: 1px solid var(--border); color: var(--text); border-radius: 8px; padding: 9px 12px; /* 14px = same as the message text (.ev-content); legacy 16px was an iOS auto-zoom threshold, superseded */ font-size: 14px; line-height: 21px; resize: none; height: 40px; box-sizing: border-box; overflow-y: auto; font-family: inherit; box-shadow: var(--groove); transition: height 0.12s ease; }
-#msg-input:focus { outline: none; border-color: var(--accent); }
+/* v0.5.11: focus reads as a deeper sunken groove (the flat-UI green
+   border was off-theme for the neumorphic language). */
+#msg-input:focus { outline: none; box-shadow: var(--shadow-pressed); }
+
+/* v0.5.11: neumorphic scrollbars for the two scrollers the user
+   drives by hand — the input box (once it scrolls past its height
+   cap) and the transcript. The track is a recessed channel (the
+   --groove inset pair) and the thumb a raised relief pill, so
+   scrolling the feed or the input keeps the relief language. */
+#transcript, #msg-input { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+#transcript::-webkit-scrollbar, #msg-input::-webkit-scrollbar { width: 10px; height: 10px; background: transparent; }
+#transcript::-webkit-scrollbar-track { background: var(--bg); box-shadow: inset 1px 0 2px rgba(75, 70, 55, 0.12), inset -1px 0 2px rgba(75, 70, 55, 0.12); }
+#msg-input::-webkit-scrollbar-track { background: var(--bg-elev); box-shadow: inset 1px 0 2px rgba(75, 70, 55, 0.12), inset -1px 0 2px rgba(75, 70, 55, 0.12); }
+#transcript::-webkit-scrollbar-thumb, #msg-input::-webkit-scrollbar-thumb { background: var(--bg-elev); border-radius: 6px; border: 2px solid transparent; background-clip: padding-box; box-shadow: var(--shadow); }
+
+/* v0.5.11: the loop-in-progress marker, in the gap between the last
+   card and the input box. A recessed slot with three raised dots
+   lifting in sequence — the loop, as relief. Visible only while
+   `loop_running`; pure decoration, so it never takes input. */
+#loop-indicator { display: flex; align-items: center; justify-content: center; height: 30px; flex: none; pointer-events: none; }
+#loop-indicator .loop-slot { display: flex; align-items: center; gap: 7px; padding: 0 10px; background: var(--bg-elev); border-radius: 9px; box-shadow: var(--groove); }
+#loop-indicator .loop-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent2); box-shadow: var(--shadow); animation: loop-dot 1s ease-in-out infinite; }
+#loop-indicator .loop-dot:nth-child(2) { animation-delay: 0.18s; }
+#loop-indicator .loop-dot:nth-child(3) { animation-delay: 0.36s; }
+@keyframes loop-dot {
+  0%, 100% { transform: translateY(0); opacity: 0.45; }
+  50% { transform: translateY(-2px); opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  #loop-indicator .loop-dot { animation: none; }
+}
 #btn-send { background: var(--accent); color: var(--bg); border: none; border-radius: 8px; min-width: 46px; padding: 10px 14px; cursor: pointer; font-size: 16px; font-weight: 700; box-shadow: var(--shadow); transition: box-shadow .12s ease, transform .12s ease, background-color .12s ease; height: 40px; box-sizing: border-box; display: flex; align-items: center; justify-content: center; }
 /* v0.5.6: start/stop loop folded into send — the green triangle is the
    idle/send state; the red square means the loop is running (click = stop). */
