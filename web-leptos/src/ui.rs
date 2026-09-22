@@ -630,11 +630,14 @@ fn rounds_view(
             lines.push(format!("round {}{k_part}", i + 1));
             let title = lines.join("\n");
             let i2 = i;
-            let state2 = state;
             let vr = view_round;
+            let ra = state.round_active;
             let chip_cls = move || {
                 let mut c = String::from("ctx-round");
-                if vr.get() == Some(i2) {
+                // Pile mode: view_round drives the highlight (round
+                // filter). Flat mode: round_active (the scroll position)
+                // drives it — same class, so both read one look.
+                if vr.get() == Some(i2) || ra.get() == Some(i2) {
                     c.push_str(" on");
                 }
                 c
@@ -644,7 +647,10 @@ fn rounds_view(
                     class=chip_cls
                     title=title.clone()
                     on:click=move |_| {
-                        state2.view_round.set(Some(i2));
+                        // v0.5.8: mode-aware — flat mode glides the
+                        // transcript to this round; pile mode keeps the
+                        // legacy round-filter semantics (view_round).
+                        crate::pile::nav_to_round(i2);
                     }
                 />
             }.into_any()

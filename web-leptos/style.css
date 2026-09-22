@@ -128,7 +128,11 @@ button { font-weight: 700; }
 
 #context-bar { height: var(--band-h); padding: 4px 16px 2px; border-bottom: none; box-shadow: inset 0 -1px 0 var(--border); font-size: 12px; font-weight: 700; color: var(--text-muted); display: flex; flex-direction: column; gap: 3px; }
 #ctx-row { display: flex; align-items: center; gap: 6px; flex: 1; min-height: 0; }
-#ctx-rounds { display: flex; align-items: center; justify-content: space-between; height: 14px; flex: none; }
+#ctx-rounds { display: flex; align-items: center; justify-content: space-between; height: 14px; flex: none; overflow: hidden; }
+/* v0.5.8: the Leptos For wrapper stays out of layout, so the chips
+   are the row's direct flex children — overflow clipping and the
+   scrollLeft centering (center_round_chip) work on #ctx-rounds. */
+#ctx-rounds > div { display: contents; }
 .ctx-round { width: 26px; height: 10px; min-width: 26px; margin: 0; padding: 0; background: var(--bg-elev); border: 1px solid var(--border); border-radius: 4px; box-shadow: var(--groove); cursor: pointer; }
 .ctx-round:hover { box-shadow: var(--shadow); }
 .ctx-round.on { background: var(--accent); border-color: var(--accent); }

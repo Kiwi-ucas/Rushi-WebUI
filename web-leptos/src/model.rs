@@ -123,6 +123,12 @@ pub struct AppState {
     /// `tool_call` ids that have no `tool_result` yet: their cards
     /// show a running state until the result event arrives.
     pub tool_pending: RwSignal<Vec<String>>,
+    /// v0.5.8 (flat mode only): the round currently under the
+    /// viewport according to the scroll position — drives the chip
+    /// row. Written by the pile engine's flat-mode scroll→round
+    /// detector; pile mode leaves it None (chips are driven by
+    /// `view_round` there), so the chip "on" state ORs the two.
+    pub round_active: RwSignal<Option<usize>>,
 }
 
 impl AppState {
@@ -149,6 +155,7 @@ impl AppState {
             live_reasoning: RwSignal::new(String::new()),
             streaming: RwSignal::new(false),
             tool_pending: RwSignal::new(Vec::new()),
+            round_active: RwSignal::new(None),
         }
     }
 

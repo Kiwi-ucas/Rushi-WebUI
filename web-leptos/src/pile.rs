@@ -315,6 +315,11 @@ struct PileState {
     current_summary: Option<HtmlElement>,
     last_applied_summary: Option<HtmlElement>,
     last_events_len: usize,
+    /// v0.5.8: caches for the flat-mode scroll→round detector —
+    /// detection runs only when the scroll top or event count
+    /// changed, so idle frames stay read-only.
+    last_round_top: f64,
+    last_round_events_len: usize,
     last_view: Option<usize>,
     /// visualViewport keyboard-lift state.
     kb_open: bool,
@@ -448,7 +453,7 @@ pub fn init(state: AppState) {
 
         // Build marker: name the running bundle so a stale cached
         // wasm/js is easy to spot (DevTools console).
-        let _ = js_sys::eval("console.log('[rushi-webui] build v0.5.7-flat')");
+        let _ = js_sys::eval("console.log('[rushi-webui] build v0.5.8-flat')");
 
         // Flat mode: default is the deck-less transcript (basic
         // usability); `?pile=1` restores the full card-deck engine.
@@ -491,6 +496,8 @@ pub fn init(state: AppState) {
             current_summary: None,
             last_applied_summary: None,
             last_events_len: 0,
+            last_round_top: -1.0,
+            last_round_events_len: 0,
             last_view: None,
             kb_open: false,
             step_scheduled: false,
@@ -822,6 +829,9 @@ fn step_full(st: &mut PileState) {
         st.last_applied_summary = None;
         st.last_events_len = 0;
         st.last_view = view;
+        // v0.5.8: clear the scroll-driven round highlight. Flat mode
+        // writes it; in pile mode it is None, so this is a no-op.
+        st.state.round_active.set(None);
         st.last_active = active.clone();
         st.fold_applied = false;
         // Spring / commit bookkeeping belongs to the previous
@@ -863,6 +873,10 @@ fn step_full(st: &mut PileState) {
                 }
             }
         }
+        // v0.5.8: scroll→round coupling. The chip row highlights the
+        // round under the viewport (flat only; pile-mode chips stay
+        // bound to the round filter, view_round).
+        detect_active_round(st, &events);
         return;
     }
 
@@ -1189,6 +1203,182 @@ fn sync_stick(st: &mut PileState) {
     if d <= 80.0 {
         st.stick_to_bottom = true;
     }
+}
+
+// ── v0.5.8: flat-mode round-chip scroll coupling ───────────────────
+/// Card index (k-th `.event` child of #transcript) of event `e`, or
+/// None if that event renders no card (ext_status). Card k ↔ the
+/// k-th rendered event — the mapping the whole engine relies on.
+fn event_card_index(events: &[serde_json::Value], e: usize) -> Option<usize> {
+    let mut k = 0usize;
+    for (j, ev) in events.iter().enumerate() {
+        let rendered = ev.get("type").and_then(|t| t.as_str()) != Some("ext_status");
+        if j == e {
+            return rendered.then_some(k);
+        }
+        if rendered {
+            k += 1;
+        }
+    }
+    None
+}
+
+/// Scroll → round (flat only): light the chip of the round the
+/// viewport sits on. Runs in the flat step_full branch; re-runs only
+/// when the scroll top or the event count changed (the
+/// `last_round_top` / `last_round_events_len` caches), and writes
+/// `round_active` only when the value actually changed, so idle
+/// frames stay read-only.
+fn detect_active_round(st: &mut PileState, events: &[serde_json::Value]) {
+    let tr = match st.transcript.clone() { Some(t) => t, None => return };
+    let s_top = tr.scroll_top() as f64;
+    let n = events.len();
+    if s_top == st.last_round_top && n == st.last_round_events_len {
+        return; // idle: no scroll motion, no new events
+    }
+    st.last_round_top = s_top;
+    st.last_round_events_len = n;
+
+    let rounds = compute_rounds(events);
+    if rounds.is_empty() {
+        if st.state.round_active.get_untracked().is_some() {
+            st.state.round_active.set(None);
+        }
+        return;
+    }
+    let cards = iter_cards(st);
+    let tr_top = tr.get_bounding_client_rect().top();
+    let client_h = tr.client_height() as f64;
+    // Sample line: 30% down the viewport — the round whose opening
+    // card sits at/above this line owns the viewport.
+    let sample = s_top + client_h * 0.30;
+    let mut active: Option<usize> = None;
+    for (i, r) in rounds.iter().enumerate() {
+        let anchor_ev = (r.start..r.end)
+            .find(|&j| {
+                events
+                    .get(j)
+                    .map(|e| e.get("type").and_then(|t| t.as_str()) != Some("ext_status"))
+                    .unwrap_or(false)
+            });
+        let Some(ci) = anchor_ev.and_then(|j| event_card_index(events, j)) else {
+            continue;
+        };
+        let Some(anchor) = cards.get(ci) else {
+            continue; // card not flushed yet; the next event/scroll heals it
+        };
+        let top = anchor.get_bounding_client_rect().top() - tr_top + s_top;
+        if top <= sample + 0.5 {
+            active = Some(i);
+        }
+    }
+    // Pinned at the bottom (following the live feed): the current
+    // round is the last one, even when its opener sits above the
+    // sample line.
+    let dist_bottom = tr.scroll_height() as f64 - s_top - client_h;
+    if dist_bottom <= 80.0 {
+        active = Some(rounds.len() - 1);
+    }
+    if st.state.round_active.get_untracked() != active {
+        st.state.round_active.set(active);
+        if let Some(i) = active {
+            center_round_chip(st, i);
+        }
+    }
+}
+
+/// Keep the active chip centered in the (overflow-clipped) chip row,
+/// so past six rounds the highlighted chip is always in view.
+/// One `scrollLeft` write per highlight change.
+fn center_round_chip(st: &PileState, i: usize) {
+    let Some(w) = web_sys::window() else {
+        return;
+    };
+    let Some(doc) = w.document() else {
+        return;
+    };
+    let Some(row) = doc
+        .get_element_by_id("ctx-rounds")
+        .map(|e| e.unchecked_into::<HtmlElement>())
+    else {
+        return;
+    };
+    // The chips render as the row's flex children (`display: contents`
+    // on the Leptos For wrapper), but in the DOM they are still the
+    // wrapper div's children — so traverse into the wrapper.
+    let Some(inner) = row.children().item(0).map(|d| d.unchecked_into::<HtmlElement>()) else {
+        return;
+    };
+    let Some(chip) = inner.children().item(i as u32).map(|c| c.unchecked_into::<HtmlElement>()) else {
+        return;
+    };
+    // Content-x of the chip inside the row, then center it.
+    let x = chip.get_bounding_client_rect().left() - row.get_bounding_client_rect().left()
+        + row.scroll_left() as f64;
+    let target = x - (row.client_width() as f64 - chip.offset_width() as f64) / 2.0;
+    let max = row.scroll_width() as f64 - row.client_width() as f64;
+    let _ = row.set_scroll_left(target.clamp(0.0, max.max(0.0)) as i32);
+}
+
+/// Chip click. Pile mode keeps the legacy round filter (`view_round`
+/// → fold + park). Flat mode: chips are a scroll navigator over the
+/// fully-tiled transcript — glide to the round's opening card and
+/// light the chip (the detector confirms it as the glide lands).
+pub fn nav_to_round(i: usize) {
+    with_pile(|cell| {
+        let st = cell.borrow();
+        let Some(rc) = st.as_ref() else {
+            return;
+        };
+        let mut st = rc.borrow_mut();
+        if !st.flat {
+            st.state.view_round.set(Some(i));
+            return;
+        }
+        let tr = match st.transcript.clone() { Some(t) => t, None => return };
+        let events = st.state.events.get_untracked();
+        let rounds = compute_rounds(&events);
+        let Some(r) = rounds.get(i) else {
+            return;
+        };
+        let n = events.len();
+        let anchor_ev = (r.start..r.end.min(n)).find(|&j| {
+            events
+                .get(j)
+                .map(|e| e.get("type").and_then(|t| t.as_str()) != Some("ext_status"))
+                .unwrap_or(false)
+        });
+        let Some(ci) = anchor_ev.and_then(|j| event_card_index(&events, j)) else {
+            return;
+        };
+        let cards = iter_cards(&st);
+        let Some(anchor) = cards.get(ci) else {
+            return;
+        };
+        let target = (anchor.get_bounding_client_rect().top()
+            - tr.get_bounding_client_rect().top()
+            + tr.scroll_top() as f64)
+            .max(0.0);
+        // A pending park (session-landing repark / grew-park) must not
+        // yank the user back to the bottom mid-glide.
+        st.park_bottom = false;
+        // Mid-transcript jump = reading history → release the follow;
+        // jumping to the last round keeps it (the per-frame pin
+        // re-arms once the viewport rests within 80px of the bottom).
+        st.stick_to_bottom = i + 1 == rounds.len();
+        // One-shot smooth glide: the engine's steady state is inline
+        // `scroll-behavior:auto`; override it for this scroll, then
+        // restore it so per-frame pin writes stay instant.
+        let _ = tr.style().set_property("scroll-behavior", "smooth");
+        tr.set_scroll_top(target as i32);
+        st.state.round_active.set(Some(i));
+        center_round_chip(&st, i);
+        let t2 = tr.clone();
+        let to = gloo_timers::callback::Timeout::new(500, move || {
+            let _ = t2.style().set_property("scroll-behavior", "auto");
+        });
+        LEAKED.with(|l| l.borrow_mut().push(Box::new(to)));
+    });
 }
 
 // ── DOM traversal helpers ──────────────────────────────────────────
