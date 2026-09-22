@@ -336,6 +336,16 @@ struct PileState {
     down_intent: bool,
     /// v0.5.10: last touch Y (client coords) for touchmove direction.
     last_touch_y: Option<f64>,
+    /// v0.5.12: a passive bottom clamp was detected on the previous
+    /// flat step (a scroll-top drop with no user input event — the
+    /// content shrank above the viewport, i.e. live-card
+    /// finalization). The flat step consumes it with a same-frame
+    /// settle pull so the clamped position is never painted.
+    passive_clamp: bool,
+    /// v0.5.12: stick_to_bottom flip history (last 6 entries,
+    /// "<perf.now ms> <reason>"), surfaced by __rushiPile() so a
+    /// follow regression is triaged from the console in one shot.
+    stick_hist: Vec<String>,
     last_view: Option<usize>,
     /// visualViewport keyboard-lift state.
     kb_open: bool,
@@ -472,7 +482,7 @@ pub fn init(state: AppState) {
 
         // Build marker: name the running bundle so a stale cached
         // wasm/js is easy to spot (DevTools console).
-        let _ = js_sys::eval("console.log('[rushi-webui] build v0.5.11-flat')");
+        let _ = js_sys::eval("console.log('[rushi-webui] build v0.5.12-flat')");
 
         // Flat mode: default is the deck-less transcript (basic
         // usability); `?pile=1` restores the full card-deck engine.
@@ -522,6 +532,8 @@ pub fn init(state: AppState) {
             input_up: false,
             down_intent: false,
             last_touch_y: None,
+            passive_clamp: false,
+            stick_hist: Vec::new(),
             last_view: None,
             kb_open: false,
             step_scheduled: false,
@@ -583,7 +595,7 @@ pub fn init(state: AppState) {
             let vt: EventTarget = t.clone().unchecked_into();
             let on_wheel = Closure::<dyn Fn(web_sys::Event)>::new(|e: web_sys::Event| {
                 let we = e.unchecked_into::<web_sys::WheelEvent>();
-                record_wheel_input(we.delta_y());
+                record_wheel_input(we.delta_y(), we.ctrl_key());
                 schedule_step();
             });
             let _ = vt.add_event_listener_with_callback("wheel", on_wheel.as_js_value().unchecked_ref::<js_sys::Function>());
@@ -749,7 +761,7 @@ fn register_debug_hook(w: &web_sys::Window) {
                         .filter(|el| el.class_list().contains("compact"))
                         .count();
                     format!(
-                        "init=1 flat={} steps={} fold_applied={} compact={}/{} events={} cards={} pile_face={} pile_open={} kb_open={} summary={} park_bottom={} stick={} stall_reported={} active={:?} view={:?} last_panic={} dbg=[{}]",
+                        "init=1 flat={} steps={} fold_applied={} compact={}/{} events={} cards={} pile_face={} pile_open={} kb_open={} summary={} park_bottom={} stick={} stall_reported={} active={:?} view={:?} last_panic={} stick_hist=[{}] dbg=[{}]",
                         st.flat,
                         st.steps,
                         st.fold_applied,
@@ -767,6 +779,7 @@ fn register_debug_hook(w: &web_sys::Window) {
                         st.state.active_session.get_untracked().as_deref(),
                         st.last_view,
                         last_panic_str(),
+                        st.stick_hist.join(" | "),
                         st.deal_dbg_hist.join(" | "),
                     )
                 }
@@ -805,13 +818,14 @@ pub fn on_history_loaded() {
         st.park_bottom = true;
         // Landing on the last message means we're at the bottom:
         // follow the live feed from here.
-        st.stick_to_bottom = true;
+        note_stick(&mut st, true, "rearm:history-land");
         // v0.5.10: re-seed the intent bookkeeping for the landing.
         st.last_range = -1.0;
         st.last_input_t = 0.0;
         st.input_up = false;
         st.down_intent = false;
         st.last_touch_y = None;
+        st.passive_clamp = false;
         // v0.5.6: quick "enter session" transition — a one-shot fade +
         // 6 px rise on the whole transcript (style.css
         // `.transcript-in`, ~180 ms; the early webui's simple, fast
@@ -895,6 +909,7 @@ fn step_full(st: &mut PileState) {
         st.input_up = false;
         st.down_intent = false;
         st.last_touch_y = None;
+        st.passive_clamp = false;
         st.last_active = active.clone();
         st.fold_applied = false;
         // Spring / commit bookkeeping belongs to the previous
@@ -914,6 +929,16 @@ fn step_full(st: &mut PileState) {
     if st.flat {
         sync_stick(st);
         step_scrolls(st, &events, &active, view);
+        // v0.5.12: settle pull — a passive bottom clamp (the live card
+        // finalizing into a shorter card) leaves the viewport pinned
+        // to the shrunken bottom; with no content growth the per-frame
+        // pin below never fires, so the "pop to the top of the new
+        // card" would sit visible for the whole agent think gap.
+        // Park back to the true bottom in the same frame, before paint.
+        if st.stick_to_bottom && view.is_none() && active.is_some() && st.passive_clamp {
+            st.passive_clamp = false;
+            park_to_bottom(st, false);
+        }
         // Tight follow (v0.5.6): while the user is following (sticky)
         // and in the live view, pin the viewport bottom every frame,
         // so ANY content growth — streaming deltas, landed event
@@ -1141,7 +1166,8 @@ fn step_scrolls(
         st.last_active = active.clone();
         // We are landing on the newest message: follow the live feed
         // from here until the user scrolls up to read history.
-        st.stick_to_bottom = true;
+        note_stick(st, true, "rearm:session");
+        st.passive_clamp = false;
         park_to_bottom(st, true);
     }
 
@@ -1165,7 +1191,7 @@ fn step_scrolls(
             .iter()
             .any(|e| e.get("type").and_then(|t| t.as_str()) == Some("user_message"));
         if new_user_msg {
-            st.stick_to_bottom = true;
+            note_stick(st, true, "rearm:new-msg");
         }
     }
     if grew && view.is_none() && active.is_some() && st.stick_to_bottom {
@@ -1275,13 +1301,20 @@ fn perf_now_ms() -> f64 {
 /// `delta_y < 0` = scrolling up (release candidate); `> 0` = down
 /// (re-arm candidate, consumed by the next flat step when the
 /// viewport is within 80 px of the bottom).
-fn record_wheel_input(delta_y: f64) {
+fn record_wheel_input(delta_y: f64, ctrl: bool) {
     with_pile(|cell| {
         let st = cell.borrow();
         let Some(rc) = st.as_ref() else {
             return;
         };
         let mut st = rc.borrow_mut();
+        if ctrl {
+            // v0.5.12: on macOS a pinch-zoom also fires wheel events
+            // (ctrlKey set). Zoom is not scroll intent — a stray
+            // pinch must not latch input_up and release the follow at
+            // the next passive clamp.
+            return;
+        }
         st.last_input_t = perf_now_ms();
         if delta_y < 0.0 {
             st.input_up = true;
@@ -1323,6 +1356,21 @@ fn record_touch_input(e: &web_sys::TouchEvent) {
     }
 }
 
+/// v0.5.12: record a stick_to_bottom transition (no-op when the flag
+/// already holds the value) and keep a short history for __rushiPile()
+/// so a follow regression is triaged from the console in one shot.
+fn note_stick(st: &mut PileState, to: bool, reason: &str) {
+    if st.stick_to_bottom == to {
+        return;
+    }
+    st.stick_to_bottom = to;
+    let t = perf_now_ms();
+    st.stick_hist.push(format!("{t:.0} {reason}"));
+    if st.stick_hist.len() > 6 {
+        st.stick_hist.remove(0);
+    }
+}
+
 /// `delta` measures user motion only.
 fn sync_stick(st: &mut PileState) {
     let Some(tr) = &st.transcript else { return };
@@ -1349,23 +1397,34 @@ fn sync_stick(st: &mut PileState) {
     if st.down_intent {
         st.down_intent = false;
         if d <= 80.0 {
-            st.stick_to_bottom = true;
+            note_stick(st, true, "rearm:down");
         }
     }
     // 2. A recent upward user input releases the follow immediately,
     //    at ANY distance (the v0.5.9 fix: no band to fight through).
     if recent_input && st.input_up {
-        st.stick_to_bottom = false;
+        note_stick(st, false, "release:up-input");
     }
     // 3. An upward scroll-top delta with no recent input: a scrollbar
     //    drag (release) or a passive clamp from content shrinkage
     //    above the viewport (keep the flag — the finalization case).
     //    Only the part of the move NOT explained by the shrink
     //    (last_range - range) counts as user motion.
+    //    v0.5.12: release ONLY when the unexplained move left the
+    //    viewport far above the bottom (d > 80). A passive bottom
+    //    clamp always leaves d ≈ 0, so a finalization shrink can
+    //    never release the follow; the settle pull in step_full
+    //    re-snaps the clamped viewport in the same frame instead.
     if delta < -0.5 && !recent_input && st.last_range >= 0.0 {
         let shrink = st.last_range - range;
-        if -delta - shrink > 0.5 {
-            st.stick_to_bottom = false; // scrollbar drag / external scroll
+        let unexplained = -delta - shrink;
+        if unexplained > 0.5 && d > 80.0 {
+            note_stick(st, false, "release:unexplained");
+        } else if st.stick_to_bottom {
+            // Upward motion that the shrink (fully or nearly) explains
+            // = a passive clamp while sticky. Request the same-frame
+            // settle pull in step_full's flat branch.
+            st.passive_clamp = true;
         }
     }
     st.last_range = range;
@@ -1535,7 +1594,9 @@ pub fn nav_to_round(i: usize) {
         // Mid-transcript jump = reading history → release the follow;
         // jumping to the last round keeps it (the per-frame pin
         // re-arms once the viewport rests within 80px of the bottom).
-        st.stick_to_bottom = i + 1 == rounds.len();
+        let is_last = i + 1 == rounds.len();
+        st.passive_clamp = false;
+        note_stick(&mut st, is_last, if is_last { "rearm:chip-last" } else { "release:chip" });
         // One-shot smooth glide: the engine's steady state is inline
         // `scroll-behavior:auto`; override it for this scroll, then
         // restore it so per-frame pin writes stay instant.
@@ -1557,6 +1618,7 @@ pub fn nav_to_round(i: usize) {
                     s.last_round_top = t2.scroll_top() as f64;
                     s.last_round_events_len = s.state.events.get_untracked().len();
                     s.last_range = t2.scroll_height() as f64 - t2.client_height() as f64;
+                    s.passive_clamp = false;
                 }
             });
         });
@@ -1905,7 +1967,7 @@ fn sync_unfold(st: &mut PileState, cards: &[HtmlElement]) {
         // delta ~ 0) never clears the flag — that is what keeps the
         // viewport following a streaming loop card after card.
         if d > 80.0 {
-            st.stick_to_bottom = false;
+            note_stick(st, false, "release:pile-dist");
         }
         delta.abs() / dt_ms
     } else {
@@ -1914,7 +1976,7 @@ fn sync_unfold(st: &mut PileState, cards: &[HtmlElement]) {
     // Re-arm the live follow whenever the viewport rests within 80px
     // of the bottom: the user is watching the feed or just returned.
     if d <= 80.0 {
-        st.stick_to_bottom = true;
+        note_stick(st, true, "rearm:pile-dist");
     }
     st.deal_dbg_hist.push(format!(
         "Δ={:.0} s_top={:.0}",
