@@ -320,6 +320,22 @@ struct PileState {
     /// changed, so idle frames stay read-only.
     last_round_top: f64,
     last_round_events_len: usize,
+    /// v0.5.10: previous frame's max scroll (scroll_height -
+    /// client_height); -1 = unseeded. Measures the content shrink a
+    /// passive browser clamp explains, so a DOM-induced upward
+    /// scroll-top delta is not misread as user motion.
+    last_range: f64,
+    /// v0.5.10: perf.now() ms of the last wheel / touch input on the
+    /// transcript (0 = none yet).
+    last_input_t: f64,
+    /// v0.5.10: the last input scrolled up (true) or down (false).
+    input_up: bool,
+    /// v0.5.10: the user's last input scrolled down; consumed by the
+    /// next flat step — re-arms the follow if the viewport is within
+    /// 80 px of the bottom.
+    down_intent: bool,
+    /// v0.5.10: last touch Y (client coords) for touchmove direction.
+    last_touch_y: Option<f64>,
     last_view: Option<usize>,
     /// visualViewport keyboard-lift state.
     kb_open: bool,
@@ -369,6 +385,9 @@ struct PileState {
     raf: Option<Closure<dyn Fn()>>,
     scroll_cb: Option<Closure<dyn Fn()>>,
     click_cb: Option<Closure<dyn Fn(web_sys::Event)>>,
+    /// v0.5.10: wheel / touchmove listeners (user scroll-intent input).
+    wheel_cb: Option<Closure<dyn Fn(web_sys::Event)>>,
+    touch_cb: Option<Closure<dyn Fn(web_sys::Event)>>,
     animend_cb: Option<Closure<dyn Fn(web_sys::Event)>>,
     resize_cb: Option<Closure<dyn Fn()>>,
     transend_cb: Option<Closure<dyn Fn()>>,
@@ -453,7 +472,7 @@ pub fn init(state: AppState) {
 
         // Build marker: name the running bundle so a stale cached
         // wasm/js is easy to spot (DevTools console).
-        let _ = js_sys::eval("console.log('[rushi-webui] build v0.5.9-flat')");
+        let _ = js_sys::eval("console.log('[rushi-webui] build v0.5.10-flat')");
 
         // Flat mode: default is the deck-less transcript (basic
         // usability); `?pile=1` restores the full card-deck engine.
@@ -498,6 +517,11 @@ pub fn init(state: AppState) {
             last_events_len: 0,
             last_round_top: -1.0,
             last_round_events_len: 0,
+            last_range: -1.0,
+            last_input_t: 0.0,
+            input_up: false,
+            down_intent: false,
+            last_touch_y: None,
             last_view: None,
             kb_open: false,
             step_scheduled: false,
@@ -516,6 +540,8 @@ pub fn init(state: AppState) {
             reduced_motion: false,
             raf: None,
             scroll_cb: None,
+            wheel_cb: None,
+            touch_cb: None,
             click_cb: None,
             animend_cb: None,
             resize_cb: None,
@@ -545,6 +571,30 @@ pub fn init(state: AppState) {
             let on_scroll = Closure::<dyn Fn()>::new(|| schedule_step());
             let _ = vt.add_event_listener_with_callback("scroll", on_scroll.as_js_value().unchecked_ref::<js_sys::Function>());
             ps.scroll_cb = Some(on_scroll);
+        }
+
+        // v0.5.10: user scroll-intent input. Wheel / touch events on
+        // the transcript record the user's up / down intent so the
+        // flat sticky gate can release / re-arm the follow from
+        // INTENT, not from the raw scroll-top delta — a passive
+        // browser clamp (content shrink, live-card finalization)
+        // produces no input event and must not release the follow.
+        if let Some(t) = &ps.transcript {
+            let vt: EventTarget = t.clone().unchecked_into();
+            let on_wheel = Closure::<dyn Fn(web_sys::Event)>::new(|e: web_sys::Event| {
+                let we = e.unchecked_into::<web_sys::WheelEvent>();
+                record_wheel_input(we.delta_y());
+                schedule_step();
+            });
+            let _ = vt.add_event_listener_with_callback("wheel", on_wheel.as_js_value().unchecked_ref::<js_sys::Function>());
+            ps.wheel_cb = Some(on_wheel);
+            let on_touch = Closure::<dyn Fn(web_sys::Event)>::new(|e: web_sys::Event| {
+                let te = e.unchecked_into::<web_sys::TouchEvent>();
+                record_touch_input(&te);
+                schedule_step();
+            });
+            let _ = vt.add_event_listener_with_callback("touchmove", on_touch.as_js_value().unchecked_ref::<js_sys::Function>());
+            ps.touch_cb = Some(on_touch);
         }
 
         // transcript click → pile open/close (legacy handler).
@@ -756,6 +806,12 @@ pub fn on_history_loaded() {
         // Landing on the last message means we're at the bottom:
         // follow the live feed from here.
         st.stick_to_bottom = true;
+        // v0.5.10: re-seed the intent bookkeeping for the landing.
+        st.last_range = -1.0;
+        st.last_input_t = 0.0;
+        st.input_up = false;
+        st.down_intent = false;
+        st.last_touch_y = None;
         // v0.5.6: quick "enter session" transition — a one-shot fade +
         // 6 px rise on the whole transcript (style.css
         // `.transcript-in`, ~180 ms; the early webui's simple, fast
@@ -832,6 +888,13 @@ fn step_full(st: &mut PileState) {
         // v0.5.8: clear the scroll-driven round highlight. Flat mode
         // writes it; in pile mode it is None, so this is a no-op.
         st.state.round_active.set(None);
+        // v0.5.10: drop the user-intent bookkeeping of the old
+        // session (stale intent must not leak into the new one).
+        st.last_range = -1.0;
+        st.last_input_t = 0.0;
+        st.input_up = false;
+        st.down_intent = false;
+        st.last_touch_y = None;
         st.last_active = active.clone();
         st.fold_applied = false;
         // Spring / commit bookkeeping belongs to the previous
@@ -1090,8 +1153,21 @@ fn step_scrolls(
     // scroll-up (sync_unfold) and re-armed when they land back at
     // the bottom, so it stays true through content growth (which is
     // exactly when we need it).
-    let grew = events.len() > st.last_events_len;
+    let prev_events = st.last_events_len;
+    let grew = events.len() > prev_events;
     st.last_events_len = events.len();
+    // v0.5.10: a new USER message re-arms the follow even while the
+    // user is reading history — sending a round means watching it.
+    // Agent-driven events (tool / assistant) do NOT re-arm: a reader
+    // below the live feed stays put.
+    if grew && view.is_none() && active.is_some() {
+        let new_user_msg = events[prev_events..]
+            .iter()
+            .any(|e| e.get("type").and_then(|t| t.as_str()) == Some("user_message"));
+        if new_user_msg {
+            st.stick_to_bottom = true;
+        }
+    }
     if grew && view.is_none() && active.is_some() && st.stick_to_bottom {
         // Park WITH the 150 ms re-park: this branch may run in the
         // DOM-lag gate, before Leptos has flushed the new card nodes,
@@ -1187,6 +1263,66 @@ fn park_to_bottom(st: &mut PileState, repark: bool) {
 /// distance itself grew with the content and the flag released at the
 /// worst moment (mid-stream), which is exactly the "no auto-follow"
 /// symptom. `last_stop` is synced by every programmatic scroll, so
+/// perf.now() in ms — the clock the input-intent timestamps use.
+fn perf_now_ms() -> f64 {
+    web_sys::window()
+        .and_then(|w| w.performance())
+        .map(|p| p.now())
+        .unwrap_or(0.0)
+}
+
+/// v0.5.10: record a wheel input's direction as user scroll intent.
+/// `delta_y < 0` = scrolling up (release candidate); `> 0` = down
+/// (re-arm candidate, consumed by the next flat step when the
+/// viewport is within 80 px of the bottom).
+fn record_wheel_input(delta_y: f64) {
+    with_pile(|cell| {
+        let st = cell.borrow();
+        let Some(rc) = st.as_ref() else {
+            return;
+        };
+        let mut st = rc.borrow_mut();
+        st.last_input_t = perf_now_ms();
+        if delta_y < 0.0 {
+            st.input_up = true;
+        } else if delta_y > 0.0 {
+            st.input_up = false;
+            st.down_intent = true;
+        }
+    });
+}
+
+/// v0.5.10: record a touchmove's direction (vs the previous touch Y)
+/// as user scroll intent.
+fn record_touch_input(e: &web_sys::TouchEvent) {
+    let y = e
+        .changed_touches()
+        .item(0)
+        .map(|t| t.client_y() as f64);
+    if let Some(y) = y {
+        with_pile(|cell| {
+            let st = cell.borrow();
+            let Some(rc) = st.as_ref() else {
+                return;
+            };
+            let mut st = rc.borrow_mut();
+            st.last_input_t = perf_now_ms();
+            let d = match st.last_touch_y {
+                Some(prev) if y < prev - 0.5 => -1,
+                Some(prev) if y > prev + 0.5 => 1,
+                _ => 0,
+            };
+            st.last_touch_y = Some(y);
+            if d < 0 {
+                st.input_up = true;
+            } else if d > 0 {
+                st.input_up = false;
+                st.down_intent = true;
+            }
+        });
+    }
+}
+
 /// `delta` measures user motion only.
 fn sync_stick(st: &mut PileState) {
     let Some(tr) = &st.transcript else { return };
@@ -1195,23 +1331,44 @@ fn sync_stick(st: &mut PileState) {
     let delta = s_top - st.last_stop;
     st.last_stop = s_top;
     let d = range - s_top; // distance to the transcript bottom
-    // v0.5.9: intent-gated release / re-arm. The v0.5.6 rule only
-    // released when the user had climbed > 80 px off the bottom, so
-    // INSIDE that band the per-frame bottom pin kept snapping the
-    // viewport back while the user scrolled up — every small
-    // wheel/trackpad step was erased ("stuck at the bottom, must
-    // scroll hard to break free"). Now: ANY upward user scroll
-    // releases the follow immediately, at any distance; the follow
-    // re-arms only when the user's own downward scroll lands within
-    // 80 px of the bottom. Pure content growth (delta ≈ 0) never
-    // toggles the flag, so a watcher at the bottom keeps following
-    // and a reader mid-transcript is never yanked.
-    if delta < -0.5 {
-        st.stick_to_bottom = false; // user is reading history
+    let recent_input = perf_now_ms() - st.last_input_t < 300.0;
+
+    // v0.5.10: release / re-arm driven by user INPUT, not by the raw
+    // delta. The v0.5.9 rule read the delta as user motion, but a
+    // PASSIVE delta — the browser clamping the viewport up when the
+    // content above it shrinks (live-card finalization: `.ev-live`
+    // collapses and a shorter final card lands) — looks identical to
+    // a user scroll up. That released the follow the moment a round's
+    // stream ended, so the viewport bounced to the new card's top
+    // and stopped following. Wheel / touch inputs (captured in init)
+    // carry the real intent; the frame pass only covers what no input
+    // event does (scrollbar drags).
+    //
+    // 1. The user's own downward motion, landing within 80 px of the
+    //    bottom, re-arms the follow (watching again / just returned).
+    if st.down_intent {
+        st.down_intent = false;
+        if d <= 80.0 {
+            st.stick_to_bottom = true;
+        }
     }
-    if delta > 0.5 && d <= 80.0 {
-        st.stick_to_bottom = true; // user returned to the bottom: follow
+    // 2. A recent upward user input releases the follow immediately,
+    //    at ANY distance (the v0.5.9 fix: no band to fight through).
+    if recent_input && st.input_up {
+        st.stick_to_bottom = false;
     }
+    // 3. An upward scroll-top delta with no recent input: a scrollbar
+    //    drag (release) or a passive clamp from content shrinkage
+    //    above the viewport (keep the flag — the finalization case).
+    //    Only the part of the move NOT explained by the shrink
+    //    (last_range - range) counts as user motion.
+    if delta < -0.5 && !recent_input && st.last_range >= 0.0 {
+        let shrink = st.last_range - range;
+        if -delta - shrink > 0.5 {
+            st.stick_to_bottom = false; // scrollbar drag / external scroll
+        }
+    }
+    st.last_range = range;
 }
 
 // ── v0.5.8: flat-mode round-chip scroll coupling ───────────────────
@@ -1291,7 +1448,7 @@ fn detect_active_round(st: &mut PileState, events: &[serde_json::Value]) {
     if st.state.round_active.get_untracked() != active {
         st.state.round_active.set(active);
         if let Some(i) = active {
-            center_round_chip(st, i);
+            center_round_chip(i);
         }
     }
 }
@@ -1299,7 +1456,7 @@ fn detect_active_round(st: &mut PileState, events: &[serde_json::Value]) {
 /// Keep the active chip centered in the (overflow-clipped) chip row,
 /// so past six rounds the highlighted chip is always in view.
 /// One `scrollLeft` write per highlight change.
-fn center_round_chip(st: &PileState, i: usize) {
+fn center_round_chip(i: usize) {
     let Some(w) = web_sys::window() else {
         return;
     };
@@ -1385,7 +1542,7 @@ pub fn nav_to_round(i: usize) {
         let _ = tr.style().set_property("scroll-behavior", "smooth");
         tr.set_scroll_top(target as i32);
         st.state.round_active.set(Some(i));
-        center_round_chip(&st, i);
+        center_round_chip(i);
         let t2 = tr.clone();
         let to = gloo_timers::callback::Timeout::new(500, move || {
             let _ = t2.style().set_property("scroll-behavior", "auto");
@@ -1399,6 +1556,7 @@ pub fn nav_to_round(i: usize) {
                     s.last_stop = t2.scroll_top() as f64;
                     s.last_round_top = t2.scroll_top() as f64;
                     s.last_round_events_len = s.state.events.get_untracked().len();
+                    s.last_range = t2.scroll_height() as f64 - t2.client_height() as f64;
                 }
             });
         });
