@@ -344,6 +344,9 @@ struct PileState {
     /// (the in-flight card finalizes in place); this now covers the
     /// residual shrink cases (thinking-block collapse, error swaps).
     passive_clamp: bool,
+    /// v0.5.16: previous frame's `streaming` flag, to detect a new model
+    /// call starting (false→true) and re-arm the live follow.
+    last_streaming: bool,
     /// v0.5.12: stick_to_bottom flip history (last 6 entries,
     /// "<perf.now ms> <reason>"), surfaced by __rushiPile() so a
     /// follow regression is triaged from the console in one shot.
@@ -484,7 +487,7 @@ pub fn init(state: AppState) {
 
         // Build marker: name the running bundle so a stale cached
         // wasm/js is easy to spot (DevTools console).
-        let _ = js_sys::eval("console.log('[rushi-webui] build v0.5.15-flat')");
+        let _ = js_sys::eval("console.log('[rushi-webui] build v0.5.16-flat')");
 
         // Flat mode: default is the deck-less transcript (basic
         // usability); `?pile=1` restores the full card-deck engine.
@@ -535,6 +538,7 @@ pub fn init(state: AppState) {
             down_intent: false,
             last_touch_y: None,
             passive_clamp: false,
+            last_streaming: false,
             stick_hist: Vec::new(),
             last_view: None,
             kb_open: false,
@@ -762,8 +766,13 @@ fn register_debug_hook(w: &web_sys::Window) {
                         .iter()
                         .filter(|el| el.class_list().contains("compact"))
                         .count();
+                    let dist = st
+                        .transcript
+                        .as_ref()
+                        .map(|t| t.scroll_height() as f64 - t.scroll_top() as f64 - t.client_height() as f64)
+                        .unwrap_or(-1.0);
                     format!(
-                        "init=1 flat={} steps={} fold_applied={} compact={}/{} events={} cards={} pile_face={} pile_open={} kb_open={} summary={} park_bottom={} stick={} stall_reported={} active={:?} view={:?} last_panic={} stick_hist=[{}] dbg=[{}]",
+                        "init=1 flat={} steps={} fold_applied={} compact={}/{} events={} cards={} pile_face={} pile_open={} kb_open={} summary={} park_bottom={} stick={} last_range={:.0} dist={:.0} passive_clamp={} last_streaming={} stall_reported={} active={:?} view={:?} last_panic={} stick_hist=[{}] dbg=[{}]",
                         st.flat,
                         st.steps,
                         st.fold_applied,
@@ -777,6 +786,10 @@ fn register_debug_hook(w: &web_sys::Window) {
                         st.current_summary.is_some(),
                         st.park_bottom,
                         st.stick_to_bottom,
+                        st.last_range,
+                        dist,
+                        st.passive_clamp,
+                        st.last_streaming,
                         st.stall_reported,
                         st.state.active_session.get_untracked().as_deref(),
                         st.last_view,
@@ -828,6 +841,7 @@ pub fn on_history_loaded() {
         st.down_intent = false;
         st.last_touch_y = None;
         st.passive_clamp = false;
+        st.last_streaming = false;
         // v0.5.6: quick "enter session" transition — a one-shot fade +
         // 6 px rise on the whole transcript (style.css
         // `.transcript-in`, ~180 ms; the early webui's simple, fast
@@ -912,6 +926,7 @@ fn step_full(st: &mut PileState) {
         st.down_intent = false;
         st.last_touch_y = None;
         st.passive_clamp = false;
+        st.last_streaming = false;
         st.last_active = active.clone();
         st.fold_applied = false;
         // Spring / commit bookkeeping belongs to the previous
@@ -940,6 +955,13 @@ fn step_full(st: &mut PileState) {
         if st.stick_to_bottom && view.is_none() && active.is_some() && st.passive_clamp {
             st.passive_clamp = false;
             park_to_bottom(st, false);
+            // v0.5.16: log the pull so __rushiPile() proves the settle
+            // fired (triage for follow regressions).
+            let t = perf_now_ms();
+            st.stick_hist.push(format!("{t:.0} pull:settle"));
+            if st.stick_hist.len() > 6 {
+                st.stick_hist.remove(0);
+            }
         }
         // Tight follow (v0.5.6): while the user is following (sticky)
         // and in the live view, pin the viewport bottom every frame,
@@ -1210,11 +1232,34 @@ fn step_scrolls(
     // user reading history is never yanked). Re-park only when the
     // growth has pushed the bottom more than 80px below the viewport;
     // that bounds how often the 150 ms repark timers are armed.
-    if view.is_none() && active.is_some() && st.stick_to_bottom && st.state.streaming.get_untracked() {
+    let streaming_now = st.state.streaming.get_untracked();
+    let stream_started = streaming_now && !st.last_streaming;
+    st.last_streaming = streaming_now;
+    if view.is_none() && active.is_some() && st.stick_to_bottom && streaming_now {
         if let Some(t) = &st.transcript {
             let dist = t.scroll_height() as f64 - t.scroll_top() as f64 - t.client_height() as f64;
             if dist > 80.0 {
                 st.park_bottom = true;
+            }
+        }
+    }
+
+    // v0.5.16: re-arm on NEW ACTIVITY at the live edge. If the user is
+    // sitting within 80 px of the bottom when a fresh model call starts
+    // (streaming false→true) or any new event lands, they are at the
+    // live edge — keep following, even if a stray input released the
+    // flag moments before the round ended. Flat mode only: pile mode's
+    // sticky stays owned by sync_unfold.
+    if st.flat
+        && view.is_none()
+        && active.is_some()
+        && !st.stick_to_bottom
+        && (stream_started || grew)
+    {
+        if let Some(t) = &st.transcript {
+            let d = t.scroll_height() as f64 - t.scroll_top() as f64 - t.client_height() as f64;
+            if d <= 80.0 {
+                note_stick(st, true, if stream_started { "rearm:stream-start" } else { "rearm:new-event" });
             }
         }
     }
@@ -1422,11 +1467,24 @@ fn sync_stick(st: &mut PileState) {
         let shrink = st.last_range - range;
         let unexplained = -delta - shrink;
         if unexplained > 0.5 && d > 80.0 {
+            // A move the shrink cannot explain, and we are far from the
+            // bottom: genuine user reading (scrollbar drag / keyboard
+            // paged up) — release the follow.
             note_stick(st, false, "release:unexplained");
-        } else if st.stick_to_bottom {
-            // Upward motion that the shrink (fully or nearly) explains
-            // = a passive clamp while sticky. Request the same-frame
-            // settle pull in step_full's flat branch.
+        } else {
+            // v0.5.16: everything else is a PASSIVE bottom clamp — the
+            // shrink explains the move, or we are still within the
+            // bottom 80 px band. A passive clamp is never user intent.
+            // If the follow had been released just before the shrink
+            // (a stray wheel/touch-up inside the 300 ms input window —
+            // the "jump to the card top at round end" regression),
+            // RE-ARM: being clamped at the bottom means the user is at
+            // the live edge and wants to keep watching. The flat
+            // step's settle pull then snaps to the true bottom in the
+            // same frame, before paint.
+            if !st.stick_to_bottom {
+                note_stick(st, true, "rearm:passive-clamp");
+            }
             st.passive_clamp = true;
         }
     }
