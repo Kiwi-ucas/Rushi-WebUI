@@ -260,12 +260,19 @@ struct PileState {
     /// Cached transcript `padding-bottom` (px). `getComputedStyle`
     /// forces a style recalc; the value is static, so read it once.
     tr_pad_bottom: Option<f64>,
+    /// Last height written to `#scroll-spacer` (px); feeds the
+    /// set_spacer_height write-skip so idle frames rewrite nothing.
+    last_spacer_h: f64,
     /// Click-expanded override: deals every row regardless of scroll.
     pile_open: bool,
     /// Last observed scroll top (deal/dock are scroll-direction gated).
     last_stop: f64,
     /// Card currently height-shrunk at the cut line.
-    shrunken_card: Option<HtmlElement>,
+    /// `(el, last_h)`: last_h is the height last written for that card
+    /// (0.0 = collapsed path, -1.0 = clean/release path applied); it
+    /// feeds the write-skip so idle frames rewrite nothing. None when
+    /// nothing is tracked.
+    shrunken_card: Option<(HtmlElement, f64)>,
     /// The card pinned at the TOP cut line: its complete relief top
     /// edge is the pile/queue boundary (mirror of the bottom cut
     /// line, sync_shrink). Pinned via margin-top + reduced height:
@@ -275,6 +282,28 @@ struct PileState {
     /// `(el, last_m)`: last_m feeds the write-skip. None when
     /// nothing is pinned.
     top_pin: Option<(HtmlElement, f64)>,
+    /// The LAST (bottom-most) card window-capped at the deck face: its
+    /// top edge is the pile/queue boundary on the BOTTOM side, the
+    /// mirror of the top-edge cut line (top_pin) which owns the queue's
+    /// top edge on the TOP side. When the last card is taller than the
+    /// visible window (deck bottom face → input cut line), its top edge
+    /// hides behind the deck; capping the height brings it down to the
+    /// deck face so BOTH edges are visible. Pinned via margin-top +
+    /// reduced height (the margin is the overflow, height-conserved so
+    /// the scroll position stays constant); the interior is CLIPPED
+    /// (overflow:hidden) and bottom-aligned (flex-end): the newest
+    /// content sits on the input cut line, and the older part is read
+    /// by the one unified transcript scroll that releases the cap — no
+    /// nested scroll domain. Gated on the
+    /// card's natural top edge being hidden above the window (geometric,
+    /// not scroll-intent based), so it stays put while the user scrolls
+    /// up — it releases exactly when the natural top edge itself reaches
+    /// the window top, at which point the capped box and the natural
+    /// box coincide (seamless handoff).
+    /// `(el, last_margin, last_height)`: last_margin/last_height feed
+    /// the write-skip (idle frames rewrite nothing). None when nothing
+    /// is capped.
+    last_win: Option<(HtmlElement, f64, f64)>,
     /// Summary card of the current view (never folds; the pile stops
     /// there).
     current_summary: Option<HtmlElement>,
@@ -413,7 +442,7 @@ pub fn init(state: AppState) {
 
         // Build marker: name the running bundle so a stale cached
         // wasm/js is easy to spot (DevTools console).
-        let _ = js_sys::eval("console.log('[rushi-webui] build v0.5.2-toprelief')");
+        let _ = js_sys::eval("console.log('[rushi-webui] build v0.5.4-unified')");
 
         let mut ps = PileState {
             state,
@@ -423,10 +452,12 @@ pub fn init(state: AppState) {
             pile_face: None,
             deck_layers: Vec::new(),
             tr_pad_bottom: None,
+            last_spacer_h: -1.0,
             pile_open: false,
             last_stop: 0.0,
             shrunken_card: None,
             top_pin: None,
+            last_win: None,
             current_summary: None,
             last_applied_summary: None,
             last_events_len: 0,
@@ -736,6 +767,10 @@ fn step_full(st: &mut PileState) {
             release_top_pin(&p.0);
         }
         st.top_pin = None;
+        if let Some(p) = st.last_win.clone() {
+            release_last_win(&p.0);
+        }
+        st.last_win = None;
         st.current_summary = None;
         st.last_applied_summary = None;
         st.last_events_len = 0;
@@ -923,9 +958,13 @@ fn step_full(st: &mut PileState) {
     step_scrolls(st, &events, &active, view);
 
     // 5. coupled syncs: the scroll-coupled fold/deal + the deck gluing,
-    //    then the cut-line shrink keeps the bottom card's relief intact.
-    sync_unfold(st);
-    sync_shrink(st);
+    //    then the cut-line shrink keeps the bottom card's relief intact,
+    //    then the last-card window cap keeps the bottom card's top edge
+    //    visible at the deck face. One card inventory is shared by all
+    //    three (a single per-frame DOM scan).
+    sync_unfold(st, &cards);
+    sync_shrink(st, &cards);
+    sync_last_win(st, &cards);
 }
 
 /// Scroll bookkeeping extracted so the DOM-lag gate path can also run
@@ -1078,6 +1117,12 @@ fn clear_inline(el: &HtmlElement) {
     // A top-pinned card carries an inline upward relief shadow (see
     // the top-edge cut line); a dealt/folded card must shed it.
     let _ = s.set_property("box-shadow", "");
+    // A window-capped last card carries inline flex bottom-alignment
+    // (display/flex-direction/justify-content); a folded card must
+    // shed it so it deals back as a normal compact row.
+    let _ = s.remove_property("display");
+    let _ = s.remove_property("flex-direction");
+    let _ = s.remove_property("justify-content");
     let _ = s.remove_property("--deal-dy");
     let _ = s.remove_property("--fold-dy");
     // Velocity-matched in/out duration (a dealt card re-joining the
@@ -1331,7 +1376,7 @@ fn commit_fold(st: &mut PileState, el: &HtmlElement) {
 /// Both are one-card-per-frame, scroll-direction gated. The CSS
 /// keyframe animations bridge the gap between the pinned deck
 /// position and the card's flow position so the motion is smooth.
-fn sync_unfold(st: &mut PileState) {
+fn sync_unfold(st: &mut PileState, cards: &[HtmlElement]) {
     // Block-scoped transcript access: the spring bookkeeping in the
     // passes below needs `st` mutable, which a live `&st.transcript`
     // borrow would forbid.
@@ -1419,12 +1464,12 @@ fn sync_unfold(st: &mut PileState) {
     // while their 260 ms commit timer is in flight.
     let mut pending_slots: Vec<(HtmlElement, f64)> = Vec::new();
 
-    let cards = iter_cards(st);
     // Batch the natural-height reads up front: the old code read
     // `offset_height` inside the write loop below (once per fold-exempt
     // card), so every read after a class/attribute write forced a
     // fresh reflow — that layout thrash is what made fast scrolls
     // run at low FPS. One batched read pass costs a single reflow.
+    // The card list is passed in (step_full's single per-frame scan).
     let card_h: Vec<f64> = cards
         .iter()
         .map(|el| el.offset_height() as f64)
@@ -1895,7 +1940,9 @@ fn sync_unfold(st: &mut PileState) {
                 // is left alone.
                 let cls = el.class_list();
                 if cls.contains("fold-anim")
-                    || st.shrunken_card.as_ref().map(|s| same_el(s, &el)).unwrap_or(false)
+                    // h >= 0: the clean-release state (-1.0) does not
+                    // own the card for the top-pin exemption.
+                    || st.shrunken_card.as_ref().map_or(false, |(s, h)| *h >= 0.0 && same_el(s, &el))
                 {
                     None
                 } else {
@@ -2097,7 +2144,7 @@ fn clear_deck(el: &HtmlElement) {
 // total content height — and therefore the user's scroll position —
 // never moves. This restores the bottom card's intact relief that a
 // plain overflow clip would otherwise slice off.
-fn sync_shrink(st: &mut PileState) {
+fn sync_shrink(st: &mut PileState, cards: &[HtmlElement]) {
     let Some(tr) = &st.transcript else { return };
     // Cut line = the content-box bottom (the transcript's border-box
     // bottom minus its bottom padding). Shrinking the straddling card
@@ -2126,8 +2173,8 @@ fn sync_shrink(st: &mut PileState) {
     let cut = rect.bottom() - pad_bottom;
 
     // Bottom-most card whose top is above the cut line (it straddles
-    // or sits above the transcript's bottom edge).
-    let cards = iter_cards(st);
+    // or sits above the transcript's bottom edge). The card list is
+    // passed in (step_full's single per-frame DOM scan).
     let mut target: Option<HtmlElement> = None;
     for el in cards.iter().rev() {
         if el.class_list().contains("hid") {
@@ -2142,6 +2189,11 @@ fn sync_shrink(st: &mut PileState) {
         if st.top_pin.as_ref().map(|p| same_el(&p.0, el)).unwrap_or(false) {
             continue;
         }
+        // The last-window cap owns this card's margin-top + height;
+        // the bottom shrink must not resize a card it is capping.
+        if st.last_win.as_ref().map(|(e, _, _)| same_el(e, el)).unwrap_or(false) {
+            continue;
+        }
         if el.get_bounding_client_rect().top() < cut - 1.0 {
             target = Some(el.clone());
             break;
@@ -2149,7 +2201,7 @@ fn sync_shrink(st: &mut PileState) {
     }
 
     // Release a stale shrunken card (target changed).
-    if let Some(sc) = st.shrunken_card.clone() {
+    if let Some((sc, _)) = st.shrunken_card.clone() {
         let still = target
             .as_ref()
             .map(|t| same_el(t, &sc))
@@ -2167,30 +2219,44 @@ fn sync_shrink(st: &mut PileState) {
 
     let top = target.get_bounding_client_rect().top();
     let desired = cut - top;
-    if desired <= 0.5 {
-        // Fully below the cut: collapse it entirely, spacer compensates.
-        let s = target.style();
-        let _ = s.set_property("height", "0px");
-        let _ = s.set_property("overflow", "hidden");
-        let _ = s.set_property("visibility", "hidden");
-        set_spacer_height(st, attr_nat_h(&target, 52.0));
-        st.shrunken_card = Some(target);
+    // The height value the three states write: 0.0 collapsed,
+    // `desired` shrunk, -1.0 clean (natural height). Idle frames
+    // recompute the same value; the write-skip below keeps them from
+    // touching the DOM at all (the rAF loop still runs on stream
+    // deltas — rewriting an unchanged style forces a layout recalc).
+    let nat = attr_nat_h(&target, 52.0);
+    let applied = if desired <= 0.5 {
+        0.0
+    } else if desired < nat - 0.5 {
+        desired
     } else {
-        let _ = target.style().set_property("visibility", "");
-        let nat = attr_nat_h(&target, 52.0);
-        if desired < nat - 0.5 {
+        -1.0
+    };
+    let unchanged = st.shrunken_card.as_ref().map_or(false, |(e, h)| {
+        same_el(e, &target) && (h - applied).abs() <= 0.05
+    });
+    if !unchanged {
+        if desired <= 0.5 {
+            // Fully below the cut: collapse it entirely, spacer compensates.
             let s = target.style();
-            let _ = s.set_property("height", &format!("{desired}px"));
+            let _ = s.set_property("height", "0px");
             let _ = s.set_property("overflow", "hidden");
-            set_spacer_height(st, nat - desired);
-            st.shrunken_card = Some(target);
+            let _ = s.set_property("visibility", "hidden");
+            set_spacer_height(st, nat);
         } else {
             let s = target.style();
-            let _ = s.set_property("height", "");
-            let _ = s.set_property("overflow", "");
-            set_spacer_height(st, 0.0);
-            st.shrunken_card = None;
+            let _ = s.set_property("visibility", "");
+            if desired < nat - 0.5 {
+                let _ = s.set_property("height", &format!("{desired}px"));
+                let _ = s.set_property("overflow", "hidden");
+                set_spacer_height(st, nat - desired);
+            } else {
+                let _ = s.set_property("height", "");
+                let _ = s.set_property("overflow", "");
+                set_spacer_height(st, 0.0);
+            }
         }
+        st.shrunken_card = Some((target.clone(), applied));
     }
 }
 
@@ -2201,7 +2267,7 @@ fn same_el(a: &HtmlElement, b: &HtmlElement) -> bool {
 }
 
 fn release_shrink(st: &mut PileState) {
-    if let Some(c) = st.shrunken_card.take() {
+    if let Some((c, _)) = st.shrunken_card.take() {
         release_shrink_card(&c);
     }
     set_spacer_height(st, 0.0);
@@ -2227,10 +2293,187 @@ fn release_top_pin(el: &HtmlElement) {
     let _ = s.remove_property("transform"); // legacy v0.4.4 residue
 }
 
-fn set_spacer_height(st: &PileState, h: f64) {
+/// Set the `#scroll-spacer` height. Write-skip: the spacer sits at the
+/// bottom of the flow, and rewriting an unchanged height forces a
+/// layout recalc for no reason (the rAF loop keeps calling this on
+/// stream deltas at idle).
+fn set_spacer_height(st: &mut PileState, h: f64) {
+    if (h - st.last_spacer_h).abs() <= 0.05 {
+        return;
+    }
     if let Some(sp) = &st.scroll_spacer {
         let _ = sp.style().set_property("height", &format!("{h}px"));
     }
+    st.last_spacer_h = h;
+}
+
+// ── last-card window cap ───────────────────────────────────────────
+/// Cap the last (bottom-most) card so its top edge lands on the deck
+/// face. Mirror of the top-edge cut line, but anchored at the input
+/// cut line instead of the transcript top. When the last card is
+/// taller than the visible window (deck bottom face → input cut line),
+/// its top edge hides behind the deck. Capping the height brings the
+/// top edge down to the deck face; the margin-top absorbs the overflow
+/// so total content height — and the user's scroll position — stays
+/// constant.
+fn sync_last_win(st: &mut PileState, cards: &[HtmlElement]) {
+    let Some(tr) = &st.transcript else { return };
+    // Gate: only when the deck is pinned (pile closed).
+    if st.pile_open {
+        if let Some((el, _, _)) = st.last_win.take() {
+            release_last_win(&el);
+        }
+        return;
+    }
+    // Gate: geometric, not scroll-intent based. The cap stays while the
+    // card's NATURAL top edge is hidden above the window top; it releases
+    // exactly when that edge reaches the window top, where the capped box
+    // and the natural box coincide (seamless handoff, no jump). The
+    // natural top is measured with the applied margin-top subtracted, so
+    // the gate never reads its own cap (no self-referential re-cap loop).
+    // Because the gate is scroll-position based, the behavior no longer
+    // depends on where the pointer is: the capped card is not a scroll
+    // container (overflow:hidden), so wheeling anywhere scrolls the one
+    // transcript, and the cap releases on geometry alone.
+    let rect = tr.get_bounding_client_rect();
+    let pad_bottom = st.tr_pad_bottom.unwrap_or(0.0);
+    let cutline = rect.bottom() - pad_bottom;
+    // The window's top edge, in VIEWPORT coords (everything here is a
+    // getBoundingClientRect read): the deck face is pinned at
+    // `rect.top() + PILE_TOP + COMPACT_ROW_H` (the r=0 row's bottom),
+    // plus the same relief gap the top-edge pin uses, so the last card's
+    // top edge lands on the queue's top boundary — never buried in the
+    // deck's downward shadow.
+    let window_top = rect.top() + PILE_TOP + COMPACT_ROW_H + TOP_EDGE_GAP;
+    let window_h = cutline - window_top;
+    if window_h <= 0.0 {
+        if let Some((el, _, _)) = st.last_win.take() {
+            release_last_win(&el);
+        }
+        return;
+    }
+
+    // Find the last card (same target selection as sync_shrink).
+    let last = cards.iter().rev().find(|el| {
+        let cls = el.class_list();
+        !cls.contains("hid") && !cls.contains("folding")
+    });
+
+    // Release a stale cap (card changed or no longer the last card).
+    if let Some((prev_el, _, _)) = st.last_win.clone() {
+        let still = last.as_ref().map(|l| same_el(l, &prev_el)).unwrap_or(false);
+        if !still {
+            release_last_win(&prev_el);
+            st.last_win = None;
+        }
+    }
+
+    let Some(target) = last else {
+        if st.last_win.is_some() {
+            let (el, _, _) = st.last_win.take().unwrap();
+            release_last_win(&el);
+        }
+        return;
+    };
+
+    // Skip if the top-pin owns this card (one-card-queue case:
+    // the top-edge cut line already handles it).
+    if st.top_pin.as_ref().map(|(e, _)| same_el(e, &target)).unwrap_or(false) {
+        if st.last_win.as_ref().map(|(e, _, _)| same_el(e, &target)).unwrap_or(false) {
+            release_last_win(&target);
+        }
+        st.last_win = None;
+        return;
+    }
+
+    // The card's NATURAL top edge: if a cap is already in effect, subtract
+    // the margin-top we applied so the gate measures the un-capped geometry
+    // (otherwise the gate would read its own cap and oscillate).
+    let stored = st
+        .last_win
+        .as_ref()
+        .filter(|(e, _, _)| same_el(e, &target))
+        .map(|(_, m, _)| *m)
+        .unwrap_or(0.0);
+    let natural_top = target.get_bounding_client_rect().top() - stored;
+    // Cap only when the card's natural top edge sits ABOVE the window top
+    // (hidden behind the deck). If another full card sits in the window
+    // above it, the last card's top edge is already below the window top
+    // (visible) and the cap must not push it up into that card.
+    let hidden = natural_top < window_top - 0.5;
+    if hidden {
+        // Push the top edge down to the window's top edge: margin-top =
+        // (window_top - natural_top). height = window_h keeps the bottom
+        // on the input cut line (window_h = cutline - window_top).
+        // margin + height = cutline - natural_top = the card's natural
+        // height, so the flow footprint is conserved: no scroll jump.
+        // (No data-natH read: it is stale for a growing streaming card;
+        // the last card's natural bottom is always the cut line, so the
+        // live top edge is enough.)
+        let overflow = (window_top - natural_top).max(0.5);
+        // Too tall for the window: cap so the top edge lands on the
+        // window's top edge, bottom stays at the input cut line.
+        //
+        // UNIFIED SINGLE SCROLL DOMAIN: the interior is CLIPPED, not a
+        // nested scroll container (overflow:hidden). The card is
+        // bottom-aligned (flex-end) so the NEWEST content sits on the
+        // input cut line; the older part is clipped away. Reading it is
+        // the outer transcript's job: scrolling up releases this cap the
+        // moment the natural top edge reaches the window top, and the
+        // full message re-enters normal flow — one scroll domain, no
+        // second one to reach for. The upward relief shadow makes the
+        // top edge read as a raised boundary between the deck face and
+        // the card.
+        let changed = st.last_win.as_ref().map_or(true, |(e, m, h)| {
+            !same_el(e, &target)
+                || (m - overflow).abs() > 0.05
+                || (h - window_h).abs() > 0.05
+        });
+        if changed {
+            let s = target.style();
+            let _ = s.set_property("margin-top", &format!("{overflow:.1}px"));
+            let _ = s.set_property("height", &format!("{window_h:.1}px"));
+            let _ = s.set_property("overflow", "hidden");
+            let _ = s.remove_property("visibility");
+            let _ = s.set_property("display", "flex");
+            let _ = s.set_property("flex-direction", "column");
+            let _ = s.set_property("justify-content", "flex-end");
+            let _ = s.set_property(
+                "box-shadow",
+                "var(--shadow), 0 -2px 5px rgba(75, 70, 55, 0.16), 0 -1px 2px rgba(75, 70, 55, 0.10)",
+            );
+        }
+        // Remember the written values for the next frame's write-skip.
+        // Idle frames rewrite nothing, so they never fight the user's
+        // wheel.
+        st.last_win = Some((target.clone(), overflow, window_h));
+    } else {
+        // Top edge is visible: release any previous cap.
+        if st.last_win.as_ref().map(|(e, _, _)| same_el(e, &target)).unwrap_or(false) {
+            release_last_win(&target);
+            st.last_win = None;
+        }
+    }
+}
+
+/// Release a last-card window cap: clear the margin-top, height,
+/// clipping, flex bottom-alignment, and shadow set by sync_last_win.
+fn release_last_win(el: &HtmlElement) {
+    let s = el.style();
+    let _ = s.set_property("margin-top", "");
+    let _ = s.set_property("height", "");
+    let _ = s.set_property("overflow", "");
+    let _ = s.set_property("overflow-y", "");
+    let _ = s.set_property("overflow-x", "");
+    let _ = s.remove_property("visibility");
+    let _ = s.remove_property("display");
+    let _ = s.remove_property("flex-direction");
+    let _ = s.remove_property("justify-content");
+    let _ = s.set_property("box-shadow", "");
+    // Back to natural flow: any interior scroll position is irrelevant
+    // (content is no longer clipped), but reset it so a re-cap starts
+    // clean.
+    let _ = el.set_scroll_top(0);
 }
 
 // ── pile open/close (legacy setPileOpen + transcript click) ───────
@@ -2293,10 +2536,11 @@ fn set_pile_open(st: &mut PileState, v: bool) {
         return;
     }
     set_pile_open_flag(st, v);
+    let cards = iter_cards(st);
     if !v {
         // Re-fold everything at once: a round that fits the viewport
         // has no scroll range to dock cards back one by one.
-        for el in iter_cards(st) {
+        for el in cards.iter().cloned() {
             let cls = el.class_list();
             if cls.contains("hid") || fold_exempt(&el) {
                 continue;
@@ -2309,8 +2553,9 @@ fn set_pile_open(st: &mut PileState, v: bool) {
             }
         }
     }
-    sync_unfold(st);
-    sync_shrink(st);
+    sync_unfold(st, &cards);
+    sync_shrink(st, &cards);
+    sync_last_win(st, &cards);
 }
 
 // ── input gutter (legacy syncInputGutter) ─────────────────────────
@@ -2344,6 +2589,7 @@ fn on_vv_event() {
         let inner = w.inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(0.0);
         let open = h < inner * 0.85;
         let mut st = st.borrow_mut();
+        let cards = iter_cards(&st);
         if open && !st.kb_open {
             st.kb_open = true;
             // WeChat/Telegram-style: if the user is near the bottom,
@@ -2366,7 +2612,8 @@ fn on_vv_event() {
                     LEAKED.with(|l| l.borrow_mut().push(Box::new(to)));
                 }
             }
-            sync_shrink(&mut st);
+            sync_shrink(&mut st, &cards);
+            sync_last_win(&mut st, &cards);
         } else if !open {
             st.kb_open = false;
         }
@@ -2382,7 +2629,8 @@ fn on_vv_event() {
                 let _ = body.style().set_property("height", &format!("{h:.0}px"));
             }
         }
-        sync_shrink(&mut st);
+        sync_shrink(&mut st, &cards);
+        sync_last_win(&mut st, &cards);
     });
 }
 
