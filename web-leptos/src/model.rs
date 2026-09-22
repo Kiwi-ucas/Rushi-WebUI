@@ -120,6 +120,14 @@ pub struct AppState {
     /// final `assistant_message` / `error` event lands, on history
     /// reload, or on session switch.
     pub streaming: RwSignal<bool>,
+    /// v0.5.15: one-frame handoff marker — set when the
+    /// `assistant_message` that finalized a live stream lands, so the
+    /// transcript mounts that card with the `.ev-settling` animation
+    /// (it starts in the in-flight card's dark/lifted state and glides
+    /// to the settled light face — no color step). Consumed by the
+    /// card that mounts; cleared on every other event frame, history
+    /// load and session switch (ws.rs / clear_live).
+    pub settling_card: RwSignal<bool>,
     /// `tool_call` ids that have no `tool_result` yet: their cards
     /// show a running state until the result event arrives.
     pub tool_pending: RwSignal<Vec<String>>,
@@ -163,6 +171,7 @@ impl AppState {
             live_text: RwSignal::new(String::new()),
             live_reasoning: RwSignal::new(String::new()),
             streaming: RwSignal::new(false),
+            settling_card: RwSignal::new(false),
             tool_pending: RwSignal::new(Vec::new()),
             round_active: RwSignal::new(None),
             looping_sessions: RwSignal::new(std::collections::HashSet::new()),
@@ -178,6 +187,7 @@ impl AppState {
         self.live_text.set(String::new());
         self.live_reasoning.set(String::new());
         self.streaming.set(false);
+        self.settling_card.set(false);
         self.tool_pending.set(Vec::new());
     }
 

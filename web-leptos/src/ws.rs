@@ -84,6 +84,7 @@ pub fn connect(state: &AppState, session: &str) {
     let tool_pending = state.tool_pending;
     let looping = state.looping_sessions;
     let done_unviewed = state.loop_done_unviewed;
+    let settling = state.settling_card;
     let session_name = session.to_string();
 
     let on_msg = {
@@ -94,6 +95,7 @@ pub fn connect(state: &AppState, session: &str) {
         let live_text = live_text;
         let live_reasoning = live_reasoning;
         let streaming = streaming;
+        let settling = settling;
         let tool_pending = tool_pending;
         let looping = looping;
         let done_unviewed = done_unviewed;
@@ -162,6 +164,7 @@ pub fn connect(state: &AppState, session: &str) {
                                 .filter(|id| !done.iter().any(|d| d == id))
                                 .collect(),
                         );
+                        settling.set(false); // v0.5.15: a history replay never settles
                         events.set(normed);
                         // Drive the pile engine directly (the Transcript
                         // effect is a second, redundant trigger): park
@@ -228,10 +231,25 @@ pub fn connect(state: &AppState, session: &str) {
                         // replaces the streamed one; tool ids move from
                         // pending to resolved as their results land.
                         match t {
-                            "assistant_message" | "error" => {
+                            "assistant_message" => {
+                                // v0.5.15: if this event finalizes a live
+                                // stream, mark it so the just-finalized
+                                // card mounts with `.ev-settling` — it starts
+                                // in the in-flight card's look (dark face +
+                                // lifted relief) and glides to the settled
+                                // light face. No color step, no flicker.
+                                if streaming.get() {
+                                    settling.set(true);
+                                }
                                 live_text.set(String::new());
                                 live_reasoning.set(String::new());
                                 streaming.set(false);
+                            }
+                            "error" => {
+                                live_text.set(String::new());
+                                live_reasoning.set(String::new());
+                                streaming.set(false);
+                                settling.set(false);
                             }
                             "tool_call" => {
                                 if let Some(cid) = ev.get("id").and_then(|i| i.as_str()).map(String::from) {

@@ -73,13 +73,20 @@ fn App() -> impl IntoView {
                 >
                     <ui::Welcome state=state />
                 </Show>
-                // v0.5.11: loop-in-progress marker in the gap between
-                // the last card and the input box.
+                // v0.5.15: loop-in-progress marker in the gap between
+                // the last card and the input box. Three-ring "breathing"
+                // (ported from the castepsui homepage logo, re-styled
+                // into this theme's relief language): three concentric
+                // rings; ONE raised bulge (the theme's --shadow) travels
+                // outer -> mid -> inner on staggered delays, reading as
+                // swell/shrink. Colors, inner -> outer: deep green /
+                // rice cream / salmon orange.
                 <Show when=move || state.loop_running.get() fallback=|| ()>
                     <div id="loop-indicator">
-                        <div class="loop-well">
-                            <div class="loop-arc" />
-                            <div class="loop-dot" />
+                        <div class="loop-rings">
+                            <div class="loop-ring lg-out" />
+                            <div class="loop-ring lg-mid" />
+                            <div class="loop-ring lg-in" />
                         </div>
                     </div>
                 </Show>

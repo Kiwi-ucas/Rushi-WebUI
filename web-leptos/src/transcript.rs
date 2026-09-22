@@ -33,47 +33,42 @@ pub fn Transcript(state: AppState) -> impl IntoView {
 
     view! {
         <div id="transcript">
-            // v0.5.14: the in-flight card is the LAST ITEM OF THIS LIST,
-            // not a separate sibling node. Even keys index real events
-            // (event i -> key 2i); while `streaming`, one extra odd key
-            // (2n+1) renders the assistant card being written, in its
-            // final position. When the final `assistant_message` event
-            // lands, the list simply gains that event (key 2n) and the
-            // sentinel key 2n+1 drops: the card is updated IN PLACE,
-            // never deleted-and-replaced, so the content above the
-            // viewport does not change height and the viewport never
-            // re-clamps at round end. (The pile engine's iter_cards
-            // skips .ev-streaming, so card<->event mapping is intact.)
             <For
-                // All cards stay in the DOM (even in a round view); the
-                // pile engine adds .hid to cards after the viewed
-                // summary — the legacy structure.
-                each=move || {
-                    let n = events.get().len();
-                    let live = state.streaming.get();
-                    (0..(n + if live { 1 } else { 0 }))
-                        .map(|i| if i < n { i * 2 } else { i * 2 + 1 })
-                        .collect::<Vec<usize>>()
-                }
-                key=|&k| k
-                children=move |k| {
-                    if k % 2 == 0 {
-                        event_card_view(k / 2, events, state)
-                    } else {
-                        streaming_card_view(state)
-                    }
+                // All event cards; the pile engine maps DOM `.event`
+                // children 1:1 to these indices (ext_status renders
+                // empty, so the mapping stays intact).
+                each=move || all_card_indices(events.get().len())
+                key=|&i| i
+                children=move |i| {
+                    event_card_view(i, events, state)
                 }
             />
+            // The in-flight card: the assistant card being written,
+            // rendered live off the .model-stream channel and riding in
+            // flow at the bottom of the card list. When the final
+            // `assistant_message` event lands, this node unmounts and
+            // the For gains the real event card in the same slot; that
+            // card mounts with `.ev-settling` (v0.5.15) so the handoff
+            // glides (dark face + lifted relief -> light face + normal
+            // relief) instead of stepping, which read as a flicker.
+            <Show
+                when=move || state.streaming.get()
+                fallback=|| ()
+            >
+                { streaming_card_view(state) }
+            </Show>
             <div id="scroll-spacer" />
         </div>
     }
 }
 
-/// v0.5.14: the in-flight assistant card — the SAME logical card that
-/// becomes the final `assistant_message` card. It streams in place and
-/// finalizes in place (chrome diff only: the running marker goes away,
-/// usage / tool chips may appear), so no node is ever swapped under the
-/// viewport and the follow never has to survive a delete+insert.
+/// The in-flight assistant card (v0.5.14: a real `.ev-assistant` card
+/// instead of the old `.ev-live` sibling; v0.5.15: back to a separate
+/// slot, because the v0.5.14 "same slot" handoff still swapped the DOM
+/// node at finalization and the instant color step read as a flicker).
+/// It streams in place; when the final event lands the For mounts the
+/// real card in the same slot with `.ev-settling`, so the handoff
+/// glides instead of stepping.
 fn streaming_card_view(state: AppState) -> AnyView {
     let live_text = state.live_text;
     let live_reasoning = state.live_reasoning;
@@ -191,6 +186,18 @@ fn event_card_view(key: usize, events: RwSignal<Vec<Value>>, state: AppState) ->
     // listener; if that never fires (reduced motion) the class is
     // harmless — the animation is disabled there too.
     let cls = format!("{cls} enter");
+    // v0.5.15: when this card is the one that just replaced a live
+    // streaming card (flag set by ws.rs at finalization), mount it with
+    // the .ev-settling class so its entry glides FROM the in-flight look
+    // (tool-colored face + lifted relief) TO the settled one — no hard
+    // color step at the handoff.
+    let cls = if t == "assistant_message" && key == events.get().len() - 1 && state.settling_card.get()
+    {
+        state.settling_card.set(false);
+        format!("{cls} ev-settling")
+    } else {
+        cls
+    };
 
     let brief = match t.as_str() {
         "user_message" => format!(
