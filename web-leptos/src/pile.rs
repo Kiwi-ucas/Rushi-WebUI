@@ -448,7 +448,7 @@ pub fn init(state: AppState) {
 
         // Build marker: name the running bundle so a stale cached
         // wasm/js is easy to spot (DevTools console).
-        let _ = js_sys::eval("console.log('[rushi-webui] build v0.5.6-flat')");
+        let _ = js_sys::eval("console.log('[rushi-webui] build v0.5.7-flat')");
 
         // Flat mode: default is the deck-less transcript (basic
         // usability); `?pile=1` restores the full card-deck engine.
@@ -458,6 +458,16 @@ pub fn init(state: AppState) {
             .ok()
             .map(|s| !s.contains("pile=1"))
             .unwrap_or(true);
+        // v0.5.7: tag the app in flat mode so CSS can drop the
+        // pile-era top-zone mask (#main::after). With no deck, that
+        // 28px band just covers the tops of cards scrolling up.
+        // ?pile=1 (deck engine) keeps it — the cover exists to hide
+        // the card sliver between the header band and the deck.
+        if flat {
+            if let Some(a) = doc.get_element_by_id("app") {
+                let _ = a.unchecked_into::<HtmlElement>().class_list().add_1("flat-mode");
+            }
+        }
 
         let mut ps = PileState {
             state,
