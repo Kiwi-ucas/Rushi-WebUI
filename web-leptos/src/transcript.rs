@@ -33,6 +33,30 @@ pub fn Transcript(state: AppState) -> impl IntoView {
 
     view! {
         <div id="transcript">
+            // v0.5.17: "load earlier" — the server ships only the last
+            // page of events on connect; this button pages backwards
+            // (older events) and prepends them to the loaded window.
+            // Hidden when the whole log is loaded, and while a single
+            // round is pinned in view.
+            <Show
+                when=move || state.hist_has_more.get() && state.view_round.get().is_none()
+                fallback=|| ()
+            >
+                <button
+                    class="load-earlier"
+                    disabled=move || state.loading_earlier.get()
+                    on:click=move |_| crate::ws::load_earlier(&state)
+                >
+                    { move || {
+                        if state.loading_earlier.get() {
+                            "loading…".to_string()
+                        } else {
+                            let n = state.hist_oldest_line.get().saturating_sub(1);
+                            format!("↑ {n} earlier")
+                        }
+                    } }
+                </button>
+            </Show>
             <For
                 // All event cards; the pile engine maps DOM `.event`
                 // children 1:1 to these indices (ext_status renders

@@ -331,11 +331,21 @@ async fn ws_handler(
 async fn ws_session(socket: WebSocket, st: AppState, session: String) {
     let (mut sock_tx, mut sock_rx) = socket.split();
 
-    // 1. Send the full history on connect.
-    if let Ok(events) = st.sessions.events(&session).await {
-        let payload =
-            format!("[{{\"kind\":\"history\",\"events\":{}}}]
-", serde_json::to_string(&events).unwrap_or_default());
+    // 1. Send the LAST HIST_PAGE events on connect (truncated history:
+    // long sessions would otherwise ship their whole log — the 13 MB
+    // case — as one frame). The client pages backwards with
+    // "load_earlier" commands; line numbers are stable because
+    // events.jsonl is append-only.
+    const HIST_PAGE: u64 = 200;
+    if let Ok(page) = st.sessions.events_windowed(&session, None, HIST_PAGE).await {
+        let payload = format!(
+            "[{{\"kind\":\"history\",\"events\":{},\"oldest_line\":{},\"total_lines\":{},\"has_more\":{}}}]
+",
+            serde_json::to_string(&page.events).unwrap_or_default(),
+            page.oldest_line,
+            page.total_lines,
+            page.has_more,
+        );
         if sock_tx.send(Message::text(payload)).await.is_err() {
             return;
         }
@@ -459,6 +469,37 @@ async fn ws_session(socket: WebSocket, st: AppState, session: String) {
                                 let target = item.get("target_seq").and_then(|v| v.as_u64()).unwrap_or(0);
                                 let mode = item.get("mode").and_then(|v| v.as_str()).unwrap_or("before");
                                 let _ = st.sessions.append_rewind(&session, target, mode).await;
+                            }
+                            // v0.5.17: page older events backwards.
+                            // before_line = 1-based line number of the
+                            // oldest event the client already holds
+                            // (from the "history" / "history_page"
+                            // frame's oldest_line). Line numbers are
+                            // stable: events.jsonl is append-only.
+                            "load_earlier" => {
+                                let before = item.get("before_line").and_then(|v| v.as_u64()).unwrap_or(1);
+                                let limit = item.get("limit").and_then(|v| v.as_u64()).unwrap_or(HIST_PAGE);
+                                match st.sessions.events_windowed(&session, Some(before), limit).await {
+                                    Ok(page) => {
+                                        let frame = serde_json::json!([{
+                                            "kind": "history_page",
+                                            "events": page.events,
+                                            "oldest_line": page.oldest_line,
+                                            "total_lines": page.total_lines,
+                                            "has_more": page.has_more,
+                                        }]);
+                                        if sock_tx.send(Message::text(frame.to_string())).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let err = format!(
+                                            "[{{\"kind\":\"error\",\"message\":\"load_earlier failed: {}\"}}]\n",
+                                            e
+                                        );
+                                        let _ = sock_tx.send(Message::text(err)).await;
+                                    }
+                                }
                             }
                             "start" => {
                                 match st.loops.start(&session).await {

@@ -50,6 +50,10 @@ pub fn connect(state: &AppState, session: &str) {
     // A fresh connection owns a fresh live-stream state: no stale
     // streamed text, no phantom running tool cards.
     state.clear_live();
+    // v0.5.17: reset truncated-history window state on (re)connect
+    state.hist_oldest_line.set(0);
+    state.hist_has_more.set(false);
+    state.loading_earlier.set(false);
 
     let w = match web_sys::window() {
         Some(w) => w,
@@ -86,6 +90,9 @@ pub fn connect(state: &AppState, session: &str) {
     let done_unviewed = state.loop_done_unviewed;
     let settling = state.settling_card;
     let session_name = session.to_string();
+    let hist_oldest_line = state.hist_oldest_line;
+    let hist_has_more = state.hist_has_more;
+    let loading_earlier = state.loading_earlier;
 
     let on_msg = {
         let events = events;
@@ -100,6 +107,9 @@ pub fn connect(state: &AppState, session: &str) {
         let looping = looping;
         let done_unviewed = done_unviewed;
         let session_name = session_name;
+        let hist_oldest_line = hist_oldest_line;
+        let hist_has_more = hist_has_more;
+        let loading_earlier = loading_earlier;
         Closure::wrap(Box::new(move |e: MessageEvent| {
             let data = match e.data().as_string() {
                 Some(d) => d,
@@ -119,57 +129,51 @@ pub fn connect(state: &AppState, session: &str) {
                             .unwrap_or_default();
                         let normed: Vec<Value> =
                             evs.into_iter().map(|mut v| normalize_event(&mut v)).collect();
-                        // Replay the legacy ctx bookkeeping: ctx_used is
-                        // the last assistant usage; each user_message
-                        // (except the very first event) closes the
-                        // previous round, recording ctx_used as its ctxK.
-                        let mut ctx = 0u64;
-                        let mut ctxk: Vec<u64> = Vec::new();
-                        for (i, ev) in normed.iter().enumerate() {
-                            let t = ev.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                            if t == "assistant_message" {
-                                // legacy updateCtxBar: only a truthy input_tokens
-                                // count moves the bar.
-                                if let Some(n) = ev
-                                    .get("usage")
-                                    .and_then(|u| u.get("input_tokens"))
-                                    .and_then(|n| n.as_u64())
-                                {
-                                    if n > 0 {
-                                        ctx = n;
-                                    }
-                                }
-                            } else if t == "user_message" && i > 0 {
-                                ctxk.push(ctx);
-                            }
-                        }
+                        let (ctx, ctxk) = rebuild_ctx_bookkeeping(&normed);
                         ctx_used.set(ctx);
                         rounds_ctxk.set(ctxk);
-                        // Rebuild the running tool-call set from history:
-                        // tool_call ids with no matching tool_result
-                        // (only survives when a loop died mid-tool).
-                        let pending: Vec<String> = normed
-                            .iter()
-                            .filter(|e| e.get("type").and_then(|t| t.as_str()) == Some("tool_call"))
-                            .filter_map(|e| e.get("id").and_then(|i| i.as_str()).map(String::from))
-                            .collect();
-                        let done: Vec<String> = normed
-                            .iter()
-                            .filter(|e| e.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
-                            .filter_map(|e| e.get("id").and_then(|i| i.as_str()).map(String::from))
-                            .collect();
-                        tool_pending.set(
-                            pending
-                                .into_iter()
-                                .filter(|id| !done.iter().any(|d| d == id))
-                                .collect(),
-                        );
+                        tool_pending.set(rebuild_tool_pending(&normed));
                         settling.set(false); // v0.5.15: a history replay never settles
+                        // v0.5.17: truncated-history window state.
+                        let oldest = item.get("oldest_line").and_then(|v| v.as_u64()).unwrap_or(1);
+                        let has_more = item.get("has_more").and_then(|v| v.as_bool()).unwrap_or(false);
+                        hist_oldest_line.set(oldest);
+                        hist_has_more.set(has_more);
+                        loading_earlier.set(false);
                         events.set(normed);
                         // Drive the pile engine directly (the Transcript
                         // effect is a second, redundant trigger): park
                         // the view at the last message of the history.
                         crate::pile::on_history_loaded();
+                    }
+                    // v0.5.17: older page of events ("load earlier").
+                    "history_page" => {
+                        let evs = item
+                            .get("events")
+                            .cloned()
+                            .and_then(|v| serde_json::from_value::<Vec<Value>>(v).ok())
+                            .unwrap_or_default();
+                        let new_count = evs.len();
+                        if new_count > 0 {
+                            let normed: Vec<Value> =
+                                evs.into_iter().map(|mut v| normalize_event(&mut v)).collect();
+                            crate::pile::on_history_prepended();
+                            let merged = {
+                                let mut v = normed;
+                                v.extend(events.get());
+                                v
+                            };
+                            let (ctx, ctxk) = rebuild_ctx_bookkeeping(&merged);
+                            ctx_used.set(ctx);
+                            rounds_ctxk.set(ctxk);
+                            tool_pending.set(rebuild_tool_pending(&merged));
+                            let oldest = item.get("oldest_line").and_then(|v| v.as_u64()).unwrap_or(1);
+                            let has_more = item.get("has_more").and_then(|v| v.as_bool()).unwrap_or(false);
+                            hist_oldest_line.set(oldest);
+                            hist_has_more.set(has_more);
+                            events.set(merged);
+                        }
+                        loading_earlier.set(false);
                     }
                     "event" => {
                         let raw = item.get("data").cloned().unwrap_or(Value::Null);
@@ -482,4 +486,69 @@ pub fn send_command(_session: &str, command: &Value) {
             let _ = s.socket.send_with_str(&payload);
         }
     });
+}
+
+/// v0.5.17: request the next OLDER page of events ("load earlier").
+/// Pages backwards from the oldest loaded line; the server answers
+/// with a `history_page` frame, handled in the on_msg closure above.
+pub fn load_earlier(state: &AppState) {
+    let active = match state.active_session.get() {
+        Some(s) => s,
+        None => return,
+    };
+    if state.loading_earlier.get() || !state.hist_has_more.get() {
+        return;
+    }
+    state.loading_earlier.set(true);
+    let before = state.hist_oldest_line.get().max(1);
+    send_command(
+        &active,
+        &serde_json::json!({ "kind": "load_earlier", "before_line": before, "limit": 200 }),
+    );
+}
+
+/// Rebuild the legacy ctx bookkeeping from a (partial or full) event
+/// list: `ctx_used` is the last assistant input_tokens usage; each
+/// user_message (except the very first event) closes the previous
+/// round, recording `ctx_used` as that round's ctxK.
+fn rebuild_ctx_bookkeeping(normed: &[Value]) -> (u64, Vec<u64>) {
+    let mut ctx = 0u64;
+    let mut ctxk: Vec<u64> = Vec::new();
+    for (i, ev) in normed.iter().enumerate() {
+        let t = ev.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if t == "assistant_message" {
+            // legacy updateCtxBar: only a truthy input_tokens count moves the bar.
+            if let Some(n) = ev
+                .get("usage")
+                .and_then(|u| u.get("input_tokens"))
+                .and_then(|n| n.as_u64())
+            {
+                if n > 0 {
+                    ctx = n;
+                }
+            }
+        } else if t == "user_message" && i > 0 {
+            ctxk.push(ctx);
+        }
+    }
+    (ctx, ctxk)
+}
+
+/// Rebuild the running tool-call set: tool_call ids with no matching
+/// tool_result (only survives when a loop died mid-tool).
+fn rebuild_tool_pending(normed: &[Value]) -> Vec<String> {
+    let pending: Vec<String> = normed
+        .iter()
+        .filter(|e| e.get("type").and_then(|t| t.as_str()) == Some("tool_call"))
+        .filter_map(|e| e.get("id").and_then(|i| i.as_str()).map(String::from))
+        .collect();
+    let done: Vec<String> = normed
+        .iter()
+        .filter(|e| e.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+        .filter_map(|e| e.get("id").and_then(|i| i.as_str()).map(String::from))
+        .collect();
+    pending
+        .into_iter()
+        .filter(|id| !done.iter().any(|d| d == id))
+        .collect()
 }

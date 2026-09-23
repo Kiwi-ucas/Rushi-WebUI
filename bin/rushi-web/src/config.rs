@@ -19,4 +19,10 @@ pub struct WebConfig {
     pub loop_cmd: Vec<String>,
     /// Directories to scan for UI-extension manifests (`ext.toml`).
     pub ext_dirs: Vec<PathBuf>,
+    /// Explicit path to the kernel `config.toml` (from `--config`).
+    /// Forwarded to spawned loops as the `CONFIG` env var so the loop
+    /// resolves its config regardless of the session working directory.
+    /// `None` when unset: the loop falls back to its own resolution
+    /// chain ($CONFIG inherited env, side-by-side, CWD).
+    pub config_path: Option<PathBuf>,
 }

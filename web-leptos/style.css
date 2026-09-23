@@ -181,6 +181,32 @@ button { font-weight: 700; }
 #ctx-k { color: var(--text-muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
 
 #transcript { flex: 1; overflow-y: auto; padding: 28px 20px 20px 28px; scroll-behavior: smooth; border-top-left-radius: 14px; box-shadow: inset 0 10px 14px -10px rgba(75, 70, 55, 0.30); overflow-anchor: none; scrollbar-gutter: stable; }
+
+/* v0.5.17: "load earlier" pill pinned at the top of the transcript.
+   Subtle rice-paper button; only visible when the server reports
+   there are older pages. */
+#transcript .load-earlier {
+  display: block;
+  margin: 0 auto 14px;
+  padding: 5px 14px;
+  font-size: 11.5px;
+  letter-spacing: 0.03em;
+  color: var(--text, #3a342a);
+  background: var(--bg-elev);
+  border: 1px solid var(--border, #ddd3bf);
+  border-radius: 9px;
+  box-shadow: 0 1px 2px rgba(75, 70, 55, 0.18), inset 0 1px 0 rgba(255, 255, 255, 0.5);
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+#transcript .load-earlier:hover {
+  color: var(--text, #3a342a);
+  background: var(--bg-elev, #faf7f0);
+}
+#transcript .load-earlier:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
 /* v0.5.6: session-entry transition (the early webui's quick fade + rise).
    One-shot, re-triggered by pile::on_history_loaded: remove class, force
    a style flush, re-add. 180 ms — noticeable, not heavy. */
@@ -249,8 +275,13 @@ button { font-weight: 700; }
    in-flight node mounts IN the in-flight look (dark tool face + lifted
    relief) and glides over 0.7s to the settled look (light face + normal
    relief): the color change reads as "settling down", not a flicker.
-   Specificity ties .event.enter, so this rule (later in source) wins. */
-.event.ev-settling { animation: fadeIn 0.15s ease-in, ev-settle 0.7s ease; }
+   v0.5.18: NO fade-in — a 150 ms opacity dip while the live node had
+   already vanished read as a flicker at every round end. The settling
+   card now appears INSTANTLY in the in-flight look (ev-settle's
+   `from` state matches .ev-assistant.ev-streaming exactly, so the
+   handoff is seamless) and only the face/relief glide. Specificity
+   ties .event.enter, so this rule (later in source) wins. */
+.event.ev-settling { animation: ev-settle 0.7s ease; }
 @keyframes ev-settle {
   from { background-color: var(--tool-bg); box-shadow: var(--shadow-lifted); }
   to   { background-color: var(--assistant-bg); box-shadow: var(--shadow); }
@@ -480,7 +511,7 @@ button { font-weight: 700; }
    compositor work — no repaints, so it stays smooth no matter how
    busy the main thread is. ONE raised bulge travels outer -> mid ->
    inner on staggered delays, reading as swell/shrink. Colors, inner
-   -> outer: deep green / rice cream / salmon orange. Purely
+   -> inner: deep green / deep beige / salmon orange. Purely
    decorative, so it never takes input. */
 #loop-indicator { display: flex; align-items: center; justify-content: center; height: 44px; flex: none; pointer-events: none; }
 #loop-indicator .loop-rings { position: relative; width: 36px; height: 36px; }
@@ -495,7 +526,7 @@ button { font-weight: 700; }
 /* Wave travels outer -> inner: the outer ring leads, each inner ring
    lags by 0.6s (both layers share the delay). */
 #loop-indicator .loop-ring.lg-out { width: 32px; height: 32px; color: var(--accent-salmon); } /* salmon, outer */
-#loop-indicator .loop-ring.lg-mid { width: 22px; height: 22px; color: var(--bg-elev); animation-delay: 0.6s; } /* rice, mid */
+#loop-indicator .loop-ring.lg-mid { width: 22px; height: 22px; color: var(--border); animation-delay: 0.6s; } /* deep beige (grey cast), mid */
 #loop-indicator .loop-ring.lg-in  { width: 12px; height: 12px; color: var(--accent); animation-delay: 1.2s; } /* nori, inner */
 #loop-indicator .loop-ring.lg-mid::after { animation-delay: 0.6s; }
 #loop-indicator .loop-ring.lg-in::after  { animation-delay: 1.2s; }

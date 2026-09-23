@@ -80,7 +80,7 @@ fn App() -> impl IntoView {
                 // rings; ONE raised bulge (the theme's --shadow) travels
                 // outer -> mid -> inner on staggered delays, reading as
                 // swell/shrink. Colors, inner -> outer: deep green /
-                // rice cream / salmon orange.
+                // deep beige / salmon orange.
                 <Show when=move || state.loop_running.get() fallback=|| ()>
                     <div id="loop-indicator">
                         <div class="loop-rings">

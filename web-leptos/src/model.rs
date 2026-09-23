@@ -80,6 +80,15 @@ pub struct AppState {
     pub active_session: RwSignal<Option<String>>,
     /// Normalized event stream (JSON values, matching the JS `events` array).
     pub events: RwSignal<Vec<Value>>,
+    /// v0.5.17: 1-based line number of the OLDEST event currently in
+    /// `events` (truncated history: the server ships only the last
+    /// page on connect; 1 = the whole log is loaded). 0 = unknown.
+    pub hist_oldest_line: RwSignal<u64>,
+    /// v0.5.17: whether older events exist above the loaded window.
+    pub hist_has_more: RwSignal<bool>,
+    /// v0.5.17: true while a "load earlier" page request is in flight
+    /// (guards against double-firing the button).
+    pub loading_earlier: RwSignal<bool>,
     pub ws_status: RwSignal<String>,
     pub loop_running: RwSignal<bool>,
     pub ctx_used: RwSignal<u64>,
@@ -154,6 +163,9 @@ impl AppState {
             sessions: RwSignal::new(Vec::new()),
             active_session: RwSignal::new(None),
             events: RwSignal::new(Vec::new()),
+            hist_oldest_line: RwSignal::new(0),
+            hist_has_more: RwSignal::new(false),
+            loading_earlier: RwSignal::new(false),
             ws_status: RwSignal::new("disconnected".into()),
             loop_running: RwSignal::new(false),
             ctx_used: RwSignal::new(0),

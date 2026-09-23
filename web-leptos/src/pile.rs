@@ -347,6 +347,14 @@ struct PileState {
     /// v0.5.16: previous frame's `streaming` flag, to detect a new model
     /// call starting (false→true) and re-arm the live follow.
     last_streaming: bool,
+    /// v0.5.18: distance to the transcript bottom (px) measured at the
+    /// END of the previous frame (after its parks/pins) — the "were you
+    /// at the live edge" probe. The activity re-arm gate must use this
+    /// PRE-growth value; the post-growth distance is large by
+    /// construction (the growth itself pushed the bottom away), which
+    /// is why the v0.5.16 gate-ordering let the follow die at every
+    /// round end.
+    prev_dist: f64,
     /// v0.5.12: stick_to_bottom flip history (last 6 entries,
     /// "<perf.now ms> <reason>"), surfaced by __rushiPile() so a
     /// follow regression is triaged from the console in one shot.
@@ -370,6 +378,10 @@ struct PileState {
     /// step (set by `on_history_loaded`, e.g. right after a session's
     /// history lands).
     park_bottom: bool,
+    /// v0.5.17: true for one step after older events are prepended;
+    /// suppresses the "new user message" / "new event" re-arm logic so
+    /// a prepend doesn't yank the user back to the bottom.
+    prepending: bool,
     /// Sticky bottom ("live follow"): while true, new events keep the
     /// viewport parked at the newest card. Released by a user scroll
     /// UP (they're reading history); re-armed when they land back
@@ -487,7 +499,7 @@ pub fn init(state: AppState) {
 
         // Build marker: name the running bundle so a stale cached
         // wasm/js is easy to spot (DevTools console).
-        let _ = js_sys::eval("console.log('[rushi-webui] build v0.5.16-flat')");
+        let _ = js_sys::eval("console.log('[rushi-webui] build v0.5.19-flat')");
 
         // Flat mode: default is the deck-less transcript (basic
         // usability); `?pile=1` restores the full card-deck engine.
@@ -539,6 +551,7 @@ pub fn init(state: AppState) {
             last_touch_y: None,
             passive_clamp: false,
             last_streaming: false,
+            prev_dist: 0.0,
             stick_hist: Vec::new(),
             last_view: None,
             kb_open: false,
@@ -548,6 +561,7 @@ pub fn init(state: AppState) {
             last_active: state.active_session.get_untracked(),
             fold_applied: false,
             park_bottom: false,
+            prepending: false,
             stick_to_bottom: true,
             stall_reported: false,
             deal_dbg_hist: Vec::new(),
@@ -772,7 +786,7 @@ fn register_debug_hook(w: &web_sys::Window) {
                         .map(|t| t.scroll_height() as f64 - t.scroll_top() as f64 - t.client_height() as f64)
                         .unwrap_or(-1.0);
                     format!(
-                        "init=1 flat={} steps={} fold_applied={} compact={}/{} events={} cards={} pile_face={} pile_open={} kb_open={} summary={} park_bottom={} stick={} last_range={:.0} dist={:.0} passive_clamp={} last_streaming={} stall_reported={} active={:?} view={:?} last_panic={} stick_hist=[{}] dbg=[{}]",
+                        "init=1 flat={} steps={} fold_applied={} compact={}/{} events={} cards={} pile_face={} pile_open={} kb_open={} summary={} park_bottom={} stick={} last_range={:.0} dist={:.0} prev_dist={:.0} passive_clamp={} last_streaming={} stall_reported={} active={:?} view={:?} last_panic={} stick_hist=[{}] dbg=[{}]",
                         st.flat,
                         st.steps,
                         st.fold_applied,
@@ -788,6 +802,7 @@ fn register_debug_hook(w: &web_sys::Window) {
                         st.stick_to_bottom,
                         st.last_range,
                         dist,
+                        st.prev_dist,
                         st.passive_clamp,
                         st.last_streaming,
                         st.stall_reported,
@@ -822,6 +837,23 @@ pub fn on_change() {
     });
 }
 
+/// v0.5.17: called right before older events are prepended to the
+/// event list (from ws.rs "history_page" handler).  Sets the
+/// `prepending` flag so the next `step_scrolls` run suppresses the
+/// "new user message" and "new event" re-arms that would otherwise
+/// misfire on the prepended (actually older) events.  No scroll
+/// anchoring is done here — native browser scroll anchoring handles
+/// the viewport position, and the user is at/near the top where the
+/// "load earlier" button lives.
+pub fn on_history_prepended() {
+    with_pile(|cell| {
+        let st = cell.borrow();
+        if let Some(st) = st.as_ref() {
+            st.borrow_mut().prepending = true;
+        }
+    });
+}
+
 /// Call right after a session's history lands (ws.rs): schedule a
 /// step and park the transcript at the last message — selecting a
 /// session must land on the newest message, not the top.
@@ -842,6 +874,7 @@ pub fn on_history_loaded() {
         st.last_touch_y = None;
         st.passive_clamp = false;
         st.last_streaming = false;
+        st.prev_dist = 0.0;
         // v0.5.6: quick "enter session" transition — a one-shot fade +
         // 6 px rise on the whole transcript (style.css
         // `.transcript-in`, ~180 ms; the early webui's simple, fast
@@ -914,6 +947,7 @@ fn step_full(st: &mut PileState) {
         st.current_summary = None;
         st.last_applied_summary = None;
         st.last_events_len = 0;
+        st.prepending = false;
         st.last_view = view;
         // v0.5.8: clear the scroll-driven round highlight. Flat mode
         // writes it; in pile mode it is None, so this is a no-op.
@@ -927,6 +961,7 @@ fn step_full(st: &mut PileState) {
         st.last_touch_y = None;
         st.passive_clamp = false;
         st.last_streaming = false;
+        st.prev_dist = 0.0;
         st.last_active = active.clone();
         st.fold_applied = false;
         // Spring / commit bookkeeping belongs to the previous
@@ -985,6 +1020,17 @@ fn step_full(st: &mut PileState) {
                 }
             }
         }
+        // v0.5.18: record this frame's resting distance-to-bottom —
+        // AFTER any park/pin wrote — for next frame's re-arm gate.
+        // That resting position is the "pre-growth" state of the frame
+        // that grows the content.
+        st.prev_dist = st
+            .transcript
+            .as_ref()
+            .map(|t| {
+                (t.scroll_height() as f64 - t.scroll_top() as f64 - t.client_height() as f64).max(0.0)
+            })
+            .unwrap_or(0.0);
         // v0.5.8: scroll→round coupling. The chip row highlights the
         // round under the viewport (flat only; pile-mode chips stay
         // bound to the round filter, view_round).
@@ -1206,11 +1252,17 @@ fn step_scrolls(
     let prev_events = st.last_events_len;
     let grew = events.len() > prev_events;
     st.last_events_len = events.len();
+    // v0.5.17: consume the "older page was prepended" flag set by
+    // on_history_prepended: the growth is a backwards window
+    // expansion, NOT new user activity — suppress the re-arms below
+    // so the reader is not yanked to the bottom.
+    let prepending = st.prepending;
+    st.prepending = false;
     // v0.5.10: a new USER message re-arms the follow even while the
     // user is reading history — sending a round means watching it.
     // Agent-driven events (tool / assistant) do NOT re-arm: a reader
     // below the live feed stays put.
-    if grew && view.is_none() && active.is_some() {
+    if grew && view.is_none() && active.is_some() && !prepending {
         let new_user_msg = events[prev_events..]
             .iter()
             .any(|e| e.get("type").and_then(|t| t.as_str()) == Some("user_message"));
@@ -1218,7 +1270,7 @@ fn step_scrolls(
             note_stick(st, true, "rearm:new-msg");
         }
     }
-    if grew && view.is_none() && active.is_some() && st.stick_to_bottom {
+    if grew && view.is_none() && active.is_some() && st.stick_to_bottom && !prepending {
         // Park WITH the 150 ms re-park: this branch may run in the
         // DOM-lag gate, before Leptos has flushed the new card nodes,
         // so the immediate park lands at the pre-flush bottom; the
@@ -1244,24 +1296,72 @@ fn step_scrolls(
         }
     }
 
-    // v0.5.16: re-arm on NEW ACTIVITY at the live edge. If the user is
-    // sitting within 80 px of the bottom when a fresh model call starts
-    // (streaming false→true) or any new event lands, they are at the
-    // live edge — keep following, even if a stray input released the
-    // flag moments before the round ended. Flat mode only: pile mode's
-    // sticky stays owned by sync_unfold.
+    // v0.5.19: two-tier re-arm.
+    // TIER 1 — round boundaries are the user's "show me the newest card"
+    // intent: a fresh model call starting (stream_started) or a round's
+    // final assistant_message landing rearms the follow UNCONDITIONALLY
+    // (even after a read-up) and snaps the viewport to the new bottom.
+    // TIER 2 — passive in-round events (tool noise): keep the v0.5.18
+    // band — re-arm only when the user was resting within 80 px of the
+    // bottom (pre-growth distance), so a reader mid-round is not
+    // yanked. In both tiers a fresh re-arm clears the input latch,
+    // otherwise sync_stick's 300 ms window re-releases the follow on
+    // the very next step (the interleaving that kept v0.5.18 stuck).
+    // Flat mode only: pile mode's sticky stays owned by sync_unfold.
+    let new_assistant = grew
+        && events[prev_events..]
+            .iter()
+            .any(|e| e.get("type").and_then(|t| t.as_str()) == Some("assistant_message"));
     if st.flat
         && view.is_none()
         && active.is_some()
         && !st.stick_to_bottom
-        && (stream_started || grew)
+        && !prepending
     {
-        if let Some(t) = &st.transcript {
-            let d = t.scroll_height() as f64 - t.scroll_top() as f64 - t.client_height() as f64;
-            if d <= 80.0 {
-                note_stick(st, true, if stream_started { "rearm:stream-start" } else { "rearm:new-event" });
-            }
+        if stream_started
+            || new_assistant
+            || (grew && st.prev_dist <= 80.0)
+        {
+            note_stick(
+                st,
+                true,
+                if stream_started {
+                    "rearm:stream-start"
+                } else if new_assistant {
+                    "rearm:round-end"
+                } else {
+                    "rearm:new-event"
+                },
+            );
+            st.input_up = false;
+            st.last_input_t = 0.0;
+            st.park_bottom = true;
         }
+    }
+    // v0.5.19: triage line for follow regressions — log the follow
+    // state at every finalized answer card, so "stopped following" is
+    // visible in the console at the moment it happens.
+    if st.flat
+        && new_assistant
+        && view.is_none()
+        && active.is_some()
+        && !prepending
+    {
+        let dist_now = st
+            .transcript
+            .as_ref()
+            .map(|t| {
+                (t.scroll_height() as f64 - t.scroll_top() as f64 - t.client_height() as f64).max(0.0)
+            })
+            .unwrap_or(-1.0);
+        let msg = format!(
+            "[rushi] finalize: stick={} prev_dist={:.0} dist_now={:.0} hist=[{}]",
+            st.stick_to_bottom,
+            st.prev_dist,
+            dist_now,
+            st.stick_hist.join(", ")
+        );
+        let _ = js_sys::eval(&format!("console.log('{}')", msg));
     }
 
     // Park at the last message (session select → history just landed,

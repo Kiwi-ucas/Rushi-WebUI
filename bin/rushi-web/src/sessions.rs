@@ -9,6 +9,23 @@ use tokio::fs;
 
 use crate::config::WebConfig;
 
+/// A page of events returned by `events_windowed`.
+///
+/// `oldest_line` is the 1-based line number (counting only non-empty lines)
+/// of the first event in this page.  `oldest_line == 1` means the very
+/// beginning of the log; `has_more` is false when no older lines remain.
+#[derive(Clone, Debug, Serialize)]
+pub struct EventsPage {
+    /// Events in chronological order (oldest first within this page).
+    pub events: Vec<serde_json::Value>,
+    /// 1-based line number of the first event in this page.
+    pub oldest_line: u64,
+    /// Total number of non-empty lines in the events log.
+    pub total_lines: u64,
+    /// Whether older events exist above `oldest_line`.
+    pub has_more: bool,
+}
+
 /// Manages session directories and their `events.jsonl` logs.
 #[derive(Clone)]
 pub struct SessionManager {
@@ -99,6 +116,57 @@ impl SessionManager {
             out.push(v);
         }
         Ok(out)
+    }
+
+    /// Read a window of events from the log, for truncated history loading.
+    ///
+    /// `before_line` is the 1-based line number of the oldest event the
+    /// client already has.  The method returns up to `limit` events
+    /// immediately before that line.  When `before_line` is `None` the
+    /// last `limit` events are returned.
+    ///
+    /// Only non-empty lines are counted (matching `events()` semantics).
+    /// JSON parsing is applied only to the returned window, not the
+    /// whole file, so this stays fast even for very large logs.
+    pub async fn events_windowed(
+        &self,
+        id: &str,
+        before_line: Option<u64>,
+        limit: u64,
+    ) -> Result<EventsPage> {
+        let path = self.events_path(id);
+        if !path.exists() {
+            return Err(anyhow!("session '{}' not found", id));
+        }
+        let text = fs::read_to_string(&path).await?;
+        // Collect non-empty line slices (no JSON parse yet — cheap).
+        let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        let total = lines.len() as u64;
+
+        let limit = limit.min(1000); // cap a single page
+
+        // end = exclusive upper bound (0-based) of the window.
+        let end: u64 = match before_line {
+            Some(b) => b.saturating_sub(1).min(total),
+            None => total,
+        };
+        let start = end.saturating_sub(limit);
+
+        let events: Vec<serde_json::Value> = lines[start as usize..end as usize]
+            .iter()
+            .map(|line| {
+                serde_json::from_str(line)
+                    .unwrap_or_else(|_| serde_json::Value::String((*line).to_string()))
+            })
+            .collect();
+
+        let oldest_line = start + 1; // 1-based
+        Ok(EventsPage {
+            events,
+            oldest_line,
+            total_lines: total,
+            has_more: start > 0,
+        })
     }
 
     // ── lifecycle: rename / delete ────────────────────────────────
@@ -437,4 +505,148 @@ pub async fn tail_model_stream(path: PathBuf, tx: tokio::sync::mpsc::Sender<Stri
 /// kernel's `ts` format (e.g. `2026-09-15T09:36:21Z`).
 fn now_rfc3339() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_root() -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "rushi-web-sessions-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn mgr(root: &Path) -> SessionManager {
+        SessionManager::new(Arc::new(WebConfig {
+            host: "127.0.0.1".into(),
+            port: 8480,
+            sessions_root: root.to_path_buf(),
+            loop_cmd: vec!["rushi".into(), "run".into()],
+            ext_dirs: Vec::new(),
+            config_path: None,
+        }))
+    }
+
+    /// Write `n` event lines for session `id` (each a tiny JSON object).
+    fn write_events(root: &Path, id: &str, n: u64) {
+        let dir = root.join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut content = String::new();
+        for i in 1..=n {
+            content.push_str(&format!(
+                r#"{{"v":1,"type":"user_message","i":{i}}}"#
+            ));
+            content.push('\n');
+        }
+        std::fs::write(dir.join("events.jsonl"), content).unwrap();
+    }
+
+    fn event_index(ev: &serde_json::Value) -> u64 {
+        ev.get("i").and_then(|v| v.as_u64()).unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn events_windowed_none_gives_last_page() {
+        let root = temp_root();
+        write_events(&root, "s", 10);
+        let sm = mgr(&root);
+        let page = sm.events_windowed("s", None, 4).await.unwrap();
+        assert_eq!(page.total_lines, 10);
+        assert_eq!(page.oldest_line, 7);
+        assert!(page.has_more);
+        assert_eq!(page.events.len(), 4);
+        assert_eq!(page.events.iter().map(event_index).collect::<Vec<_>>(), [7, 8, 9, 10]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn events_windowed_pages_backwards_to_start() {
+        let root = temp_root();
+        write_events(&root, "s", 10);
+        let sm = mgr(&root);
+        // page 1: last 4 → lines 7..10
+        let p1 = sm.events_windowed("s", None, 4).await.unwrap();
+        assert!(!p1.has_more == false);
+        // page 2: 4 before line 7 → lines 3..6
+        let p2 = sm.events_windowed("s", Some(p1.oldest_line), 4).await.unwrap();
+        assert_eq!(p2.oldest_line, 3);
+        assert!(p2.has_more);
+        assert_eq!(p2.events.iter().map(event_index).collect::<Vec<_>>(), [3, 4, 5, 6]);
+        // page 3: 4 before line 3 → lines 1..2, no older lines remain
+        let p3 = sm.events_windowed("s", Some(p2.oldest_line), 4).await.unwrap();
+        assert_eq!(p3.oldest_line, 1);
+        assert!(!p3.has_more);
+        assert_eq!(p3.events.iter().map(event_index).collect::<Vec<_>>(), [1, 2]);
+        // page 4: nothing older than line 1
+        let p4 = sm.events_windowed("s", Some(p3.oldest_line), 4).await.unwrap();
+        assert_eq!(p4.events.len(), 0);
+        assert!(!p4.has_more);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn events_windowed_single_line_log() {
+        let root = temp_root();
+        write_events(&root, "s", 1);
+        let sm = mgr(&root);
+        let page = sm.events_windowed("s", None, 200).await.unwrap();
+        assert_eq!(page.total_lines, 1);
+        assert_eq!(page.oldest_line, 1);
+        assert!(!page.has_more);
+        assert_eq!(page.events.len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn events_windowed_counts_only_nonempty_lines() {
+        let root = temp_root();
+        let dir = root.join("s");
+        std::fs::create_dir_all(&dir).unwrap();
+        // 4 real events with blank lines interleaved → 4 countable lines
+        std::fs::write(
+            dir.join("events.jsonl"),
+            r#"{"i":1}
+
+{"i":2}
+{"i":3}
+
+{"i":4}
+"#,
+        )
+        .unwrap();
+        let sm = mgr(&root);
+        let page = sm.events_windowed("s", None, 2).await.unwrap();
+        assert_eq!(page.total_lines, 4);
+        assert_eq!(page.oldest_line, 3);
+        assert_eq!(page.events.len(), 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn events_windowed_caps_page_at_1000() {
+        let root = temp_root();
+        write_events(&root, "s", 10);
+        let sm = mgr(&root);
+        let page = sm.events_windowed("s", None, 5000).await.unwrap();
+        assert_eq!(page.events.len(), 10); // cap can't exceed what exists
+        assert!(!page.has_more);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn events_windowed_missing_session_errors() {
+        let root = temp_root();
+        let sm = mgr(&root);
+        assert!(sm.events_windowed("nope", None, 100).await.is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
