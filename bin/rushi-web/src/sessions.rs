@@ -24,6 +24,10 @@ pub struct EventsPage {
     pub total_lines: u64,
     /// Whether older events exist above `oldest_line`.
     pub has_more: bool,
+    /// Total rounds across the FULL log (1 + user_message line count),
+    /// so the client can label round chips with global numbers even
+    /// while only a window of the log is loaded.
+    pub total_rounds: u64,
 }
 
 /// Manages session directories and their `events.jsonl` logs.
@@ -152,6 +156,18 @@ impl SessionManager {
         };
         let start = end.saturating_sub(limit);
 
+        // Rounds across the FULL log, matching the client's
+        // compute_rounds: the first event opens round 1, and each LATER
+        // user_message line opens a new round. So total_rounds =
+        // 1 + (user_message lines that are not the first event).
+        // Quoted-type string scan (no JSON parse — cheap on multi-MB
+        // logs); "user_message_retract" lines do NOT match, since their
+        // type string is "user_message_retract".
+        let user_msgs = lines.iter().filter(|l| l.contains(r#""user_message""#)).count();
+        let first_is_um = lines.first().is_some_and(|l| l.contains(r#""user_message""#));
+        let later_ums = user_msgs.saturating_sub(if first_is_um { 1 } else { 0 });
+        let total_rounds = if total == 0 { 0 } else { 1 + later_ums as u64 };
+
         let events: Vec<serde_json::Value> = lines[start as usize..end as usize]
             .iter()
             .map(|line| {
@@ -166,6 +182,7 @@ impl SessionManager {
             oldest_line,
             total_lines: total,
             has_more: start > 0,
+            total_rounds,
         })
     }
 
@@ -402,14 +419,12 @@ pub async fn tail_file(path: PathBuf, tx: tokio::sync::mpsc::Sender<String>) {
 
         let mut buf = std::mem::take(&mut partial);
         buf.extend_from_slice(&new_bytes);
-        let mut consumed: u64 = 0;
         let mut rest = buf.as_slice();
         loop {
             match rest.iter().position(|&b| b == b'\n') {
                 Some(i) => {
                     let line: String = String::from_utf8_lossy(&rest[..i]).into_owned();
                     rest = &rest[i + 1..];
-                    consumed += i as u64 + 1;
                     if !line.trim().is_empty()
                         && tx.send(line).await.is_err()
                     {
@@ -422,7 +437,13 @@ pub async fn tail_file(path: PathBuf, tx: tokio::sync::mpsc::Sender<String>) {
                 }
             }
         }
-        offset += consumed;
+        // Advance past EVERYTHING read this poll (complete lines + the
+        // partial tail held in `partial`), not just the complete
+        // lines: the next poll must not re-read the partial bytes, or
+        // they would be prepended to the new read and duplicate the
+        // line prefix (a torn poll mid-line corrupted the JSON line).
+        // Truncation is detected above (offset reset to 0).
+        offset += new_bytes.len() as u64;
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
@@ -434,13 +455,27 @@ pub async fn tail_file(path: PathBuf, tx: tokio::sync::mpsc::Sender<String>) {
 /// is created before each call and deleted after, so the file is
 /// absent most of the time.
 ///
-/// Starts at the file's current end (a late connection must not
-/// replay an in-progress message's deltas; the final
-/// `assistant_message` event carries the full text anyway). A
-/// truncate (the next model call opens with `File::create`) resets
+/// `catch_up` (v0.5.21): a fresh client (new browser tab, or a session
+/// switch) starts with an EMPTY `live_text` (`clear_live()` on connect),
+/// so it has seen none of the in-flight message's deltas. When set, the
+/// tail starts at byte 0 and replays the whole current stream file first
+/// (every delta the model has emitted so far), so the in-progress card
+/// renders from the ACTUAL generation position instead of restarting
+/// from the first delta that lands after the connect. A late
+/// connection without `catch_up` (or a reconnect where the client kept
+/// its stream state) starts at the current end so it is not replayed.
+/// A truncate (the next model call opens with `File::create`) resets
 /// the offset so the new call's deltas flow. Polls every 100 ms.
-pub async fn tail_model_stream(path: PathBuf, tx: tokio::sync::mpsc::Sender<String>) {
-    let mut offset: u64 = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+pub async fn tail_model_stream(
+    path: PathBuf,
+    tx: tokio::sync::mpsc::Sender<String>,
+    catch_up: bool,
+) {
+    let mut offset: u64 = if catch_up {
+        0
+    } else {
+        std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
+    };
     let mut partial: Vec<u8> = Vec::new();
 
     loop {
@@ -467,14 +502,12 @@ pub async fn tail_model_stream(path: PathBuf, tx: tokio::sync::mpsc::Sender<Stri
                 }) {
                     let mut buf = std::mem::take(&mut partial);
                     buf.extend_from_slice(&new_bytes);
-                    let mut consumed: u64 = 0;
                     let mut rest = buf.as_slice();
                     loop {
                         match rest.iter().position(|&b| b == b'\n') {
                             Some(i) => {
                                 let line: String = String::from_utf8_lossy(&rest[..i]).into_owned();
                                 rest = &rest[i + 1..];
-                                consumed += i as u64 + 1;
                                 if !line.trim().is_empty()
                                     && tx.send(line).await.is_err()
                                 {
@@ -487,7 +520,15 @@ pub async fn tail_model_stream(path: PathBuf, tx: tokio::sync::mpsc::Sender<Stri
                             }
                         }
                     }
-                    offset += consumed;
+                    // Advance past EVERYTHING read this poll (complete
+                    // lines + the partial tail held in `partial`), not
+                    // just the complete lines: the next poll must not
+                    // re-read the partial bytes, or they would be
+                    // prepended to the new read and duplicate the line
+                    // prefix (a torn poll mid-line corrupted the delta
+                    // JSON). Truncation is still detected above via
+                    // `m.len() < offset` (reset to 0).
+                    offset += new_bytes.len() as u64;
                 }
             }
         }
@@ -511,15 +552,23 @@ fn now_rfc3339() -> String {
 mod tests {
     use super::*;
 
+    /// Per-test process counter so parallel tests never share a root,
+    /// even when the two `SystemTime::now()` calls land on the same
+    /// nanosecond (which makes `remove_dir_all` in one test race the
+    /// file writes of another).
+    static TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     fn temp_root() -> PathBuf {
         let mut p = std::env::temp_dir();
+        let seq = TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         p.push(format!(
-            "rushi-web-sessions-{}-{}",
+            "rushi-web-sessions-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            seq
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
@@ -565,6 +614,9 @@ mod tests {
         assert!(page.has_more);
         assert_eq!(page.events.len(), 4);
         assert_eq!(page.events.iter().map(event_index).collect::<Vec<_>>(), [7, 8, 9, 10]);
+        // 10 user_message lines: first opens round 1, 9 later lines
+        // open rounds 2..10.
+        assert_eq!(page.total_rounds, 10);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -648,5 +700,102 @@ mod tests {
         let sm = mgr(&root);
         assert!(sm.events_windowed("nope", None, 100).await.is_err());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Collect up to `max` messages from `rx` within a short window.
+    async fn collect(rx: &mut tokio::sync::mpsc::Receiver<String>, max: usize, window_ms: u64) -> Vec<String> {
+        let mut out = Vec::new();
+        while out.len() < max {
+            match tokio::time::timeout(std::time::Duration::from_millis(window_ms), rx.recv()).await {
+                Ok(Some(l)) => out.push(l),
+                _ => break,
+            }
+        }
+        out
+    }
+
+    /// v0.5.21: with catch-up, a fresh tailer replays every complete
+    /// line of the in-flight `.model-stream` file (the client's
+    /// `live_text` is empty on a new connect), holds the trailing
+    /// partial line for the next poll, and still resets on truncate.
+    #[tokio::test]
+    async fn tail_model_stream_catchup_replays_in_flight_file() {
+        let dir = temp_root();
+        let path = dir.join(".model-stream");
+        // In-flight call: 3 complete delta lines + a partial 4th
+        std::fs::write(
+            &path,
+            "{\"kind\":\"text\",\"delta\":\"a\"}\n\
+             {\"kind\":\"text\",\"delta\":\"b\"}\n\
+             {\"kind\":\"text\",\"delta\":\"c\"}\n\
+             {\"kind\":\"text\",\"del",
+        )
+        .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+        let p = path.clone();
+        let task = tokio::spawn(async move { tail_model_stream(p, tx, true).await });
+
+        let got = collect(&mut rx, 3, 300).await;
+        assert_eq!(got.len(), 3, "catch-up must replay all complete lines: {got:?}");
+        assert!(got[0].contains("\"a\"") && got[1].contains("\"b\"") && got[2].contains("\"c\""));
+        // The partial line must NOT have been sent yet.
+        assert!(rx.try_recv().is_err());
+
+        // Writer finishes the partial line -> it flows on the next poll.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"ta\":\"d\"}\n")
+            .unwrap();
+        let rest = collect(&mut rx, 1, 300).await;
+        assert_eq!(
+            rest,
+            vec!["{\"kind\":\"text\",\"delta\":\"d\"}".to_string()],
+            "completed partial line must flow intact (no duplicated prefix): {rest:?}"
+        );
+
+        // Next model call truncates the file -> truncate branch resets.
+        std::fs::write(&path, "{\"kind\":\"text\",\"delta\":\"n1\"}\n").unwrap();
+        let fresh = collect(&mut rx, 1, 300).await;
+        assert_eq!(fresh, vec!["{\"kind\":\"text\",\"delta\":\"n1\"}".to_string()]);
+
+        drop(rx); // receiver gone; no more lines will be written, so
+                  // the tailer would poll forever — abandon it
+        task.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Without catch-up the tailer starts at EOF: a fresh file is NOT
+    /// replayed (existing reconnects keep their own state).
+    #[tokio::test]
+    async fn tail_model_stream_no_catchup_starts_at_eof() {
+        let dir = temp_root();
+        let path = dir.join(".model-stream");
+        std::fs::write(
+            &path,
+            "{\"kind\":\"text\",\"delta\":\"a\"}\n{\"kind\":\"text\",\"delta\":\"b\"}\n",
+        )
+        .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+        let p = path.clone();
+        let task = tokio::spawn(async move { tail_model_stream(p, tx, false).await });
+
+        let got = collect(&mut rx, 2, 250).await;
+        assert!(got.is_empty(), "no-catch-up must not replay: {got:?}");
+
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"kind\":\"text\",\"delta\":\"c\"}\n")
+            .unwrap();
+        let live = collect(&mut rx, 1, 300).await;
+        assert_eq!(live.len(), 1, "new deltas must still flow: {live:?}");
+
+        drop(rx); // receiver gone; no more lines will be written, so
+                  // the tailer would poll forever — abandon it
+        task.abort();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

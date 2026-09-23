@@ -339,12 +339,13 @@ async fn ws_session(socket: WebSocket, st: AppState, session: String) {
     const HIST_PAGE: u64 = 200;
     if let Ok(page) = st.sessions.events_windowed(&session, None, HIST_PAGE).await {
         let payload = format!(
-            "[{{\"kind\":\"history\",\"events\":{},\"oldest_line\":{},\"total_lines\":{},\"has_more\":{}}}]
+            "[{{\"kind\":\"history\",\"events\":{},\"oldest_line\":{},\"total_lines\":{},\"has_more\":{},\"total_rounds\":{}}}]
 ",
             serde_json::to_string(&page.events).unwrap_or_default(),
             page.oldest_line,
             page.total_lines,
             page.has_more,
+            page.total_rounds,
         );
         if sock_tx.send(Message::text(payload)).await.is_err() {
             return;
@@ -375,10 +376,15 @@ async fn ws_session(socket: WebSocket, st: AppState, session: String) {
     // 2b. Model stream channel: tail the session's live `.model-stream`
     // (the model subprocess writes one SSE delta JSON line per token)
     // so the client can render the in-progress assistant card live.
+    // v0.5.21: a fresh client has an empty live buffer, so replay the
+    // whole in-flight stream file first (catch-up) — but only while
+    // the loop that owns the file is alive; a stale file left by a
+    // killed loop must not be replayed as if it were a live stream.
     let stream_path = st.sessions.session_dir(&session).join(".model-stream");
+    let catch_up = st.loops.is_running(&session).await;
     let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel::<String>(256);
     let stream_watcher = tokio::spawn(async move {
-        sessions::tail_model_stream(stream_path, stream_tx).await;
+        sessions::tail_model_stream(stream_path, stream_tx, catch_up).await;
     });
 
     // Loop-lifecycle channel: the server tells this client when the
@@ -487,6 +493,7 @@ async fn ws_session(socket: WebSocket, st: AppState, session: String) {
                                             "oldest_line": page.oldest_line,
                                             "total_lines": page.total_lines,
                                             "has_more": page.has_more,
+                                            "total_rounds": page.total_rounds,
                                         }]);
                                         if sock_tx.send(Message::text(frame.to_string())).await.is_err() {
                                             return;
