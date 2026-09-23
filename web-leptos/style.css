@@ -19,18 +19,16 @@
      The legacy translucent tints are replaced by opaque equivalents
      over --bg (#faf9f5) so the pinned deck stack reads clean. */
   --user-bg: #e8eee6;
-  --assistant-bg: var(--bg); /* v0.5.14b: the FINAL assistant card keeps the light
-     beige face (--bg) the user expected ("之前是浅米色"); only the in-flight
-     .ev-streaming card is overridden to the tool face (--tool-bg) so it still
-     matches tool call/result cards (round-6 ②). User cards keep --user-bg,
-     errors keep --error-bg. */
+  --assistant-bg: var(--bg); /* v0.5.20: assistant cards — the in-flight
+     .ev-streaming card AND the final card both sit on the light beige face
+     (--bg, 米白色), so the live→final handoff has no color step and no
+     relief step. (v0.5.14b gave the in-flight card the tool face; the user
+     dropped it in favor of a face-identical card.) User cards keep
+     --user-bg, errors keep --error-bg. */
   --tool-bg: #f1eee3;
   --error-bg: #f3e8e2;
   /* raised-block shadows (warm, on rice): dark fall + top-edge light = extruded relief */
   --shadow: 0 2px 4px rgba(75, 70, 55, 0.16), 0 1px 1px rgba(75, 70, 55, 0.10), inset 0 1px 0 rgba(255, 255, 255, 0.55);
-  /* v0.5.15: the in-flight card sits on a HIGHER plane than settled cards —
-     same relief language, pushed up: deeper, wider fall + stronger top light. */
-  --shadow-lifted: 0 7px 14px rgba(75, 70, 55, 0.24), 0 2px 5px rgba(75, 70, 55, 0.12), inset 0 1px 0 rgba(255, 255, 255, 0.60);
   --shadow-hover: 0 3px 8px rgba(75, 70, 55, 0.22), 0 1px 3px rgba(75, 70, 55, 0.12), inset 0 1px 0 rgba(255, 255, 255, 0.55);
   --shadow-pressed: inset 0 2px 4px rgba(75, 70, 55, 0.20);
   --shadow-up: 0 -2px 5px rgba(75, 70, 55, 0.14), 0 -1px 2px rgba(75, 70, 55, 0.10), inset 0 1px 0 rgba(255, 255, 255, 0.55);
@@ -271,21 +269,11 @@ button { font-weight: 700; }
    lands in the queue" flicker. A finished .enter animation is
    harmless: no fill-mode, base style is opacity 1 / transform none. */
 .event.enter { animation: fadeIn 0.15s ease-in; }
-/* v0.5.15: the live→final handoff. The card that just replaced the
-   in-flight node mounts IN the in-flight look (dark tool face + lifted
-   relief) and glides over 0.7s to the settled look (light face + normal
-   relief): the color change reads as "settling down", not a flicker.
-   v0.5.18: NO fade-in — a 150 ms opacity dip while the live node had
-   already vanished read as a flicker at every round end. The settling
-   card now appears INSTANTLY in the in-flight look (ev-settle's
-   `from` state matches .ev-assistant.ev-streaming exactly, so the
-   handoff is seamless) and only the face/relief glide. Specificity
-   ties .event.enter, so this rule (later in source) wins. */
-.event.ev-settling { animation: ev-settle 0.7s ease; }
-@keyframes ev-settle {
-  from { background-color: var(--tool-bg); box-shadow: var(--shadow-lifted); }
-  to   { background-color: var(--assistant-bg); box-shadow: var(--shadow); }
-}
+/* v0.5.20: the live→final handoff no longer has a color/relief step —
+   the in-flight card now wears the same beige face and shadow as the
+   final card, so the former .ev-settling 0.7s face/relief glide (and
+   its @keyframes ev-settle) is gone. The `.ev-settling` class may
+   still be applied by transcript.rs; it now matches no rule. */
 @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
 /* v0.5.14: the in-flight card is a real .event ev-assistant card — the
    sentinel item of the transcript's card list (transcript.rs) — so it
@@ -302,7 +290,7 @@ button { font-weight: 700; }
 .ev-running { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 700; color: var(--text-muted); }
 .ev-running::before { content: ''; width: 7px; height: 7px; border-radius: 50%; background: var(--accent, #6cc); animation: ev-pulse 1.1s ease-in-out infinite; }
 @keyframes ev-pulse { 0%, 100% { opacity: 0.35; transform: scale(0.85); } 50% { opacity: 1; transform: scale(1); } }
-@media (prefers-reduced-motion: reduce) { .ev-streaming.enter { animation: none; } .event.ev-settling { animation: none; } .ev-running::before { animation: none; opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .ev-streaming.enter { animation: none; } .ev-running::before { animation: none; opacity: 1; } }
 /* deal out of the pile — the mirror of the dock (pass 1): the card
    peels off when its flow slot has passed the deck's BOTTOM edge
    (PILE_TOP + COMPACT_ROW_H + PILE_BAND, pile.rs pass 2). The card
@@ -366,13 +354,10 @@ button { font-weight: 700; }
    divider between the pile and the card below it: no white base
    under the stack, just the card's own raised edge. */
 .ev-assistant { --card-bg: var(--assistant-bg); background: var(--assistant-bg); border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); box-shadow: var(--shadow); }
-/* v0.5.14b: the in-flight card (the sentinel item of the card list)
-   keeps the tool face so generate reads the same as tool call/result
-   cards (round-6 ②); on finalization the .ev-streaming class drops and
-   the SAME card reverts to the light --assistant-bg face — the color
-   step IS the "settled" cue. Two-class specificity so this wins over
-   .ev-assistant regardless of source order. */
-.ev-assistant.ev-streaming { --card-bg: var(--tool-bg); background: var(--tool-bg); box-shadow: var(--shadow-lifted); }
+/* v0.5.20: the in-flight card no longer overrides the assistant face —
+   it inherits .ev-assistant's beige (--assistant-bg) and normal shadow,
+   identical to the finalized card. No face/relief step at the
+   live→final handoff. */
 .ev-tool-call { --card-bg: var(--tool-bg); background: var(--tool-bg); border-left: 3px solid var(--warn); padding: 6px 12px; }
 .ev-tool-result { --card-bg: var(--tool-bg); background: var(--tool-bg); border-left: 3px solid var(--accent2); padding: 6px 12px; }
 .ev-tool-call .ev-header, .ev-tool-result .ev-header { margin-bottom: 2px; }
