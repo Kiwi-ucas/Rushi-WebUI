@@ -355,8 +355,9 @@ which is why only fast drags worked.
   A bottom watcher (rested ~0) still re-arms on round end; a reader parked
   >24 px above the bottom is left where they are; far-up readers
   (d > 80, reading latched) remain protected as before. Verified headless
-  via e2e/liveedge_probe.py (rearm:down at bottom, shrink-while-watching,
-  released-bottom shrink re-arm all pass); the 40 px parked-reader case is
+  via the local e2e/liveedge_probe.py probe (not checked in; see Dev notes)
+  — rearm:down at bottom, shrink-while-watching, released-bottom shrink re-arm
+  all pass; the 40 px parked-reader case is
   device-verified by scrolling up ~2 lines, letting a round end, and
   checking __rushiPile(): expect stick=false, reading=false,
   prev_dist > 24.
@@ -396,7 +397,7 @@ Exit 0 = all scenarios as expected, 1 = regression, 2 =
 inconclusive (no CDP target, no initialized pile, or no session
 with content).
 
-**Live round-boundary check: `e2e/liveedge_probe.py [port]` or a real
+**Live round-boundary check: the local `e2e/liveedge_probe.py [port]` probe (gitignored, not checked in — see Dev notes) or a real
 session.** The tier-1 round-end re-arm and the v0.5.38 finalization
 suppression need a *live* round (a real `assistant_message` finalizing),
 so the headless `touch_regress` can't exercise them. `liveedge_probe.py`
@@ -421,6 +422,14 @@ snapped back, then re-arms on pull-back-down (`rearm:down`).
 `touch_active=` for triage.
 
 ## Dev notes
+
+- Local CDP test probes: `e2e/*.py` / `e2e/*.sh` (touch_regress,
+  freeze_regress, liveedge_probe, earlier_anchor, earlier_flicker,
+  truncation_ws) drive a real headless Chromium over CDP against a
+  running rushi-web. They are developer regression tools, kept
+  LOCAL-ONLY — `e2e/` is gitignored and not part of the repo, so the
+  `e2e/...` paths cited above resolve only on a dev machine that has
+  the probes checked out.
 
 - Mobile Safari: the input row is kept above Safari's bottom URL bar /
   home indicator with `height: 100dvh` (no-JS fallback), a

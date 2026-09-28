@@ -21,3 +21,6 @@ __pycache__/
 # Local config / secrets
 *.local.toml
 .env
+
+# Local CDP test probes — intentionally not part of the repo
+e2e/
