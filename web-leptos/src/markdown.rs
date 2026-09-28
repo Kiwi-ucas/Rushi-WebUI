@@ -182,11 +182,19 @@ fn split_inline_blocks(src: &str, bullet: bool, ordered: bool) -> Vec<Vec<MdInli
         .collect()
 }
 
+/// v0.5.33: the fence-split regex, compiled once (parse_md used to
+/// rebuild it on every call — and parse_md runs on every coalesced
+/// delta flush of the streaming card).
+fn fence_re() -> &'static Regex {
+    static FENCE: OnceLock<Regex> = OnceLock::new();
+    FENCE.get_or_init(|| Regex::new(r"(```[^\n]*\n[\s\S]*?```|```[^\n]*$)").unwrap())
+}
+
 /// Parse markdown source into blocks (port of the legacy renderMD).
 pub fn parse_md(src: &str) -> Vec<MdBlock> {
     let mut blocks: Vec<MdBlock> = Vec::new();
     // Split on fenced code blocks first.
-    let re = Regex::new(r"(```[^\n]*\n[\s\S]*?```|```[^\n]*$)").unwrap();
+    let re = fence_re();
     let mut last = 0;
     for m in re.captures_iter(src) {
         let m = match m {

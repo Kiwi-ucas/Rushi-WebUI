@@ -9,6 +9,10 @@ web/dist/
 node_modules/
 
 # Logs & editor/OS noise
+
+# Python test caches
+__pycache__/
+*.pyc
 *.log
 .DS_Store
 .idea/

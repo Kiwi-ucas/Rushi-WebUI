@@ -14,9 +14,19 @@ fn all_card_indices(n: usize) -> Vec<usize> {
     (0..n).collect()
 }
 
+/// v0.5.33: card keys tagged with the event-generation counter.
+/// Returning a concrete `Vec<(u64, usize)>` (instead of an untyped
+/// `.collect()` inside the `view!` macro) gives the target type, and
+/// pairing the key with `ev_gen` so a prefix-changing write invalidates
+/// every card at once.
+fn ev_key_indices(n: usize, gen: u64) -> Vec<(u64, usize)> {
+    (0..n).map(|i| (gen, i)).collect()
+}
+
 #[component]
 pub fn Transcript(state: AppState) -> impl IntoView {
     let events = state.events;
+    let ev_gen = state.ev_gen;
 
     // Phase 4: the scroll/pile engine drives the DOM of #transcript
     // (fold/compact rows, cut-line shrink, auto-scroll) off every
@@ -38,21 +48,33 @@ pub fn Transcript(state: AppState) -> impl IntoView {
             // (older events) and prepends them to the loaded window.
             // Hidden when the whole log is loaded, and while a single
             // round is pinned in view.
+            // v0.5.21: the label doubles as feedback — it shows the
+            // in-flight state, a failure hint (watchdog / error frame),
+            // and how many events have been pulled so far.
             <Show
                 when=move || state.hist_has_more.get() && state.view_round.get().is_none()
                 fallback=|| ()
             >
                 <button
-                    class="load-earlier"
+                    class=move || {
+                        if state.earlier_failed.get() { "load-earlier failed" } else { "load-earlier" }
+                    }
                     disabled=move || state.loading_earlier.get()
                     on:click=move |_| crate::ws::load_earlier(&state)
                 >
                     { move || {
                         if state.loading_earlier.get() {
-                            "loading…".to_string()
+                            "loading\u{2026}".to_string()
+                        } else if state.earlier_failed.get() {
+                            "earlier failed \u{b7} click to retry".to_string()
                         } else {
                             let n = state.hist_oldest_line.get().saturating_sub(1);
-                            format!("↑ {n} earlier")
+                            let loaded = state.earlier_loaded.get();
+                            if loaded > 0 {
+                                format!("\u{2191} {n} earlier \u{b7} {loaded} loaded")
+                            } else {
+                                format!("\u{2191} load earlier ({n})")
+                            }
                         }
                     } }
                 </button>
@@ -61,9 +83,22 @@ pub fn Transcript(state: AppState) -> impl IntoView {
                 // All event cards; the pile engine maps DOM `.event`
                 // children 1:1 to these indices (ext_status renders
                 // empty, so the mapping stays intact).
-                each=move || all_card_indices(events.get().len())
-                key=|&i| i
-                children=move |i| {
+                // v0.5.33: key by (ev_gen, index). A plain index key
+                // keeps each card's view across a `load_earlier`
+                // PREPEND (Leptos re-diffs by key: same index ⇒ the
+                // pre-prepended card view is retained, so the older
+                // page never renders and the list shows duplicated
+                // tail content). Bumping ev_gen on every
+                // prefix-changing write (initial history frame,
+                // load-earlier prepend) invalidates all keys ⇒ a full
+                // rebuild with correct content; streaming appends do
+                // not bump, so the hot path keeps stable keys.
+                each=move || {
+                    ev_key_indices(events.get().len(), ev_gen.get())
+                }
+                key=|item: &(u64, usize)| item.clone()
+                children=move |item| {
+                    let (_, i) = item;
                     event_card_view(i, events, state)
                 }
             />
@@ -128,10 +163,11 @@ fn streaming_card_view(state: AppState) -> AnyView {
 /// only grow the last, still-in-progress block. The render exploits
 /// that:
 ///
-/// - `parsed` — a `Memo` re-parsing the WHOLE text on each delta.
-///   This is the only O(total-text) work per frame (fence regex
-///   scan + linear inline pass); comfortably sub-millisecond up to
-///   ~50KB, which is the whole streaming card.
+/// - `parsed` — a `Memo` re-parsing the WHOLE text on each flush,
+///   bounded by LIVE_MD_REPARSE_CAP (v0.5.33): past the cap the memo
+///   pins the last parse and the unparsed remainder renders as raw
+///   text in `.md-tail`, keeping the per-frame cost bounded even on
+///   long generations.
 /// - stable `For` over blocks `0..n-1` with index keys and STATIC
 ///   children: a child view is built ONCE when its block becomes
 ///   stable and is never re-run (no per-delta re-render, no
@@ -143,34 +179,82 @@ fn streaming_card_view(state: AppState) -> AnyView {
 /// When the text is cleared (final event lands) the memo is empty:
 /// the `For` unmounts its blocks, the `Show` hides the hot view, and
 /// the card itself is unmounted by the `Show` on `streaming`.
+// v0.5.33: cost cap for the live card's markdown re-parse. Below the
+// cap the render is as before (whole-text re-parse + hot-tail
+// re-highlight every coalesced flush, sub-millisecond up to ~50KB).
+// Past it, re-parsing STOPS: the parsed blocks freeze and the
+// unparsed remainder renders as plain wrapping text in `.md-tail`
+// (no highlighting, no markdown markup) until the card settles.
+// Without the cap, a long generation (three loops streaming for
+// minutes) makes the per-frame O(total-text) parse + O(tail-block)
+// highlight grow until the phone's main thread saturates — the
+// "uses fine, then freezes; only a refresh helps" behaviour.
+const LIVE_MD_REPARSE_CAP: usize = 100_000;
+
 fn live_md_view(text: RwSignal<String>) -> impl IntoView {
-    let parsed = Memo::new(move |_prev: Option<&Vec<md::MdBlock>>| {
-        md::parse_md(&text.get())
+    // Memo value: (parsed blocks, bytes parsed). Up to date on every
+    // flush while below the cap; pinned at the last parse once over
+    // it. (Memo::new takes Fn(Option<&T>) -> T — T here is the tuple.)
+    let parsed = Memo::new(move |prev: Option<&(Vec<md::MdBlock>, usize)>| {
+        let t = text.get();
+        if t.len() <= LIVE_MD_REPARSE_CAP {
+            (md::parse_md(&t), t.len())
+        } else {
+            // v0.5.33: cap hit — pin the last parse (frozen); the raw
+            // remainder grows behind it and renders in `.md-tail`.
+            match prev {
+                Some((blocks, n)) => (blocks.clone(), *n),
+                None => (md::parse_md(&t), t.len()),
+            }
+        }
     });
-    let stable = parsed;
-    let hot = parsed;
     view! {
         <div class="md">
             <For
                 each=move || {
-                    let n = stable.get().len();
-                    all_card_indices(n.saturating_sub(1))
+                    // Below the cap: the last block is hot (the Show
+                    // below renders it). At the cap: every parsed
+                    // block is frozen, so the For owns them all.
+                    let n = parsed.get().0.len();
+                    let capped = text.get().len() > LIVE_MD_REPARSE_CAP;
+                    all_card_indices(if capped { n } else { n.saturating_sub(1) })
                 }
                 key=|&i| i
                 children=move |i| {
-                    // Built once per block, at the moment the block
-                    // becomes stable; its content is frozen, so the
-                    // static view never needs to re-run.
-                    md_block_view(&stable.get()[i])
+                    // Built once when the block becomes stable; frozen
+                    // content, so the static view never re-runs (and at
+                    // the cap no block grows any more).
+                    let blocks = parsed.get().0;
+                    match blocks.get(i) {
+                        Some(b) => md_block_view(b),
+                        None => ().into_any(),
+                    }
                 }
             />
             <Show
-                when=move || !hot.get().is_empty()
+                when=move || {
+                    let (blocks, plen) = parsed.get();
+                    !blocks.is_empty() || text.get().len() > plen
+                }
                 fallback=|| ()
             >
                 { move || {
-                    let blocks = hot.get();
-                    md_block_view(&blocks[blocks.len() - 1])
+                    let (blocks, plen) = parsed.get();
+                    let t = text.get();
+                    if t.len() > plen {
+                        // v0.5.33: cap hit — the unparsed remainder is
+                        // shown raw until the card settles.
+                        view! {
+                            <pre class="md-tail">{ t.get(plen..).unwrap_or("").to_string() }</pre>
+                        }
+                        .into_any()
+                    } else {
+                        // Under the cap: the hot tail block.
+                        match blocks.last() {
+                            Some(b) => md_block_view(b),
+                            None => ().into_any(),
+                        }
+                    }
                 } }
             </Show>
         </div>

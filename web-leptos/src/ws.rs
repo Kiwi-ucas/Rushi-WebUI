@@ -4,6 +4,7 @@
 use std::cell::RefCell;
 
 use leptos::prelude::*;
+use leptos::task::spawn_local;
 use serde_json::Value;
 use web_sys::{CloseEvent, MessageEvent, WebSocket};
 use wasm_bindgen::closure::Closure;
@@ -16,6 +17,45 @@ thread_local! {
     /// The live socket for the active session; replaced (and closed) on
     /// session switch. Dropping the stored Closures deregisters handlers.
     static WS_LIVE: RefCell<Option<LiveSocket>> = const { RefCell::new(None) };
+
+    /// v0.5.23: model_stream deltas coalesced into one update per
+    /// animation frame. The server streams deltas at 60fps and a single
+    /// 16ms poll cycle can read several of them, so one frame may see
+    /// K WS messages. The pre-v0.5.23 per-message path ran a full
+    /// Leptos notify + markdown re-parse + engine rAF step PER message,
+    /// and K of those saturated the main thread during long
+    /// generations (clicks starved; CSS kept animating). Now deltas
+    /// accumulate here and a single rAF flush applies them.
+    static PENDING_TEXT: RefCell<String> = const { RefCell::new(String::new()) };
+    static PENDING_REASONING: RefCell<String> = const { RefCell::new(String::new()) };
+    /// A frame flush is already queued; `schedule_delta_flush` is a
+    /// no-op until it fires and re-arms.
+    static FLUSH_SCHEDULED: RefCell<bool> = const { RefCell::new(false) };
+}
+
+/// v0.5.23: queue `flush` for the next animation frame; at most one
+/// flush per frame regardless of how many delta messages arrived.
+fn schedule_delta_flush(flush: &Closure<dyn Fn()>) {
+    let already = FLUSH_SCHEDULED.with(|f| {
+        let mut f = f.borrow_mut();
+        let s = *f;
+        *f = true;
+        s
+    });
+    if already {
+        return;
+    }
+    if let Some(w) = web_sys::window() {
+        let _ = w.request_animation_frame(flush.as_js_value().unchecked_ref::<js_sys::Function>());
+    }
+}
+
+/// v0.5.23: discard coalesced deltas still waiting for the next frame
+/// (final `assistant_message` / stream error / session switch — a
+/// queued flush must not re-append text or revive the streaming card).
+fn drop_pending_deltas() {
+    PENDING_TEXT.with(|b| b.borrow_mut().clear());
+    PENDING_REASONING.with(|b| b.borrow_mut().clear());
 }
 
 #[allow(dead_code)] // fields are never read; they keep the Closures alive
@@ -45,6 +85,31 @@ pub fn close_current() {
 /// (kind "history"), then streams each new events.jsonl line (kind
 /// "event") and each live model delta (kind "model_stream"), plus
 /// out-of-band error lines (kind "error").
+/// v0.5.23: the per-frame flush of coalesced model_stream deltas, built
+/// for `state`'s live-stream signals. Used by connect() and by the freeze
+/// regression test, so both exercise the same coalescing path.
+fn make_delta_flush(state: &AppState) -> Closure<dyn Fn()> {
+    let live_text = state.live_text;
+    let live_reasoning = state.live_reasoning;
+    let streaming = state.streaming;
+    Closure::wrap(Box::new(move || {
+        FLUSH_SCHEDULED.with(|f| *f.borrow_mut() = false);
+        let text = PENDING_TEXT.with(|b| std::mem::take(&mut *b.borrow_mut()));
+        let reasoning = PENDING_REASONING.with(|b| std::mem::take(&mut *b.borrow_mut()));
+        if text.is_empty() && reasoning.is_empty() {
+            return;
+        }
+        if !text.is_empty() {
+            live_text.update(|s| s.push_str(&text));
+        }
+        if !reasoning.is_empty() {
+            live_reasoning.update(|s| s.push_str(&reasoning));
+        }
+        streaming.set(true);
+        crate::pile::on_change();
+    }) as Box<dyn Fn()>)
+}
+
 pub fn connect(state: &AppState, session: &str) {
     close_current();
     // A fresh connection owns a fresh live-stream state: no stale
@@ -54,6 +119,14 @@ pub fn connect(state: &AppState, session: &str) {
     state.hist_oldest_line.set(0);
     state.hist_has_more.set(false);
     state.loading_earlier.set(false);
+    // v0.5.21: per-connection "load earlier" bookkeeping resets too.
+    state.hist_total_rounds.set(0);
+    state.earlier_loaded.set(0);
+    state.earlier_failed.set(false);
+    // v0.5.23: drop coalesced deltas left over from the previous
+    // connection; a queued flush then finds empty buffers and no-ops,
+    // so it can never append into the new session's live card.
+    drop_pending_deltas();
 
     let w = match web_sys::window() {
         Some(w) => w,
@@ -89,10 +162,23 @@ pub fn connect(state: &AppState, session: &str) {
     let looping = state.looping_sessions;
     let done_unviewed = state.loop_done_unviewed;
     let settling = state.settling_card;
+    // v0.5.30: "output" sidebar rank — bumped only when a loop
+    // COMPLETES (the running=false branch of "loop_status").
+    let output_rank = state.output_rank;
     let session_name = session.to_string();
     let hist_oldest_line = state.hist_oldest_line;
     let hist_has_more = state.hist_has_more;
     let loading_earlier = state.loading_earlier;
+    let hist_total_rounds = state.hist_total_rounds;
+    let earlier_loaded = state.earlier_loaded;
+    let earlier_failed = state.earlier_failed;
+    let ev_gen = state.ev_gen;
+
+    // v0.5.23: the per-frame flush of coalesced model_stream deltas
+    // (see make_delta_flush). Created per connection — it captures THIS
+    // socket's signals — and is kept alive inside on_msg's capture box
+    // (see LiveSocket).
+    let flush = make_delta_flush(state);
 
     let on_msg = {
         let events = events;
@@ -106,10 +192,16 @@ pub fn connect(state: &AppState, session: &str) {
         let tool_pending = tool_pending;
         let looping = looping;
         let done_unviewed = done_unviewed;
+        let output_rank = output_rank;
         let session_name = session_name;
         let hist_oldest_line = hist_oldest_line;
         let hist_has_more = hist_has_more;
         let loading_earlier = loading_earlier;
+        let hist_total_rounds = hist_total_rounds;
+        let earlier_loaded = earlier_loaded;
+        let earlier_failed = earlier_failed;
+        let ev_gen = ev_gen;
+        let flush = flush;
         Closure::wrap(Box::new(move |e: MessageEvent| {
             let data = match e.data().as_string() {
                 Some(d) => d,
@@ -137,10 +229,19 @@ pub fn connect(state: &AppState, session: &str) {
                         // v0.5.17: truncated-history window state.
                         let oldest = item.get("oldest_line").and_then(|v| v.as_u64()).unwrap_or(1);
                         let has_more = item.get("has_more").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let total_rounds = item.get("total_rounds").and_then(|v| v.as_u64()).unwrap_or(0);
                         hist_oldest_line.set(oldest);
                         hist_has_more.set(has_more);
+                        hist_total_rounds.set(total_rounds);
+                        earlier_loaded.set(0);
+                        earlier_failed.set(false);
                         loading_earlier.set(false);
                         events.set(normed);
+                        // v0.5.33: this REPLACES the loaded list (fresh
+                        // connection, or a reconnect after the window
+                        // may have grown) — bump the generation so the
+                        // transcript's keyed For re-keys and rebuilds.
+                        ev_gen.update(|g| *g += 1);
                         // Drive the pile engine directly (the Transcript
                         // effect is a second, redundant trigger): park
                         // the view at the last message of the history.
@@ -154,6 +255,15 @@ pub fn connect(state: &AppState, session: &str) {
                             .and_then(|v| serde_json::from_value::<Vec<Value>>(v).ok())
                             .unwrap_or_default();
                         let new_count = evs.len();
+                        // v0.5.33: window bookkeeping applies to the
+                        // EMPTY terminal page too (has_more=false must
+                        // reach the pill even when 0 events came back).
+                        let oldest = item.get("oldest_line").and_then(|v| v.as_u64()).unwrap_or(1);
+                        let has_more = item.get("has_more").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let total_rounds = item.get("total_rounds").and_then(|v| v.as_u64()).unwrap_or(0);
+                        hist_oldest_line.set(oldest);
+                        hist_has_more.set(has_more);
+                        hist_total_rounds.set(total_rounds);
                         if new_count > 0 {
                             let normed: Vec<Value> =
                                 evs.into_iter().map(|mut v| normalize_event(&mut v)).collect();
@@ -167,12 +277,16 @@ pub fn connect(state: &AppState, session: &str) {
                             ctx_used.set(ctx);
                             rounds_ctxk.set(ctxk);
                             tool_pending.set(rebuild_tool_pending(&merged));
-                            let oldest = item.get("oldest_line").and_then(|v| v.as_u64()).unwrap_or(1);
-                            let has_more = item.get("has_more").and_then(|v| v.as_bool()).unwrap_or(false);
-                            hist_oldest_line.set(oldest);
-                            hist_has_more.set(has_more);
+                            earlier_loaded.update(|v| *v += new_count as u64);
                             events.set(merged);
+                            // v0.5.33: prepend shifts every index — bump
+                            // the generation so the keyed For re-keys
+                            // and rebuilds all cards (a plain index key
+                            // would retain the pre-prepended views and
+                            // swallow this page).
+                            ev_gen.update(|g| *g += 1);
                         }
+                        earlier_failed.set(false);
                         loading_earlier.set(false);
                     }
                     "event" => {
@@ -203,6 +317,11 @@ pub fn connect(state: &AppState, session: &str) {
                                 }
                             }
                         } else if t == "user_message" {
+                            // v0.5.23: a new round starts; drop any
+                            // coalesced deltas left over from the
+                            // previous one (a queued flush must not
+                            // re-append into the new round's card).
+                            drop_pending_deltas();
                             // A user_message closes the previous round
                             // (legacy curRound bookkeeping). Record ctxK
                             // EXACTLY ONCE: for our own sends, do_send
@@ -245,11 +364,17 @@ pub fn connect(state: &AppState, session: &str) {
                                 if streaming.get() {
                                     settling.set(true);
                                 }
+                                // v0.5.23: this event owns the final text;
+                                // drop any coalesced deltas still queued so
+                                // the pending rAF flush can't re-append them.
+                                drop_pending_deltas();
                                 live_text.set(String::new());
                                 live_reasoning.set(String::new());
                                 streaming.set(false);
                             }
                             "error" => {
+                                // v0.5.23: same guard as assistant_message.
+                                drop_pending_deltas();
                                 live_text.set(String::new());
                                 live_reasoning.set(String::new());
                                 streaming.set(false);
@@ -306,6 +431,14 @@ pub fn connect(state: &AppState, session: &str) {
                             "message": message,
                         });
                         events.update(|old| old.push(ev));
+                        // v0.5.21: an error frame can be the reply to a
+                        // load_earlier command (e.g. "load_earlier failed: …").
+                        // Without this the in-flight flag would stick true
+                        // and the pill would stay disabled forever.
+                        if loading_earlier.get() {
+                            loading_earlier.set(false);
+                            earlier_failed.set(true);
+                        }
                         crate::pile::on_change();
                     }
                     "loops" => {
@@ -354,6 +487,18 @@ pub fn connect(state: &AppState, session: &str) {
                                 ls.remove(&sname);
                                 du.insert(sname.clone());
                             }
+                        }
+                        // v0.5.30: "output" sidebar rank — the ONLY thing
+                        // that moves the by-last-output order. Bumped
+                        // here, at loop COMPLETION (running=false), so
+                        // concurrent streaming sessions do not reshuffle
+                        // the sidebar card-per-card; a finished loop
+                        // jumps to the top.
+                        if !running {
+                            let now = js_sys::Date::now() / 1000.0;
+                            output_rank.update(|rank| {
+                                rank.insert(sname.clone(), now);
+                            });
                         }
                         if sname == session_name {
                             loop_running.set(running);
@@ -413,20 +558,21 @@ pub fn connect(state: &AppState, session: &str) {
                         // tool_call_delta and done carry no card of
                         // their own; the final events do the work.
                         if !delta.is_empty() {
+                            // v0.5.23: coalesce into the per-frame buffer
+                            // instead of a reactive update per message
+                            // (the 60fps stream used to saturate the main
+                            // thread; one rAF flush applies all pending
+                            // deltas).
                             match dkind {
-                                "text" => {
-                                    live_text.update(|s| s.push_str(delta));
-                                    streaming.set(true);
-                                }
                                 "reasoning" => {
-                                    live_reasoning.update(|s| s.push_str(delta));
-                                    streaming.set(true);
+                                    PENDING_REASONING.with(|b| b.borrow_mut().push_str(delta));
                                 }
-                                _ => {}
+                                _ => {
+                                    PENDING_TEXT.with(|b| b.borrow_mut().push_str(delta));
+                                }
                             }
-                            // Let the pile follow the growing card
-                            // (rAF-throttled; a no-op if already parked).
-                            crate::pile::on_change();
+                            // At most one flush per animation frame.
+                            schedule_delta_flush(&flush);
                         }
                     }
                     _ => {}
@@ -437,9 +583,33 @@ pub fn connect(state: &AppState, session: &str) {
 
     let on_close = {
         let ws_status = ws_status;
+        let st = *state;
+        // `session_name` was moved into the on_msg closure above, so
+        // build this socket's reconnect name directly from the `&str`
+        // param (still owned-scoped here, not captured by the Closure).
+        let sname = session.to_string();
         Closure::wrap(
             Box::new(move |_e: CloseEvent| {
                 ws_status.set("disconnected".to_string());
+                // v0.5.21: auto-reconnect. If this socket still owns the
+                // active session, re-establish it after 1s. Guards: the
+                // session-name check stops a superseded socket (user
+                // already switched sessions) from resurrecting the old
+                // one; the is_open() check avoids double-connecting while
+                // a fresh socket is mid-handshake. Re-checked AFTER the
+                // sleep so a session switch during the delay wins.
+                if st.active_session.get().as_deref() == Some(sname.as_str()) && !is_open() {
+                    // `st` is Copy; clone the String so the outer
+                    // closure stays FnMut (it must outlive one close).
+                    let st2 = st;
+                    let sname2 = sname.clone();
+                    spawn_local(async move {
+                        gloo_timers::future::TimeoutFuture::new(1000).await;
+                        if st2.active_session.get().as_deref() == Some(sname2.as_str()) && !is_open() {
+                            connect(&st2, &sname2);
+                        }
+                    });
+                }
             }) as Box<dyn FnMut(CloseEvent)>,
         )
     };
@@ -499,12 +669,29 @@ pub fn load_earlier(state: &AppState) {
     if state.loading_earlier.get() || !state.hist_has_more.get() {
         return;
     }
+    // v0.5.37: capture the reader's exact viewport position NOW (before
+    // the pill relabels to "loading…"), so the prepend can restore the
+    // screen to the spot the user was actually reading.
+    crate::pile::capture_earlier_anchor();
     state.loading_earlier.set(true);
+    state.earlier_failed.set(false);
     let before = state.hist_oldest_line.get().max(1);
     send_command(
         &active,
         &serde_json::json!({ "kind": "load_earlier", "before_line": before, "limit": 200 }),
     );
+    // v0.5.21: watchdog — if the history_page frame never arrives
+    // (dead socket, old server that ignores the command, dropped
+    // message), clear the in-flight flag so the pill un-sticks and
+    // shows the retry hint instead of "loading…" forever.
+    let st = *state;
+    spawn_local(async move {
+        gloo_timers::future::TimeoutFuture::new(5000).await;
+        if st.loading_earlier.get() {
+            st.loading_earlier.set(false);
+            st.earlier_failed.set(true);
+        }
+    });
 }
 
 /// Rebuild the legacy ctx bookkeeping from a (partial or full) event
@@ -551,4 +738,403 @@ fn rebuild_tool_pending(normed: &[Value]) -> Vec<String> {
         .into_iter()
         .filter(|id| !done.iter().any(|d| d == id))
         .collect()
+}
+
+
+// ── v0.5.23: freeze regression test (`?test=freeze`) ────────────────
+//
+// Repeatable regression test for the main-thread saturation that froze
+// the UI during model streaming (the pre-v0.5.23 per-delta reactive
+// update storm). Open the app with `?test=freeze` in the URL (add
+// `&flood=raw` to emulate the PRE-fix behaviour as a negative
+// control) and ~1.5 s after mount the test runs itself:
+//
+//   1. seeds the streaming card with a large markdown document,
+//   2. drives the flood on a 16 ms timer chain (rAF never fires in
+//      the headless shell the e2e runner uses; a real browser gets
+//      the same cadence) — the default mode pushes each tick's delta
+//      batch into the per-frame pending buffers and invokes the
+//      production coalesced flush ONCE; the raw control fires K
+//      separate one-delta timer tasks per tick (the pre-fix shape:
+//      each WS message was its own task, so Leptos flushed between
+//      deltas), while sampling main-thread responsiveness (tick
+//      gaps + a 0 ms timer round-trip queued behind the flood),
+//   3. restores the signals and writes a machine-readable verdict to
+//      `window.__rushiFreezeResult`, the console, a visible
+//      #rushi-freeze-badge, the <title>, and persistent
+//      `<html data-freeze-verdict / -gap / -timer>` attributes (the
+//      CDP runner e2e/freeze_regress.py reads those after the badge
+//      auto-dismisses).
+//
+// PASS: max tick gap < 100 ms AND max timer round-trip < 150 ms while the
+// document grows. The raw (pre-fix) control is EXPECTED to fail — that
+// is how the test proves it discriminates. (Raw stops early, after
+// FLOOD_EARLY_STOP_FRAMES ticks, once a threshold is exceeded.)
+
+/// Deltas delivered per 16 ms tick. 60 (≈3.3 KB/tick) models a very
+/// fast local burst: the raw control fires 60 separate one-delta
+/// timer tasks per tick, and their full-cycle cost grows with the
+/// document, so the bursts saturate the main thread (the pre-fix
+/// freeze). The coalesced path pays ONE flush per tick no matter K,
+/// so it stays smooth. (6 deltas were too mild to exceed the
+/// thresholds even in raw mode — the test must discriminate, not
+/// just run.)
+const FLOOD_CHUNKS_PER_FRAME: u32 = 60;
+/// ~1.5 s at 60 fps. Sized so the flood ends with a ~360 KB live
+/// document: the coalesced path pays ONE re-parse/DOM cycle per tick
+/// (stays under the 100 ms gate), while the raw control pays 60
+/// re-parses per tick and exceeds the gates — from ~40 frames in
+/// (see FLOOD_EARLY_STOP_FRAMES, which stops the raw run once the
+/// failure is proven).
+const FLOOD_FRAMES: u32 = 96;
+/// Raw mode stops as soon as it has exceeded a threshold for this many
+/// ticks (proven failure; no need to burn the full flood).
+const FLOOD_EARLY_STOP_FRAMES: u32 = 24;
+const FLOOD_SEED_BYTES: usize = 40_000;
+const FLOOD_MAX_GAP_MS: f64 = 100.0;
+const FLOOD_MAX_TIMER_MS: f64 = 150.0;
+/// Driver tick cadence. The driver runs on a timer chain (NOT rAF):
+/// the headless shell that executes this test has no display and fires
+/// no animation frames, while timers run normally — a real browser
+/// gets the same ~60 Hz cadence from the 16 ms timer.
+const FLOOD_FRAME_MS: u32 = 16;
+
+/// ~55 bytes: the size of one delta; a burst of 60 of these in one
+/// 16 ms tick is the "fast local model" flood the UI must survive.
+const FLOOD_CHUNK: &str = "delta — the model keeps writing, the UI must stay responsive. ";
+
+/// Repeating block exercising every parser branch (heading, paragraph,
+/// code fence, table, bullets) so the hot-tail re-parse does real work.
+fn flood_seed() -> String {
+    let block = "\n## Section\n\nRushi regression paragraph. The quick brown fox jumps over the lazy dog while the model streams a long answer into the transcript card.\n\n```\nfn sample() -> usize {\n    (0..64).map(|n| n.wrapping_mul(7)).sum()\n}\n```\n\n| round | tool | ctx |\n| --- | --- | --- |\n| 1 | read | 12k |\n| 2 | bash | 18k |\n\n- alpha\n- beta\n- gamma\n";
+    let mut s = String::with_capacity(FLOOD_SEED_BYTES + block.len());
+    while s.len() < FLOOD_SEED_BYTES {
+        s.push_str(block);
+    }
+    s
+}
+
+/// Per-frame driver state for the flood (see `run_freeze_test`).
+struct FloodState {
+    frame: u32,
+    last_ts: Option<f64>,
+    max_gap_ms: f64,
+    timer_max_ms: f64,
+    /// Timer round-trip probes (one per tick). They must survive
+    /// until they fire — a raw-mode burst queues them for a while —
+    /// so they are kept for the test's lifetime and dropped all at
+    /// once when the driver is done.
+    pending: Vec<gloo_timers::callback::Timeout>,
+    /// The next-tick timer (dropped when the test ends).
+    tick: Option<gloo_timers::callback::Timeout>,
+    /// The timer that starts the driver chain (kept alive until it
+    /// fires; the driver then reschedules itself into `tick`).
+    first: Option<gloo_timers::callback::Timeout>,
+}
+
+/// Write the verdict everywhere the test can be read from: the
+/// console, `window.__rushiFreezeResult` (for scripts), and a visible
+/// #rushi-freeze-badge.
+fn flood_report(pass: Option<bool>, reason: &str, max_gap_ms: f64, timer_ms: f64, frames: u32, live_bytes: usize) {
+    let label = match pass {
+        Some(true) => "PASS",
+        Some(false) => "FAIL",
+        None => "SKIP",
+    };
+    let json = serde_json::json!({
+        "pass": pass,
+        "reason": reason,
+        "max_gap_ms": max_gap_ms,
+        "timer_ms": timer_ms,
+        "frames": frames,
+        "frames_expected": FLOOD_FRAMES,
+        "live_bytes": live_bytes,
+        "thresholds": { "max_gap_ms": FLOOD_MAX_GAP_MS, "timer_ms": FLOOD_MAX_TIMER_MS },
+        "version": "0.5.23",
+    });
+    let js = format!(
+        "window.__rushiFreezeResult = {}; console.log('[rushi-freeze] {} — {} (gap {gap:.0}ms, timer {clk:.0}ms, {frames}/{total} frames)');",
+        json,
+        label,
+        reason,
+        gap = max_gap_ms,
+        clk = timer_ms,
+        frames = frames,
+        total = FLOOD_FRAMES
+    );
+    let _ = js_sys::eval(&js);
+    if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+        // Persistent verdict markers (the badge below auto-dismisses):
+        // the tab title for humans, the html data attribute for
+        // headless harnesses that dump the DOM after the badge is gone.
+        let _ = doc.set_title(&format!("rushi freeze-test {label}"));
+        if let Some(root) = doc.document_element() {
+            let _ = root.set_attribute("data-freeze-verdict", label);
+            let _ = root.set_attribute(
+                "data-freeze-gap",
+                &format!("{max_gap_ms:.1}"),
+            );
+            let _ = root.set_attribute(
+                "data-freeze-timer",
+                &format!("{timer_ms:.1}"),
+            );
+        }
+        if let Ok(div) = doc.create_element("div") {
+            div.set_id("rushi-freeze-badge");
+            let color = if pass == Some(true) { "#4ade80" } else { "#f87171" };
+            let _ = div.set_attribute(
+                "style",
+                &format!(
+                    "position:fixed;top:12px;right:12px;z-index:99999;font:13px system-ui;padding:8px 12px;border-radius:8px;background:#1c1e21;color:{color};box-shadow:0 2px 12px rgba(0,0,0,.5)"
+                ),
+            );
+            div.set_text_content(Some(&format!(
+                "freeze-test {label}: {reason} — gap {gap:.0}ms / timer {clk:.0}ms",
+                gap = max_gap_ms,
+                clk = timer_ms,
+            )));
+            if let Some(body) = doc.body() {
+                let _ = body.append_child(&div);
+            }
+            let div2 = div.clone();
+            crate::pile::leak_timeout(gloo_timers::callback::Timeout::new(
+                20_000,
+                move || {
+                    let _ = div2.remove();
+                },
+            ));
+        }
+    }
+}
+
+/// Run the freeze regression test. Auto-invoked when the URL carries
+/// `?test=freeze` (see lib.rs); safe to call manually from the console.
+pub fn run_freeze_test() {
+    let Some(state) = crate::model::AppState::current_app_state() else {
+        flood_report(None, "no AppState (call after mount)", 0.0, 0.0, 0, 0);
+        return;
+    };
+    // rAF is throttled in background tabs; a verdict there is
+    // meaningless.
+    if js_sys::eval("document.visibilityState")
+        .ok()
+        .and_then(|v| v.as_string())
+        .as_deref()
+        == Some("hidden")
+    {
+        flood_report(
+            None,
+            "tab hidden (rAF throttled) — open in a visible tab",
+            0.0,
+            0.0,
+            0,
+            0,
+        );
+        return;
+    }
+    let raw_mode = web_sys::window()
+        .and_then(|w| w.location().search().ok())
+        .is_some_and(|q| q.contains("flood=raw"));
+
+    // Snapshot the live-stream signals so the test can restore them.
+    let old_text = state.live_text.get();
+    let old_reasoning = state.live_reasoning.get();
+    let old_streaming = state.streaming.get();
+
+    PENDING_TEXT.with(|b| b.borrow_mut().clear());
+    PENDING_REASONING.with(|b| b.borrow_mut().clear());
+    FLUSH_SCHEDULED.with(|f| *f.borrow_mut() = false);
+
+    // Responsiveness probe: every frame schedules a setTimeout(0) and
+    // records how late it actually fired. A saturated main thread
+    // (the pre-v0.5.23 situation) delays timer fires into the
+    // hundreds of ms. (A synthetic el.click() handler would run
+    // inline in the same task and measure nothing; a timer
+    // round-trip does.)
+    let timer_latency = std::rc::Rc::new(std::cell::RefCell::new(0.0f64));
+    // Liveness guard for raw-mode drain tasks: the queued one-delta
+    // timers outlive the driver's early stop; the flag makes them
+    // no-ops once the test has restored the signals.
+    let alive = std::rc::Rc::new(std::cell::RefCell::new(true));
+
+    // Seed the streaming card so each flush does the real work:
+    // hot-tail markdown re-parse + Leptos notify + engine step.
+    let seed = flood_seed();
+    state.live_text.set(seed.clone());
+    state.live_reasoning.set(String::new());
+    state.streaming.set(true);
+    crate::pile::on_change();
+
+    // Driver: one 16 ms timer chain that (a) pushes this tick's flood
+    // batch — coalesced buffers in the default mode, the old per-delta
+    // path in raw mode — (b) samples the tick gap, (c) schedules the
+    // 0 ms timer round-trip probe, (d) reschedules itself, and
+    // (e) on the last tick restores the signals and reports.
+    let flush = make_delta_flush(&state);
+    let live_text = state.live_text;
+    let live_reasoning = state.live_reasoning;
+    let streaming = state.streaming;
+    let ds = std::rc::Rc::new(std::cell::RefCell::new(FloodState {
+        frame: 0,
+        last_ts: None,
+        max_gap_ms: 0.0,
+        timer_max_ms: 0.0,
+        pending: Vec::new(),
+        tick: None,
+        first: None,
+    }));
+    let next_frame: std::rc::Rc<std::cell::RefCell<Option<Closure<dyn Fn()>>>> = std::rc::Rc::new(std::cell::RefCell::new(None));
+    {
+        let ns = next_frame.clone();
+        let ds = ds.clone();
+        let lat = timer_latency.clone();
+        let driver = Closure::wrap(Box::new(move || {
+            let done = {
+                let mut st = ds.borrow_mut();
+                st.frame += 1;
+                let now = js_sys::Date::now();
+                if let Some(last) = st.last_ts {
+                    st.max_gap_ms = st.max_gap_ms.max(now - last);
+                }
+                st.last_ts = Some(now);
+                if raw_mode {
+                    // Pre-v0.5.23 behaviour: every delta was its own
+                    // task (a separate WS message is its own
+                    // macrotask), so Leptos flushed BETWEEN deltas —
+                    // K full re-parse/DOM cycles per frame. Model that
+                    // with K separate timer tasks: a synchronous loop
+                    // would coalesce into one cycle and the test would
+                    // not discriminate.
+                    for _ in 0..FLOOD_CHUNKS_PER_FRAME {
+                        let lt = live_text;
+                        let st = streaming;
+                        let al = alive.clone();
+                        crate::pile::leak_timeout(gloo_timers::callback::Timeout::new(
+                            0,
+                            move || {
+                                if !*al.borrow() {
+                                    return;
+                                }
+                                lt.update(|s| s.push_str(FLOOD_CHUNK));
+                                st.set(true);
+                                crate::pile::on_change();
+                            },
+                        ));
+                    }
+                } else {
+                    PENDING_TEXT.with(|b| {
+                        let mut b = b.borrow_mut();
+                        for _ in 0..FLOOD_CHUNKS_PER_FRAME {
+                            b.push_str(FLOOD_CHUNK);
+                        }
+                    });
+                    // Drive the production coalesced flush directly:
+                    // schedule_delta_flush is rAF-based and rAF never
+                    // fires in the headless shell, so the tick invokes
+                    // the flush's JS function value instead (same
+                    // coalescing contract: one flush per tick, K deltas
+                    // inside). The ScopedClosure stays owned by the
+                    // driver, so its JS callback stays registered.
+                    let f: &js_sys::Function =
+                        flush.as_js_value().unchecked_ref::<js_sys::Function>();
+                    let _ = f.call0(&wasm_bindgen::JsValue::UNDEFINED);
+                }
+                // Timer round-trip sample for this tick: scheduled
+                // AFTER the flood block, so it is queued behind the
+                // raw delta tasks and measures the whole burst.
+                let t0v = now;
+                let latc = lat.clone();
+                let to = gloo_timers::callback::Timeout::new(
+                    0,
+                    move || {
+                        *latc.borrow_mut() = js_sys::Date::now() - t0v;
+                    },
+                );
+                st.pending.push(to);
+                st.timer_max_ms = st.timer_max_ms.max(*lat.borrow());
+                let done = st.frame >= FLOOD_FRAMES
+                    || (raw_mode
+                        && st.frame >= FLOOD_EARLY_STOP_FRAMES
+                        && (st.max_gap_ms > FLOOD_MAX_GAP_MS
+                            || st.timer_max_ms > FLOOD_MAX_TIMER_MS));
+                if !done {
+                    // Re-trigger the driver through its JS function
+                    // value: take the stored closure, clone its JS
+                    // reference, hand the owner back to ns (dropping a
+                    // ScopedClosure deregisters its JS callback), and
+                    // let the next tick's timer call the JS function.
+                    let c = ns.borrow_mut().take();
+                    if let Some(c) = c {
+                        let jsfn = c.as_js_value().clone();
+                        ns.borrow_mut().replace(c);
+                        st.tick = Some(gloo_timers::callback::Timeout::new(
+                            FLOOD_FRAME_MS,
+                            move || {
+                                let f: &js_sys::Function =
+                                    jsfn.unchecked_ref::<js_sys::Function>();
+                                let _ = f.call0(&wasm_bindgen::JsValue::UNDEFINED);
+                            },
+                        ));
+                    }
+                }
+                done
+            };
+            if done {
+                ns.borrow_mut().take(); // deregister (no more frames)
+                // Stop raw drain tasks that are still queued: they
+                // must not append to the restored text or revive the
+                // streaming card.
+                *alive.borrow_mut() = false;
+                // clone (not move): the driver closure must stay Fn.
+                live_text.set(old_text.clone());
+                live_reasoning.set(old_reasoning.clone());
+                streaming.set(old_streaming);
+                drop_pending_deltas();
+                crate::pile::on_change();
+                let st = ds.borrow();
+                let verdict = st.max_gap_ms < FLOOD_MAX_GAP_MS
+                    && st.timer_max_ms < FLOOD_MAX_TIMER_MS;
+                let reason = if raw_mode {
+                    let r = "raw control (pre-fix behaviour — expected to fail)";
+                    if st.frame < FLOOD_FRAMES {
+                        format!("{r} — stopped early at frame {}", st.frame)
+                    } else {
+                        r.to_string()
+                    }
+                } else {
+                    "coalesced per-frame flush".to_string()
+                };
+                let gap = st.max_gap_ms;
+                let clk = st.timer_max_ms;
+                let frames = st.frame;
+                drop(st);
+                flood_report(
+                    Some(verdict),
+                    &reason,
+                    gap,
+                    clk,
+                    frames,
+                    live_text.get().len(),
+                );
+                return;
+            }
+        }) as Box<dyn Fn()>);
+        next_frame.borrow_mut().replace(driver);
+    }
+    {
+        let c = next_frame.borrow_mut().take().expect("driver stored");
+        // Timer kick (rAF does not fire in the headless shell — see
+        // FLOOD_FRAME_MS). The timer must stay alive until it fires,
+        // so it lives in FloodState until the first tick.
+        let jsfn = c.as_js_value().clone();
+        next_frame.borrow_mut().replace(c);
+        ds.borrow_mut().first = Some(gloo_timers::callback::Timeout::new(
+            FLOOD_FRAME_MS,
+            move || {
+                let f: &js_sys::Function =
+                    jsfn.unchecked_ref::<js_sys::Function>();
+                let _ = f.call0(&wasm_bindgen::JsValue::UNDEFINED);
+            },
+        ));
+    }
 }

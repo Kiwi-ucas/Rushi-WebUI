@@ -13,6 +13,13 @@
   --accent-salmon: #e88a70;
   --danger: #b3402f;
   --warn: #9a6a10;
+  /* loop indicator three rings (v0.5.27-A, re-adopted in v0.5.28 after the
+     user tried the salmon outer pulse B and came back to all-green):
+     single-hue GREEN ramp — soft outer -> mid -> theme accent core. Dark
+     overrides --loop-out/--loop-mid below; --loop-in follows --accent. */
+  --loop-out: #b8caa9;
+  --loop-mid: #7fae85;
+  --loop-in: var(--accent);
   --code-bg: #f1eee3;
   /* Opaque card faces: a card keeps the SAME background in the queue,
      in the pile (compact/deck) and mid-animation — one card, one face.
@@ -27,14 +34,32 @@
      --user-bg, errors keep --error-bg. */
   --tool-bg: #f1eee3;
   --error-bg: #f3e8e2;
+  /* v0.5.22: relief color pair, parameterized. The light theme is a WARM
+     extrusion — a warm dark fall + a white top-edge rim; the dark theme
+     inverts the physics with its own token overrides: near-black fall +
+     a faint warm rim. Every call site (the tokens below, the scattered
+     gradients/insets, the pile engine's inline box-shadows in pile.rs)
+     uses these two vars so ONE dark block re-themes the whole relief
+     language. Light values below are byte-identical to the former
+     hard-coded rgba(75,70,55,x) / rgba(255,255,255,x). */
+  --shadow-tint: 75, 70, 55;
+  --shadow-rim: 255, 255, 255;
+  /* deck-edge pair the pile engine appends to --shadow inline (pile.rs):
+     an up-facing fall under a card sliding out of the deck. */
+  --shadow-deck-edge: 0 -2px 5px rgba(var(--shadow-tint), 0.16), 0 -1px 2px rgba(var(--shadow-tint), 0.10);
+  /* text on filled (accent / danger / badge) buttons. Light: white on
+     deep greens, black on mid greens; dark flips to dark-on-light. */
+  --on-accent: #fff;
+  --on-danger: #fff;
+  --on-badge: #000;
   /* raised-block shadows (warm, on rice): dark fall + top-edge light = extruded relief */
-  --shadow: 0 2px 4px rgba(75, 70, 55, 0.16), 0 1px 1px rgba(75, 70, 55, 0.10), inset 0 1px 0 rgba(255, 255, 255, 0.55);
-  --shadow-hover: 0 3px 8px rgba(75, 70, 55, 0.22), 0 1px 3px rgba(75, 70, 55, 0.12), inset 0 1px 0 rgba(255, 255, 255, 0.55);
-  --shadow-pressed: inset 0 2px 4px rgba(75, 70, 55, 0.20);
-  --shadow-up: 0 -2px 5px rgba(75, 70, 55, 0.14), 0 -1px 2px rgba(75, 70, 55, 0.10), inset 0 1px 0 rgba(255, 255, 255, 0.55);
-  --shadow-up-hover: 0 -3px 10px rgba(75, 70, 55, 0.20), inset 0 1px 0 rgba(255, 255, 255, 0.55);
-  --shadow-side: 2px 0 6px rgba(75, 70, 55, 0.14), 2px 0 2px rgba(75, 70, 55, 0.08), inset 0 1px 0 rgba(255, 255, 255, 0.40);
-  --groove: inset 0 1px 2px rgba(75, 70, 55, 0.20), inset 0 -1px 0 rgba(255, 255, 255, 0.50);
+  --shadow: 0 2px 4px rgba(var(--shadow-tint), 0.16), 0 1px 1px rgba(var(--shadow-tint), 0.10), inset 0 1px 0 rgba(var(--shadow-rim), 0.55);
+  --shadow-hover: 0 3px 8px rgba(var(--shadow-tint), 0.22), 0 1px 3px rgba(var(--shadow-tint), 0.12), inset 0 1px 0 rgba(var(--shadow-rim), 0.55);
+  --shadow-pressed: inset 0 2px 4px rgba(var(--shadow-tint), 0.20);
+  --shadow-up: 0 -2px 5px rgba(var(--shadow-tint), 0.14), 0 -1px 2px rgba(var(--shadow-tint), 0.10), inset 0 1px 0 rgba(var(--shadow-rim), 0.55);
+  --shadow-up-hover: 0 -3px 10px rgba(var(--shadow-tint), 0.20), inset 0 1px 0 rgba(var(--shadow-rim), 0.55);
+  --shadow-side: 2px 0 6px rgba(var(--shadow-tint), 0.14), 2px 0 2px rgba(var(--shadow-tint), 0.08), inset 0 1px 0 rgba(var(--shadow-rim), 0.40);
+  --groove: inset 0 1px 2px rgba(var(--shadow-tint), 0.20), inset 0 -1px 0 rgba(var(--shadow-rim), 0.50);
   /* v0.5.12: scrollbar relief pair — a sunken channel track + a raised
      thumb, both clearly off the face color (the v0.5.11 thumb was
      --bg-elev on a --bg face: nearly invisible). */
@@ -46,6 +71,93 @@
      the first full card in the queue — the assistant card, which
      keeps its full raised-card relief (.ev-assistant). */
 }
+
+/* ── v0.5.22: dark theme — "night rice" (深棕夜米色) ─────────────────
+   The rice identity carried into the dark: a warm brown-black base
+   (NOT neutral grey), the green accent brightened, salmon/danger/
+   warn lifted for contrast, and the extrusion physics inverted —
+   near-black falls + a faint warm rim instead of warm falls + white.
+   The welcome illustration (nigiri/maki) is FOOD, not chrome: it
+   keeps its own colors and only its falls re-tint via --shadow-tint
+   (a white rice ball on a dark table reads naturally). */
+html[data-theme="dark"] {
+  --bg: #191510;
+  --bg-panel: #14110c;
+  --bg-elev: #221d15;
+  --border: #3a3226;
+  --ink: #6b6152;
+  --text: #e8e0cf;
+  --text-muted: #9a8f7b;
+  /* v0.5.25 REVERT: the nori (海带) deep-green accent was rejected by the
+     user — restored to the original v0.5.22 dark accent pair (bright green).
+     on-accent/on-badge go back to dark rice-brown letters on the bright
+     green faces. */
+  --accent: #4fb07a;
+  --accent2: #63bd84;
+  --accent-salmon: #f09a7d;
+  /* loop rings, dark (scheme A): dim-forest outer -> mid green -> the
+     bright accent core glows innermost. */
+  --loop-out: #2c4a37;
+  --loop-mid: #3f7d52;
+  --danger: #e2604a;
+  --warn: #d9a43f;
+  --code-bg: #131009;
+  --user-bg: #1e241c;
+  --tool-bg: #211c13;
+  --error-bg: #2b1d19;
+  /* dark relief: black falls, faint warm rim (the rim at ~0.05 alpha
+     is what the white 0.55 rim was in light — the "lit top edge"). */
+  --shadow-tint: 0, 0, 0;
+  --shadow-rim: 255, 235, 200;
+  --shadow: 0 2px 4px rgba(0, 0, 0, 0.55), 0 1px 1px rgba(0, 0, 0, 0.40), inset 0 1px 0 rgba(var(--shadow-rim), 0.05);
+  --shadow-hover: 0 3px 8px rgba(0, 0, 0, 0.65), 0 1px 3px rgba(0, 0, 0, 0.45), inset 0 1px 0 rgba(var(--shadow-rim), 0.06);
+  --shadow-pressed: inset 0 2px 4px rgba(0, 0, 0, 0.60);
+  --shadow-up: 0 -2px 5px rgba(0, 0, 0, 0.50), 0 -1px 2px rgba(0, 0, 0, 0.40), inset 0 1px 0 rgba(var(--shadow-rim), 0.05);
+  --shadow-up-hover: 0 -3px 10px rgba(0, 0, 0, 0.60), inset 0 1px 0 rgba(var(--shadow-rim), 0.06);
+  --shadow-side: 2px 0 6px rgba(0, 0, 0, 0.50), 2px 0 2px rgba(0, 0, 0, 0.35), inset 0 1px 0 rgba(var(--shadow-rim), 0.04);
+  --groove: inset 0 1px 2px rgba(0, 0, 0, 0.55), inset 0 -1px 0 rgba(var(--shadow-rim), 0.05);
+  --shadow-deck-edge: 0 -2px 5px rgba(0, 0, 0, 0.55), 0 -1px 2px rgba(0, 0, 0, 0.40);
+  --on-accent: #100d08;
+  --on-danger: #241009;
+  /* dark badges sit on the bright green accent faces (active/completed)
+     and the amber warn face (paused): dark rice-brown letters read on
+     all of them (the v0.5.22 baseline). */
+  --on-badge: #100d08;
+  --scroll-track: #0e0c08;
+  --scroll-thumb: #453b2a;
+}
+/* dark-theme selector overrides for call sites whose light-tuned
+   alphas are too strong on the dark base (the token values above
+   already carry their own dark alphas — only the scattered
+   hard-coded sites need an override). */
+html[data-theme="dark"] #sidebar { box-shadow: inset 0 1px 0 rgba(255, 235, 200, 0.05); }
+html[data-theme="dark"] #transcript .load-earlier {
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.50), inset 0 1px 0 rgba(255, 235, 200, 0.05);
+}
+html[data-theme="dark"] #transcript .load-earlier:hover {
+  background: var(--bg-elev);
+}
+html[data-theme="dark"] #transcript::-webkit-scrollbar-thumb,
+html[data-theme="dark"] #msg-input::-webkit-scrollbar-thumb,
+html[data-theme="dark"] .ev-result::-webkit-scrollbar-thumb,
+html[data-theme="dark"] .ev-args::-webkit-scrollbar-thumb {
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.60), inset 0 1px 0 rgba(255, 235, 200, 0.08);
+}
+/* v0.5.27: the mid loop ring no longer rides --border/--text-muted; it now
+   resolves --loop-mid, which the dark block sets directly. */
+/* syntax colors: the light values are tuned for rice paper; on the
+   night base use brighter, warm-harmonized equivalents. */
+html[data-theme="dark"] .hl-kw  { color: #f0937d; }
+html[data-theme="dark"] .hl-str { color: #8fc0e8; }
+html[data-theme="dark"] .hl-num { color: #d8b06a; }
+html[data-theme="dark"] .hl-com { color: #857c68; }
+/* v0.5.24: the + New Session button is a flat raised pill on the near-black
+   base (bg-elev on bg: nearly invisible). Dark mode gives it the accent
+   CTA fill (#btn-send language): bright green face, dark text. */
+html[data-theme="dark"] #session-actions button { background: var(--accent); color: var(--on-accent); }
+/* the stop-state square flips the face to danger (bright red in dark) —
+   keep the text dark for the same reason. */
+html[data-theme="dark"] #btn-send.stop { color: var(--on-danger); }
 * { box-sizing: border-box; }
 html, body { margin: 0; padding: 0; height: 100%; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 14px; }
 html { background: var(--bg); }
@@ -57,11 +169,24 @@ body.kb-anim { transition: height 0.22s ease-out; }
    be a direct flex child of body, exactly like the legacy DOM. */
 #mount-root { display: contents; }
 #boot { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--text-muted); font-size: 13px; font-family: system-ui, sans-serif; z-index: 100; }
-#sidebar { width: 240px; min-width: 0; background: var(--bg); box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.40); display: flex; flex-direction: column; overflow: hidden; position: relative; transition: width .18s ease; }
+#sidebar { width: 240px; min-width: 0; background: var(--bg); box-shadow: inset 0 1px 0 rgba(var(--shadow-rim), 0.40); display: flex; flex-direction: column; overflow: hidden; position: relative; transition: width .18s ease; }
 #sidebar-inner { width: 240px; flex: 1; min-height: 0; display: flex; flex-direction: column; overflow-y: auto; }
 #app.sidebar-collapsed #sidebar { width: 0; min-width: 0; box-shadow: none; }
+/* v0.5.32: no-sidebar mode. The left-biased clearances below were
+   tuned for the 240px sidebar (28px on the left, less on the right,
+   plus the sidebar-edge relief/corner art). Collapsed, #main owns
+   the full width and the asymmetry shows: the card block sits 8px
+   right of center (transcript padding 28/20) and the input box 2px
+   left of center (input-module margin 28/30) — on a phone that
+   reads as "not centered". Symmetrize the main column to 20px and
+   drop the sidebar-edge decorations, which would otherwise float
+   at the screen edge. */
+#app.sidebar-collapsed #transcript { padding-left: 20px; border-top-left-radius: 0; }
+#app.sidebar-collapsed #input-module { margin-left: 20px; margin-right: 20px; }
+#app.sidebar-collapsed #main::before { display: none; }
+#app.sidebar-collapsed #main::after { border-top-left-radius: 0; }
 #main { flex: 1; display: flex; flex-direction: column; overflow: hidden; position: relative; }
-#main::before { content: ''; position: absolute; top: var(--band-h); bottom: 0; left: 0; width: 14px; background: linear-gradient(to right, rgba(75, 70, 55, 0.16), rgba(75, 70, 55, 0)); /* v0.5.13: the left-edge relief starts BELOW the 14 px corner (v0.5.11 wrapped the corner, but the 0.16 dark tint read as a color patch — "not the same height as the sidebar"). The corner stays plain --bg, continuous with the band and the sidebar. */ -webkit-mask-image: linear-gradient(to bottom, transparent 14px, black 34px); mask-image: linear-gradient(to bottom, transparent 14px, black 34px); pointer-events: none; z-index: 47; /* same z as the z47 deck layer but earlier in tree order, so the deck face still paints on top */ }
+#main::before { content: ''; position: absolute; top: var(--band-h); bottom: 0; left: 0; width: 14px; background: linear-gradient(to right, rgba(var(--shadow-tint), 0.16), rgba(var(--shadow-tint), 0)); /* v0.5.13: the left-edge relief starts BELOW the 14 px corner (v0.5.11 wrapped the corner, but the 0.16 dark tint read as a color patch — "not the same height as the sidebar"). The corner stays plain --bg, continuous with the band and the sidebar. */ -webkit-mask-image: linear-gradient(to bottom, transparent 14px, black 34px); mask-image: linear-gradient(to bottom, transparent 14px, black 34px); pointer-events: none; z-index: 47; /* same z as the z47 deck layer but earlier in tree order, so the deck face still paints on top */ }
 /* Top-zone cover (v0.4.5): the strip between the header band and the
    deck (transcript 0..PILE_TOP=28px, the zone above the topmost deck
    row). Opaque rice, same top chrome as #transcript so it reads as the
@@ -70,7 +195,7 @@ body.kb-anim { transition: height 0.22s ease-out; }
    used to scroll through the gap above the pile. This is NOT the
    removed deck plate (that was 0..92, under the rows); it is only the
    28px above the pile, continuous with the header. */
-#main::after { content: ''; position: absolute; top: var(--band-h); left: 0; right: 0; height: 28px; background: var(--bg); border-top-left-radius: 14px; box-shadow: inset 0 10px 14px -10px rgba(75, 70, 55, 0.30); z-index: 46; pointer-events: none; }
+#main::after { content: ''; position: absolute; top: var(--band-h); left: 0; right: 0; height: 28px; background: var(--bg); border-top-left-radius: 14px; box-shadow: inset 0 10px 14px -10px rgba(var(--shadow-tint), 0.30); z-index: 46; pointer-events: none; }
 /* v0.5.7: in flat mode there is no deck, so the cover has nothing to
    hide — it just sits over the tops of cards scrolling up (the "white
    mask over cards" report). pile::init tags <body> with .flat-mode.
@@ -80,7 +205,7 @@ body.kb-anim { transition: height 0.22s ease-out; }
    (the "cards and top look flush" report); the v0.5.7 opaque rice
    cover is gone, so the card tops stay fully visible. */
 body.flat-mode #main::after {
-  background: linear-gradient(to bottom, rgba(75, 70, 55, 0.10), rgba(75, 70, 55, 0));
+  background: linear-gradient(to bottom, rgba(var(--shadow-tint), 0.10), rgba(var(--shadow-tint), 0));
   box-shadow: none;
   height: 18px;
 }
@@ -94,6 +219,13 @@ button { font-weight: 700; }
 .sb-header h1 { font-size: 19px; margin: 0; color: var(--accent); }
 #sidebar-toggle { background: var(--bg-elev); border: none; border-radius: 4px; color: var(--text); padding: 2px 8px; font-size: 16px; cursor: pointer; line-height: 1.3; box-shadow: var(--shadow); }
 #sidebar-toggle:hover { box-shadow: var(--shadow-hover); }
+/* v0.5.22: theme cycle button (auto ◐ / light ☀ / dark ☾) next to the
+   sidebar toggle — same relief treatment; both grouped in .sb-actions
+   so .sb-header's space-between keeps the h1 on the left. */
+.sb-actions { display: flex; gap: 6px; }
+#theme-toggle { background: var(--bg-elev); border: none; border-radius: 4px; color: var(--text-muted); padding: 2px 8px; font-size: 15px; cursor: pointer; line-height: 1.3; box-shadow: var(--shadow); }
+#theme-toggle:hover { box-shadow: var(--shadow-hover); color: var(--text); }
+#theme-toggle:active { transform: translateY(1px); box-shadow: var(--shadow-pressed); }
 #sidebar-open { display: none; background: var(--bg-elev); border: none; border-radius: 4px; color: var(--text); padding: 2px 8px; cursor: pointer; font-size: 13px; box-shadow: var(--shadow); }
 #sidebar-open:hover { box-shadow: var(--shadow-hover); }
 #app.sidebar-collapsed #sidebar-open { display: inline-block; }
@@ -128,10 +260,31 @@ button { font-weight: 700; }
 .sess-menu-item { display: block; width: 100%; text-align: left; padding: 8px 10px; border: none; background: none; color: var(--text); font-size: 13px; border-radius: 6px; cursor: pointer; font-family: inherit; }
 .sess-menu-item:hover { background: var(--bg); }
 .sess-menu-item.danger { color: var(--danger); font-weight: 600; }
-#session-actions { margin: 0; padding: 10px 12px; background: var(--bg); box-shadow: var(--shadow); border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: 6px; }
+/* v0.5.23: #session-actions now sits ABOVE #session-list (right under
+   the header), not pinned at the sidebar bottom. The old footer chrome
+   (border-top + raised shadow) is dropped; the strip is flush with the
+   sidebar face. The button keeps its raised-pill relief.
+   v0.5.24: a border-bottom divider between the button and the session
+   cards, same 1px var(--border) language as the goal-panel / status-bar
+   dividers below. */
+#session-actions { margin: 0; padding: 10px 12px; background: var(--bg); border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 6px; }
 #session-actions button { background: var(--bg-elev); border: none; color: var(--text); padding: 7px 10px; border-radius: 6px; cursor: pointer; font-size: 14px; text-align: left; box-shadow: var(--shadow); transition: box-shadow .12s ease, transform .12s ease; }
 #session-actions button:hover { box-shadow: var(--shadow-hover); }
 #session-actions button:active { transform: translateY(1px); box-shadow: var(--shadow-pressed); }
+
+/* v0.5.30: sidebar ordering — a compact 3-way segmented control
+   (newest / output / custom) under the + New Session button, and the
+   drag & drop states for custom order. */
+#session-actions .sb-seg { display: flex; gap: 4px; }
+#session-actions .sb-seg button { flex: 1; background: var(--bg-elev); color: var(--text-muted); font-size: 12px; font-weight: 700; padding: 5px 6px; text-align: center; text-transform: uppercase; letter-spacing: .3px; }
+#session-actions .sb-seg button.on { color: var(--text); box-shadow: var(--shadow-hover); }
+/* the v0.5.24 dark-mode accent CTA targets every #session-actions
+   button; keep the seg control neutral, mark .on with the accent */
+html[data-theme="dark"] #session-actions .sb-seg button { background: var(--bg-elev); color: var(--text-muted); }
+html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--accent); color: var(--on-accent); }
+.session-item.dragging { opacity: .4; }
+.session-item.drop-target { box-shadow: inset 0 2px 0 var(--accent), var(--shadow); }
+#session-list.drop-end { box-shadow: inset 0 -3px 0 var(--accent); }
 
 /* v0.5.6: the sidebar start/stop buttons were folded into #btn-send,
    so the .running tint on #session-actions buttons is dead. */
@@ -142,10 +295,10 @@ button { font-weight: 700; }
 #goal-body .goal-meta { font-size: 12px; color: var(--text-muted); }
 #goal-body .goal-empty { color: var(--text-muted); font-style: italic; }
 .goal-badge { display: inline-block; padding: 1px 7px; border-radius: 9px; font-size: 11px; font-weight: 700; }
-.goal-badge.active { background: var(--accent2); color: #000; }
-.goal-badge.paused { background: var(--warn); color: #000; }
-.goal-badge.completed { background: var(--accent); color: #000; }
-.goal-badge.blocked { background: var(--danger); color: #fff; }
+.goal-badge.active { background: var(--accent2); color: var(--on-badge); }
+.goal-badge.paused { background: var(--warn); color: var(--on-badge); }
+.goal-badge.completed { background: var(--accent); color: var(--on-badge); }
+.goal-badge.blocked { background: var(--danger); color: var(--on-danger); }
 .goal-actions { display: flex; flex-wrap: wrap; gap: 4px; }
 .goal-actions button { background: var(--bg-elev); border: none; color: var(--text-muted); border-radius: 4px; padding: 2px 7px; font-size: 12px; cursor: pointer; box-shadow: var(--shadow); }
 .goal-actions button:hover { color: var(--text); box-shadow: var(--shadow-hover); }
@@ -172,13 +325,29 @@ button { font-weight: 700; }
 .ctx-round:hover { box-shadow: var(--shadow); }
 .ctx-round.on { background: var(--accent); border-color: var(--accent); }
 .ctx-round.ctx-spot { visibility: hidden; }
+/* v0.5.21: leftmost "⋯ N" chip — N = rounds in the full log not yet in
+   the loaded window. Same 10px row as .ctx-round, wider pill with text. */
+.ctx-round-more { height: 10px; min-width: 0; margin: 0 6px 0 0; padding: 0 6px; font-size: 9px; line-height: 8px; font-variant-numeric: tabular-nums; color: var(--text-muted); background: var(--bg-elev); border: 1px solid var(--border); border-radius: 5px; box-shadow: var(--groove); cursor: pointer; white-space: nowrap; flex: none; }
+.ctx-round-more:hover { box-shadow: var(--shadow); }
+.ctx-round-more:disabled { opacity: 0.55; cursor: default; }
+.ctx-round-more.failed { color: var(--danger); border-color: var(--danger); }
 #ctx-label { color: var(--text-muted); min-width: 0; }
 #ctx-track { flex: 1; height: 6px; background: var(--bg-elev); border: none; border-radius: 3px; overflow: hidden; box-shadow: var(--groove); }
 #ctx-fill { height: 100%; background: var(--accent); width: 0%; transition: width 0.3s; }
 #ctx-pct { min-width: 32px; text-align: right; color: var(--text-muted); font-variant-numeric: tabular-nums; }
 #ctx-k { color: var(--text-muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
 
-#transcript { flex: 1; overflow-y: auto; padding: 28px 20px 20px 28px; scroll-behavior: smooth; border-top-left-radius: 14px; box-shadow: inset 0 10px 14px -10px rgba(75, 70, 55, 0.30); overflow-anchor: none; scrollbar-gutter: stable; }
+/* v0.5.31: lock the card surface to vertical-only scrolling.
+   overflow-y:auto alone makes the x axis compute to auto as well
+   (the spec: visible+auto is illegal, so the x axis follows), so any
+   sliver of horizontal overflow became pannable — and on touch
+   devices a near-vertical swipe always carries a little x drift,
+   which panned the cards sideways. overflow-x:hidden clips the x
+   axis entirely; touch-action:pan-y stops the browser from
+   initiating horizontal pan gestures here at all. Wide code blocks
+   keep their OWN horizontal scroll (.ev-content pre) and re-allow
+   pan-x on touch inside themselves. */
+#transcript { flex: 1; overflow-y: auto; overflow-x: hidden; touch-action: pan-y; padding: 28px 20px 20px 28px; scroll-behavior: smooth; border-top-left-radius: 14px; box-shadow: inset 0 10px 14px -10px rgba(var(--shadow-tint), 0.30); overflow-anchor: none; scrollbar-gutter: stable; }
 
 /* v0.5.17: "load earlier" pill pinned at the top of the transcript.
    Subtle rice-paper button; only visible when the server reports
@@ -193,7 +362,7 @@ button { font-weight: 700; }
   background: var(--bg-elev);
   border: 1px solid var(--border, #ddd3bf);
   border-radius: 9px;
-  box-shadow: 0 1px 2px rgba(75, 70, 55, 0.18), inset 0 1px 0 rgba(255, 255, 255, 0.5);
+  box-shadow: 0 1px 2px rgba(var(--shadow-tint), 0.18), inset 0 1px 0 rgba(var(--shadow-rim), 0.5);
   cursor: pointer;
   transition: background 0.12s ease, color 0.12s ease;
 }
@@ -204,6 +373,12 @@ button { font-weight: 700; }
 #transcript .load-earlier:disabled {
   opacity: 0.55;
   cursor: default;
+}
+/* v0.5.21: failed-state tint (watchdog timed out / server error frame)
+   — the pill is clickable again; the red border invites the retry. */
+#transcript .load-earlier.failed {
+  color: var(--danger);
+  border-color: var(--danger);
 }
 /* v0.5.6: session-entry transition (the early webui's quick fade + rise).
    One-shot, re-triggered by pile::on_history_loaded: remove class, force
@@ -239,20 +414,20 @@ button { font-weight: 700; }
 #welcome { position: absolute; top: var(--band-h); left: 0; right: 0; bottom: 0; display: flex; align-items: center; justify-content: center; overflow: hidden; pointer-events: none; z-index: 1; }
 #welcome .w-hero { text-align: center; padding: 24px 24px 112px; max-width: 440px; }
 #welcome .w-dish { position: relative; width: 180px; height: 96px; margin: 0 auto 26px; }
-#welcome .w-plate { position: absolute; bottom: 0; left: 0; right: 0; height: 22px; border-radius: 50%; background: linear-gradient(#fff, var(--bg-elev)); box-shadow: 0 5px 10px -5px rgba(75, 70, 55, 0.35), inset 0 1px 0 #fff; }
+#welcome .w-plate { position: absolute; bottom: 0; left: 0; right: 0; height: 22px; border-radius: 50%; background: linear-gradient(#fff, var(--bg-elev)); box-shadow: 0 5px 10px -5px rgba(var(--shadow-tint), 0.35), inset 0 1px 0 #fff; }
 #welcome .w-nigiri { position: absolute; bottom: 16px; left: 18px; width: 88px; height: 64px; }
-#welcome .w-rice { position: absolute; bottom: 0; left: 0; right: 0; height: 38px; background: linear-gradient(#fffef8, #f1ead7); border-radius: 16px 16px 12px 12px; box-shadow: inset 0 -4px 6px rgba(75, 70, 55, 0.10), 0 3px 5px rgba(75, 70, 55, 0.14); }
-#welcome .w-fish { position: absolute; top: 0; left: 5px; right: 5px; height: 34px; border-radius: 12px 18px 10px 10px; background: repeating-linear-gradient(105deg, rgba(255, 255, 255, 0.35) 0 3px, rgba(255, 255, 255, 0) 3px 15px), linear-gradient(100deg, #f5a78b, var(--accent-salmon) 75%); box-shadow: 0 3px 5px rgba(75, 70, 55, 0.20); }
+#welcome .w-rice { position: absolute; bottom: 0; left: 0; right: 0; height: 38px; background: linear-gradient(#fffef8, #f1ead7); border-radius: 16px 16px 12px 12px; box-shadow: inset 0 -4px 6px rgba(var(--shadow-tint), 0.10), 0 3px 5px rgba(var(--shadow-tint), 0.14); }
+#welcome .w-fish { position: absolute; top: 0; left: 5px; right: 5px; height: 34px; border-radius: 12px 18px 10px 10px; background: repeating-linear-gradient(105deg, rgba(var(--shadow-rim), 0.35) 0 3px, rgba(var(--shadow-rim), 0) 3px 15px), linear-gradient(100deg, #f5a78b, var(--accent-salmon) 75%); box-shadow: 0 3px 5px rgba(var(--shadow-tint), 0.20); }
 #welcome .w-nori { position: absolute; top: 6px; bottom: 6px; left: 50%; width: 15px; margin-left: -7px; background: linear-gradient(#313a31, #1d221d); border-radius: 4px; box-shadow: 0 1px 2px rgba(0, 0, 0, 0.30); }
 #welcome .w-wasabi { position: absolute; bottom: 18px; left: 118px; width: 18px; height: 11px; border-radius: 50% 50% 42% 42%; background: linear-gradient(#8aa34f, #6f8a3c); transform: rotate(-6deg); }
-#welcome .w-maki { position: absolute; bottom: 18px; right: 14px; width: 42px; height: 42px; border-radius: 50%; background: radial-gradient(circle at 35% 32%, #3a443a, #20251f 72%); box-shadow: 0 4px 6px rgba(75, 70, 55, 0.25); }
+#welcome .w-maki { position: absolute; bottom: 18px; right: 14px; width: 42px; height: 42px; border-radius: 50%; background: radial-gradient(circle at 35% 32%, #3a443a, #20251f 72%); box-shadow: 0 4px 6px rgba(var(--shadow-tint), 0.25); }
 #welcome .w-maki::before { content: ''; position: absolute; inset: 8px; border-radius: 50%; background: #f6f0e1; }
 #welcome .w-maki::after { content: ''; position: absolute; left: 50%; top: 50%; width: 13px; height: 13px; margin: -6.5px 0 0 -6.5px; border-radius: 50%; background: var(--accent-salmon); }
 #welcome .w-title { font-size: 30px; font-weight: 800; letter-spacing: -0.5px; margin: 0 0 12px; }
 #welcome .w-title span { color: var(--accent); }
 #welcome .w-chip { display: inline-block; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; font-weight: 600; color: var(--text-muted); background: var(--bg-elev); border: 1px solid var(--border); border-radius: 6px; padding: 3px 9px; box-shadow: var(--groove); margin-bottom: 12px; }
 #welcome .w-sub { font-size: 13px; line-height: 1.55; color: var(--text-muted); margin: 0 0 22px; }
-#welcome #w-new { pointer-events: auto; background: var(--accent); color: #fff; border: none; border-radius: 8px; padding: 10px 20px; font-size: 13px; font-weight: 700; cursor: pointer; box-shadow: var(--shadow); transition: box-shadow .12s ease, transform .12s ease; }
+#welcome #w-new { pointer-events: auto; background: var(--accent); color: var(--on-accent); border: none; border-radius: 8px; padding: 10px 20px; font-size: 13px; font-weight: 700; cursor: pointer; box-shadow: var(--shadow); transition: box-shadow .12s ease, transform .12s ease; }
 #welcome #w-new:hover { box-shadow: var(--shadow-hover); }
 #welcome #w-new:active { transform: translateY(1px); box-shadow: var(--shadow-pressed); }
 #welcome .w-hint { font-size: 11px; color: var(--text-muted); margin-top: 12px; opacity: 0.85; }
@@ -275,6 +450,14 @@ button { font-weight: 700; }
    its @keyframes ev-settle) is gone. The `.ev-settling` class may
    still be applied by transcript.rs; it now matches no rule. */
 @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+/* v0.5.38: a load-earlier prepend re-keys the whole card list, so every
+   existing card re-mounts and would replay this .enter fade (opacity
+   0->1 + translateY) — a visible full-transcript flicker. While
+   #transcript carries .prepend-quiet (set by pile::on_history_prepended
+   for the re-mount frame) cards skip the fade and appear instantly; the
+   class + the .enter class are stripped ~400 ms later so the fade can't
+   replay when the quiet class is released. */
+#transcript.prepend-quiet .event.enter { animation: none; opacity: 1; }
 /* v0.5.14: the in-flight card is a real .event ev-assistant card — the
    sentinel item of the transcript's card list (transcript.rs) — so it
    gets the .event/.ev-assistant chrome and face for free: one color
@@ -383,7 +566,9 @@ button { font-weight: 700; }
 .ev-time { margin-left: auto; }
 .ev-content { line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
 .ev-content code { background: var(--code-bg); padding: 1px 4px; border-radius: 3px; font-family: "SF Mono", Consolas, monospace; font-size: 13px; }
-.ev-content pre { background: var(--code-bg); padding: 10px; overflow-x: auto; border-radius: 6px; margin: 8px 0; }
+.ev-content pre { background: var(--code-bg); padding: 10px; overflow-x: auto; border-radius: 6px; margin: 8px 0; /* v0.5.31: touch pan is restricted to pan-y on #transcript; re-allow horizontal panning INSIDE wide code blocks (white-space:pre lines scroll their own box) */ touch-action: pan-x pan-y; }
+/* v0.5.33: raw tail of a live card once it passes LIVE_MD_REPARSE_CAP — the unparsed remainder shows as plain wrapping monospace (no highlight, no markdown markup) until the card settles. */
+.md-tail { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; background: var(--code-bg); padding: 8px; border-radius: 4px; margin: 4px 0; opacity: 0.9; }
 
 .ev-args { background: var(--code-bg); padding: 8px 10px; border-radius: 6px; font-family: monospace; font-size: 13px; overflow-x: auto; margin-top: 6px; white-space: pre-wrap; }
 
@@ -398,8 +583,8 @@ button { font-weight: 700; }
 
 .ev-approval-actions { display: flex; gap: 8px; margin-top: 8px; }
 .ev-approval-actions button { padding: 5px 14px; border-radius: 5px; border: none; cursor: pointer; font-size: 13px; font-weight: 600; box-shadow: var(--shadow); }
-.btn-approve { background: var(--accent2); color: #fff; }
-.btn-deny { background: var(--danger); color: #fff; }
+.btn-approve { background: var(--accent2); color: var(--on-accent); }
+.btn-deny { background: var(--danger); color: var(--on-danger); }
 .btn-approve:hover, .btn-deny:hover { opacity: 0.85; }
 .ev-approval-resolved .ev-approval-actions { display: none; }
 .ev-approval-resolved .ev-badge-resolved { font-size: 12px; margin-top: 4px; }
@@ -478,9 +663,9 @@ button { font-weight: 700; }
    (--scroll-track / --scroll-thumb) with a real raised shadow. */
 #transcript, #msg-input, .ev-result, .ev-args { scrollbar-width: thin; scrollbar-color: var(--scroll-thumb) var(--scroll-track); }
 #transcript::-webkit-scrollbar, #msg-input::-webkit-scrollbar, .ev-result::-webkit-scrollbar, .ev-args::-webkit-scrollbar { width: 10px; height: 10px; background: transparent; }
-#transcript::-webkit-scrollbar-track, #msg-input::-webkit-scrollbar-track, .ev-result::-webkit-scrollbar-track, .ev-args::-webkit-scrollbar-track { background: var(--scroll-track); box-shadow: inset 1px 0 2px rgba(75, 70, 55, 0.14), inset -1px 0 2px rgba(75, 70, 55, 0.14); }
+#transcript::-webkit-scrollbar-track, #msg-input::-webkit-scrollbar-track, .ev-result::-webkit-scrollbar-track, .ev-args::-webkit-scrollbar-track { background: var(--scroll-track); box-shadow: inset 1px 0 2px rgba(var(--shadow-tint), 0.14), inset -1px 0 2px rgba(var(--shadow-tint), 0.14); }
 /* v0.5.14: the thumb needed a stronger drop shadow to read against the darker track (round-5: "滚动条看不清楚"). */
-#transcript::-webkit-scrollbar-thumb, #msg-input::-webkit-scrollbar-thumb, .ev-result::-webkit-scrollbar-thumb, .ev-args::-webkit-scrollbar-thumb { background: var(--scroll-thumb); border-radius: 6px; border: 2px solid transparent; background-clip: padding-box; box-shadow: 0 1px 4px rgba(75, 70, 55, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.45), inset 0 -1px 0 rgba(75, 70, 55, 0.30); }
+#transcript::-webkit-scrollbar-thumb, #msg-input::-webkit-scrollbar-thumb, .ev-result::-webkit-scrollbar-thumb, .ev-args::-webkit-scrollbar-thumb { background: var(--scroll-thumb); border-radius: 6px; border: 2px solid transparent; background-clip: padding-box; box-shadow: 0 1px 4px rgba(var(--shadow-tint), 0.55), inset 0 1px 0 rgba(var(--shadow-rim), 0.45), inset 0 -1px 0 rgba(var(--shadow-tint), 0.30); }
 
 /* v0.5.16b: the loop-in-progress marker, in the gap between the last
    card and the input box. Three-ring "breathing" in this theme's
@@ -492,14 +677,13 @@ button { font-weight: 700; }
    animation visibly dropped frames. Now each ring is two static
    layers: the sunken groove base (painted once) and a ::after ghost
    holding the raised state (--shadow relief, painted once). Only
-   OPACITY (the ghost) and TRANSFORM (the 1.08x swell) animate, both
+   OPACITY (the ghost) and TRANSFORM (the 1.18x swell) animate, both
    compositor work — no repaints, so it stays smooth no matter how
    busy the main thread is. ONE raised bulge travels outer -> mid ->
-   inner on staggered delays, reading as swell/shrink. Colors, inner
-   -> inner: deep green / deep beige / salmon orange. Purely
+   inner on staggered delays, reading as swell/shrink. v0.5.27: single-hue green ramp via --loop-out/--loop-mid/--loop-in (outer/mid per theme, inner = --accent). Purely
    decorative, so it never takes input. */
-#loop-indicator { display: flex; align-items: center; justify-content: center; height: 44px; flex: none; pointer-events: none; }
-#loop-indicator .loop-rings { position: relative; width: 36px; height: 36px; }
+#loop-indicator { display: flex; align-items: center; justify-content: flex-start; padding-left: 29px; height: 32px; flex: none; pointer-events: none; } /* v0.5.29: 29px = #transcript 28px left gutter + 1px ring-geometry offset, so the outer ring's max-swell left tangent lands exactly on the message card's left edge (ring 24px border-box × 1.25 swell = 30px dia, radius 15 vs 14px half-box). */
+#loop-indicator .loop-rings { position: relative; width: 28px; height: 28px; }
 /* Static sunken-groove base; the swell is transform-only (compositor).
    The ring's color is carried as `color` so the ghost's border can
    inherit it via currentColor. */
@@ -510,14 +694,41 @@ button { font-weight: 700; }
 #loop-indicator .loop-ring::after { content: ''; position: absolute; inset: -2px; border-radius: 50%; border: 2px solid currentColor; box-shadow: var(--shadow); opacity: 0; animation: loop-ring-raise 4s ease-in-out infinite; will-change: opacity; }
 /* Wave travels outer -> inner: the outer ring leads, each inner ring
    lags by 0.6s (both layers share the delay). */
-#loop-indicator .loop-ring.lg-out { width: 32px; height: 32px; color: var(--accent-salmon); } /* salmon, outer */
-#loop-indicator .loop-ring.lg-mid { width: 22px; height: 22px; color: var(--border); animation-delay: 0.6s; } /* deep beige (grey cast), mid */
-#loop-indicator .loop-ring.lg-in  { width: 12px; height: 12px; color: var(--accent); animation-delay: 1.2s; } /* nori, inner */
+#loop-indicator .loop-ring.lg-out { width: 24px; height: 24px; color: var(--loop-out); } /* soft green, outer (v0.5.28) */
+#loop-indicator .loop-ring.lg-mid { width: 16px; height: 16px; color: var(--loop-mid); animation-delay: 0.6s; } /* mid green, mid */
+#loop-indicator .loop-ring.lg-in  { width: 9px; height: 9px; color: var(--loop-in); animation-delay: 1.2s; } /* accent core, inner */
 #loop-indicator .loop-ring.lg-mid::after { animation-delay: 0.6s; }
 #loop-indicator .loop-ring.lg-in::after  { animation-delay: 1.2s; }
+/* v0.5.38: loop-command glance chip — a RECESSED relief (inset shadow,
+   the mirror image of a raised relief) to the right of the rings,
+   showing the instruction the user most recently sent while the loop
+   runs (model::last_user_command = the last user_message content).
+   Carved look: no face color change, just the inset shadow pair
+   (dark top channel + faint rim bottom), matching #msg-input's
+   groove. Small single-line text with ellipsis; full command on
+   hover via title. Lives inside #loop-indicator's <Show when=
+   loop_running>, so it appears/disappears with the rings.
+   pointer-events auto on the chip itself (the indicator row keeps
+   pointer-events:none) so the text is hoverable/selectable. */
+#loop-indicator .loop-cmd {
+  margin-left: 10px;
+  min-width: 0;
+  max-width: min(360px, calc(100vw - 320px));
+  padding: 4px 10px;
+  border-radius: 6px;
+  box-shadow: inset 0 1px 2px rgba(var(--shadow-tint), 0.30), inset 0 -1px 0 rgba(var(--shadow-rim), 0.35);
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 14px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  user-select: text;
+  pointer-events: auto;
+}
 @keyframes loop-ring-swell {
   0%, 100% { transform: translate(-50%, -50%) scale(1); }
-  50% { transform: translate(-50%, -50%) scale(1.08); }
+  50% { transform: translate(-50%, -50%) scale(1.25); }
 }
 @keyframes loop-ring-raise {
   0%, 100% { opacity: 0; }
@@ -527,7 +738,7 @@ button { font-weight: 700; }
   #loop-indicator .loop-ring { animation: none; }
   #loop-indicator .loop-ring::after { animation: none; opacity: 0.8; }
 }
-#btn-send { background: var(--accent); color: var(--bg); border: none; border-radius: 8px; min-width: 46px; padding: 10px 14px; cursor: pointer; font-size: 16px; font-weight: 700; box-shadow: var(--shadow); transition: box-shadow .12s ease, transform .12s ease, background-color .12s ease; height: 40px; box-sizing: border-box; display: flex; align-items: center; justify-content: center; }
+#btn-send { background: var(--accent); color: var(--on-accent); border: none; border-radius: 8px; min-width: 46px; padding: 10px 14px; cursor: pointer; font-size: 16px; font-weight: 700; box-shadow: var(--shadow); transition: box-shadow .12s ease, transform .12s ease, background-color .12s ease; height: 40px; box-sizing: border-box; display: flex; align-items: center; justify-content: center; }
 /* v0.5.6: start/stop loop folded into send — the green triangle is the
    idle/send state; the red square means the loop is running (click = stop). */
 #btn-send.stop { background: var(--danger); }
@@ -536,7 +747,7 @@ button { font-weight: 700; }
 #btn-send:hover { opacity: 0.9; }
 
 /* new-session dialog (name + working-directory picker) */
-#ns-backdrop { position: fixed; inset: 0; background: rgba(75, 70, 55, 0.30); backdrop-filter: blur(2px); z-index: 300; display: flex; align-items: center; justify-content: center; }
+#ns-backdrop { position: fixed; inset: 0; background: rgba(var(--shadow-tint), 0.30); backdrop-filter: blur(2px); z-index: 300; display: flex; align-items: center; justify-content: center; }
 #ns-dialog { width: 480px; max-width: calc(100vw - 48px); max-height: calc(100vh - 96px); overflow-y: auto; background: var(--bg); border-radius: 14px; box-shadow: var(--shadow-hover); border: 1px solid var(--border); padding: 20px; display: flex; flex-direction: column; gap: 4px; }
 .ns-title { font-size: 17px; font-weight: 800; color: var(--text); margin-bottom: 6px; }
 .ns-label { font-size: 12px; font-weight: 700; color: var(--text-muted); text-transform: uppercase; letter-spacing: .4px; margin-top: 8px; }
@@ -553,15 +764,15 @@ button { font-weight: 700; }
 .ns-btn:hover { box-shadow: var(--shadow-hover); }
 .ns-btn:active { transform: translateY(1px); box-shadow: var(--shadow-pressed); }
 .ns-cancel { background: var(--bg-elev); color: var(--text); }
-.ns-create { background: var(--accent); color: #fff; }
+.ns-create { background: var(--accent); color: var(--on-accent); }
 .ns-create:disabled { opacity: 0.6; cursor: default; }
 
 /* delete-session confirmation dialog */
-#dc-backdrop { position: fixed; inset: 0; background: rgba(75, 70, 55, 0.30); backdrop-filter: blur(2px); z-index: 300; display: flex; align-items: center; justify-content: center; }
+#dc-backdrop { position: fixed; inset: 0; background: rgba(var(--shadow-tint), 0.30); backdrop-filter: blur(2px); z-index: 300; display: flex; align-items: center; justify-content: center; }
 #dc-dialog { width: 380px; max-width: calc(100vw - 48px); background: var(--bg); border-radius: 14px; box-shadow: var(--shadow-hover); border: 1px solid var(--border); padding: 20px; display: flex; flex-direction: column; gap: 4px; }
 .dc-title { font-size: 17px; font-weight: 800; color: var(--text); margin-bottom: 6px; }
 .dc-body { font-size: 14px; color: var(--text); line-height: 1.5; }
-.ns-danger { background: var(--danger); color: #fff; }
+.ns-danger { background: var(--danger); color: var(--on-danger); }
 
 /* explicit type scale for .md content: without font-size/weight rules the
    headings fall back to UA defaults (h1=2em, h2=1.5em, h3≈1.17em on the

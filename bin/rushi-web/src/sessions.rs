@@ -89,6 +89,7 @@ impl SessionManager {
                 name,
                 has_events: exists,
                 last_modified,
+                created: Self::created_ts(&dir, &ev_path).await,
             });
         }
 
@@ -96,8 +97,39 @@ impl SessionManager {
             b.last_modified
                 .unwrap_or(0)
                 .cmp(&a.last_modified.unwrap_or(0))
+                .then_with(|| a.name.cmp(&b.name))
         });
         out
+    }
+
+    /// v0.5.30: a session's creation timestamp in unix seconds.
+    /// Prefers the `.created` marker written by `ensure_session`;
+    /// falls back to the first event's `ts` for pre-marker sessions
+    /// (including ones created by the CLI, which never writes the
+    /// marker). `None` when the session has no events at all.
+    async fn created_ts(dir: &Path, ev_path: &Path) -> Option<u64> {
+        if let Ok(t) = fs::read_to_string(dir.join(".created")).await {
+            if let Ok(v) = t.trim().parse::<u64>() {
+                return Some(v);
+            }
+        }
+        Self::first_line_ts(ev_path).await
+    }
+
+    /// Read only the FIRST line of an events file (never the whole
+    /// log — these can be multi-MB) and return its `ts` as unix
+    /// seconds.
+    async fn first_line_ts(ev_path: &Path) -> Option<u64> {
+        use tokio::io::AsyncBufReadExt;
+        let file = fs::File::open(ev_path).await.ok()?;
+        let mut reader = tokio::io::BufReader::new(file);
+        let mut line = String::new();
+        if reader.read_line(&mut line).await.ok()? == 0 {
+            return None;
+        }
+        let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+        let ts = v.get("ts")?.as_str()?;
+        chrono::DateTime::parse_from_rfc3339(ts).ok()?.timestamp().try_into().ok()
     }
 
     // ── event access ──────────────────────────────────────────────
@@ -242,6 +274,18 @@ impl SessionManager {
     async fn ensure_session(&self, id: &str) -> Result<()> {
         let dir = self.cfg.sessions_root.join(id);
         fs::create_dir_all(&dir).await?;
+        // v0.5.30: creation-time marker (unix seconds). Written only
+        // when missing, so a session that already exists (created by
+        // the CLI or by an earlier server instance) keeps its original
+        // creation stamp — the marker records first sight.
+        let marker = dir.join(".created");
+        if !marker.exists() {
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let _ = fs::write(&marker, secs.to_string()).await;
+        }
         let ev = dir.join("events.jsonl");
         if !ev.exists() {
             fs::File::create(&ev).await?;
@@ -381,6 +425,10 @@ pub struct SessionInfo {
     pub has_events: bool,
     /// Unix timestamp (seconds) of the last modification, if any.
     pub last_modified: Option<u64>,
+    /// v0.5.30: unix seconds of session creation — the `.created`
+    /// marker, or the first event's `ts` for sessions created before
+    /// the marker existed. Drives the client's "by creation" ordering.
+    pub created: Option<u64>,
 }
 
 /// Tail `path` for new lines and forward them over `tx`.
@@ -699,6 +747,66 @@ mod tests {
         let root = temp_root();
         let sm = mgr(&root);
         assert!(sm.events_windowed("nope", None, 100).await.is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// v0.5.30: creation stamp — the `.created` marker written by
+    /// `ensure_session`, the first-event-`ts` fallback for pre-marker
+    /// sessions, marker precedence, and no-stamp-rewrite on re-ensure.
+    #[tokio::test]
+    async fn list_reports_created_from_marker_or_first_event() {
+        let root = temp_root();
+        let sm = mgr(&root);
+
+        // Fresh session: the marker is written at creation time.
+        sm.ensure_session("fresh").await.unwrap();
+        let fresh = sm
+            .list()
+            .await
+            .into_iter()
+            .find(|s| s.name == "fresh")
+            .unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let created = fresh.created.expect("fresh session must report a stamp");
+        assert!(created <= now && now - created < 5, "marker must be ~now: {created} vs {now}");
+
+        // Pre-marker session: no marker; the first event's ts applies.
+        let dir = root.join("legacy");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("events.jsonl"),
+            "{\"v\":1,\"type\":\"user_message\",\"ts\":\"2026-01-02T03:04:05Z\"}\n\
+             {\"v\":1,\"type\":\"assistant_message\",\"i\":2}\n",
+        )
+        .unwrap();
+        let legacy = sm
+            .list()
+            .await
+            .into_iter()
+            .find(|s| s.name == "legacy")
+            .unwrap();
+        let expect = chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+            .unwrap()
+            .timestamp()
+            .try_into()
+            .unwrap();
+        assert_eq!(legacy.created, Some(expect), "first-event ts must be the fallback");
+
+        // The marker beats the first-event ts when both exist, and
+        // re-ensuring an existing session must not move the stamp.
+        std::fs::write(dir.join(".created"), "12345").unwrap();
+        sm.ensure_session("legacy").await.unwrap();
+        let legacy = sm
+            .list()
+            .await
+            .into_iter()
+            .find(|s| s.name == "legacy")
+            .unwrap();
+        assert_eq!(legacy.created, Some(12345), "marker wins, and is not rewritten");
+
         let _ = std::fs::remove_dir_all(&root);
     }
 

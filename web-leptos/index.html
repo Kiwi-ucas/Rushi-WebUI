@@ -4,8 +4,29 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>rushi web</title>
+    <script>
+      // v0.5.22: pre-paint theme apply. Runs before first paint so the
+      // right <html data-theme> is in place before style.css is
+      // computed — no flash of the wrong theme. The Leptos app
+      // re-applies the same value on mount and follows OS scheme
+      // changes in auto mode (ui::theme_init).
+      (function () {
+        var m = "auto";
+        try { m = localStorage.getItem("rushi-theme") || "auto"; } catch (e) {}
+        if (m !== "light" && m !== "dark") m = "auto";
+        var eff = m === "auto"
+          ? (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light")
+          : m;
+        document.documentElement.setAttribute("data-theme", eff);
+      })();
+    </script>
     <link data-trunk rel="css" href="style.css" />
-    <link data-trunk rel="rust" data-type="main" />
+    <!-- v0.5.33: rust 1.96 emits saturating-float-to-int (i32.trunc_sat_f64)
+         + bulk-memory ops; wasm-opt (binaryen ≤ version_123, trunk's
+         pinned tool) cannot validate them. Pass the feature gates so a
+         truncsat-capable optimizer accepts the build. (Bump trunk's
+         wasm-opt tool to ≥ version_130 for a clean toolchain match.) -->
+    <link data-trunk rel="rust" data-type="main" data-wasm-opt-params="--enable-bulk-memory --enable-nontrapping-float-to-int" />
   </head>
   <body>
     <!-- The app mounts INTO #mount-root (the element stays, its

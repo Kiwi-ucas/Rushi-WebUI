@@ -17,21 +17,63 @@ use leptos::task::spawn_local;
 fn App() -> impl IntoView {
     let state = model::AppState::new();
 
+    // v0.5.23: publish the live state so out-of-tree code (the
+    // ?test=freeze regression test, console diagnostics) can reach
+    // the app's signals.
+    model::AppState::set_app_state(state);
+
     // Restore persisted sidebar-collapse state
     {
         let collapsed = ui::read_collapsed();
         state.sidebar_collapsed.set(collapsed);
     }
 
+    // v0.5.22: theme (auto/light/dark). The pre-paint inline script in
+    // index.html already set <html data-theme> for the first paint;
+    // this restores the persisted mode into the signal, re-applies the
+    // attribute, and follows OS scheme changes in auto mode.
+    ui::theme_init(state);
+
+    // v0.5.30: restore the persisted sidebar ordering (mode + the
+    // user's own drag order). The "output" rank map seeds itself
+    // from the first session load below (last_modified baseline).
+    {
+        let (mode, order) = ui::read_persisted_sort();
+        state.sort_mode.set(mode);
+        state.custom_order.set(order);
+    }
+
+    // v0.5.38: keep the loop-cmd chip's `loop_cmd` signal fresh from
+    // the loaded event window. The WS history frame only carries the
+    // last HIST_PAGE events, but a freshly sent command is always the
+    // most recent user_message, so mirroring it whenever the window has
+    // one keeps the chip correct without any fetch. A session whose
+    // command is BURIED under >HIST_PAGE events is seeded separately by
+    // a full-transcript fetch (ui.rs select_session + the s3 poll below).
+    {
+        let st = state;
+        Effect::new(move || {
+            let s = model::last_user_command_slice(&st.events.get());
+            if !s.is_empty() {
+                st.loop_cmd.set(s);
+            }
+        });
+    }
+
     // Background: initial session load + periodic polling (port of JS setInterval loops)
     let s1 = state;
     spawn_local(async move {
         if let Ok(sessions) = api::load_sessions().await {
+            // v0.5.30: reconcile the sidebar-ordering bookkeeping
+            // (output-rank seeding + custom-order membership) BEFORE
+            // the list is rendered.
+            s1.sync_session_bookkeeping(&sessions);
             s1.sessions.set(sessions);
         }
         loop {
             gloo_timers::future::TimeoutFuture::new(10_000).await;
             if let Ok(sessions) = api::load_sessions().await {
+                s1.sync_session_bookkeeping(&sessions);
                 s1.sessions.set(sessions);
             }
         }
@@ -53,9 +95,46 @@ fn App() -> impl IntoView {
             gloo_timers::future::TimeoutFuture::new(4_000).await;
             if let Some(id) = s3.active_session.get() {
                 s3.loop_running.set(api::loop_running(&id).await);
+                // v0.5.38: reseed the loop-cmd chip when this poll is the
+                // first for the active session (select_session's own fetch
+                // may have been skipped — e.g. the loop was not running at
+                // switch time — or may have failed). Only while a loop
+                // runs, and only when `loop_cmd_sess` has not yet been
+                // claimed by this session. A freshly sent command is
+                // always in the loaded window and is mirrored into
+                // `loop_cmd` by the Effect in App(), so this full fetch
+                // only matters for a command BURIED under >HIST_PAGE
+                // model/tool events.
+                if s3.loop_running.get()
+                    && s3.loop_cmd_sess.get().as_deref() != Some(id.as_str())
+                {
+                    if let Ok(evs) = api::load_events(&id).await {
+                        s3.loop_cmd
+                            .set(model::last_user_command_slice(&evs));
+                    }
+                    s3.loop_cmd_sess.set(Some(id.clone()));
+                }
             }
         }
     });
+
+    // v0.5.23: freeze regression test (?test=freeze): ~1.5s after
+    // mount, drive a synthetic model-stream flood through the real
+    // coalescing path and report a PASS/FAIL verdict (console +
+    // #rushi-freeze-badge + window.__rushiFreezeResult). Add
+    // &flood=raw to emulate the PRE-fix per-delta behaviour instead
+    // (the negative control — expected to FAIL).
+    {
+        let search = web_sys::window()
+            .and_then(|w| w.location().search().ok())
+            .unwrap_or_default();
+        if search.contains("test=freeze") {
+            spawn_local(async move {
+                gloo_timers::future::TimeoutFuture::new(1_500).await;
+                crate::ws::run_freeze_test();
+            });
+        }
+    }
 
     let app_class = move || {
         if state.sidebar_collapsed.get() { "sidebar-collapsed".to_string() } else { String::new() }
@@ -88,6 +167,24 @@ fn App() -> impl IntoView {
                             <div class="loop-ring lg-mid" />
                             <div class="loop-ring lg-in" />
                         </div>
+                        // v0.5.38: recessed (sunken relief) chip right of the
+                        // rings: the instruction the user most recently sent,
+                        // held in `loop_cmd` (mirrored from the loaded event
+                        // window, seeded by a full fetch when buried). A
+                        // reminder for when the user forgets what they asked
+                        // while waiting on a long loop. Inside the same
+                        // <Show>, so it appears and disappears WITH the rings.
+                        <Show
+                            when=move || !state.loop_cmd.get().is_empty()
+                            fallback=|| ()
+                        >
+                            <div
+                                class="loop-cmd"
+                                title={move || state.loop_cmd.get()}
+                            >
+                                {move || state.loop_cmd.get()}
+                            </div>
+                        </Show>
                     </div>
                 </Show>
                 <ui::InputModule state=state />

@@ -64,6 +64,28 @@ const FULL_ROW_MARGIN: f64 = 12.0;
 /// shadow reaches ~6px below its face, so 12px clears it cleanly.
 const TOP_EDGE_GAP: f64 = 12.0;
 
+/// v0.5.24.1: cumulative touch drift (px) that latches scroll
+/// direction from touchmove deltas. The v0.5.10 detector compared each
+/// touchmove to the PREVIOUS event (0.5 px dead-zone), so slow pulls
+/// — per-event displacement under 0.5 px on 60–120 Hz touch sampling —
+/// never registered and a light pull-up couldn't release the sticky
+/// bottom. Hysteresis over the cumulative drift since the last latched
+/// direction makes intent register after ~8 px of travel regardless of
+/// event cadence.
+const TOUCH_INTENT_DRIFT_PX: f64 = 8.0;
+
+/// v0.5.39: the "truly at the live edge" distance (px). The 80 px live
+/// edge band (the `reading` latch threshold) is too coarse to tell a
+/// watcher AT the bottom (d ≈ 0, should keep/re-engage the follow) from
+/// a reader parked a few lines above it (d ≈ 40, should NOT be yanked
+/// to the bottom when a round ends or a down-scroll lands near the
+/// edge). Auto re-arms (down-intent, round-end/new-event, and the
+/// finalize passive-clamp) therefore require d ≤ LIVE_EDGE_TIGHT (≈ one
+/// 14 px transcript line) — being within one line of the bottom is
+/// "watching"; more than that is "reading". A down-scroll still resumes
+/// the follow: it crosses this line on the way to the bottom.
+const LIVE_EDGE_TIGHT: f64 = 24.0;
+
 /// Velocity-matched in/out animation duration (ms).
 ///
 /// The fold/deal slide durations track the user's wheel speed: a fast
@@ -243,6 +265,31 @@ fn step_flow_springs(st: &mut PileState, now_ms: f64) {
 }
 
 // ── engine state ──────────────────────────────────────────────────
+/// v0.5.37: pending "load earlier" scroll compensation. #transcript
+/// has `overflow-anchor: none` (the engine owns all programmatic
+/// scrolls, so native scroll anchoring is disabled to keep from
+/// fighting the pin/park writers). When an older page of events is
+/// PREPENDED, the browser therefore does NOT shift `scroll_top` for
+/// the inserted height, and a reader's viewport jumps: the freshly
+/// loaded page lands under the "earlier" button at the top and the old
+/// content slides down out of the spot the user was reading. The
+/// capture is taken in `on_history_prepended` (still on the pre-prepend
+/// DOM); the correction is applied on the first frame whose DOM holds
+/// the new cards (the old first card now sits at `new_count`, and its
+/// offset grew by exactly the inserted height).
+struct PrependComp {
+    /// Pre-insert position of the oldest loaded card relative to the
+    /// transcript's viewport top (signed; negative when above it).
+    anchor_before: f64,
+    /// `scroll_top` before the insertion.
+    scroll_before: f64,
+    /// Index of the pre-prepend first card in the NEW (merged) event
+    /// list = number of prepended events. Filled on the frame that
+    /// consumes the `prepending` flag — the only frame where
+    /// `events.len() - last_events_len` is the page size.
+    new_count: Option<usize>,
+}
+
 struct PileState {
     state: AppState,
     transcript: Option<HtmlElement>,
@@ -325,17 +372,40 @@ struct PileState {
     /// passive browser clamp explains, so a DOM-induced upward
     /// scroll-top delta is not misread as user motion.
     last_range: f64,
-    /// v0.5.10: perf.now() ms of the last wheel / touch input on the
+/// v0.5.10: perf.now() ms of the last wheel / touch input on the
     /// transcript (0 = none yet).
     last_input_t: f64,
     /// v0.5.10: the last input scrolled up (true) or down (false).
+    /// v0.5.24.2: used ONLY by the 300 ms release window
+    /// (`recent_input && input_up` → release:up-input). It no longer
+    /// gates the automatic re-arms — that is the positional
+    /// `reading` latch's job. (The v0.5.24.1 `!input_up` re-arm
+    /// gates wedged the follow off after a round end: a stray
+    /// up-tick at the bottom latched input_up with no position
+    /// constraint, and then blocked every round-boundary re-arm.)
+    /// Cleared by an explicit down-intent, a re-arm, or a session
+    /// reset/switch.
     input_up: bool,
     /// v0.5.10: the user's last input scrolled down; consumed by the
     /// next flat step — re-arms the follow if the viewport is within
     /// 80 px of the bottom.
     down_intent: bool,
     /// v0.5.10: last touch Y (client coords) for touchmove direction.
-    last_touch_y: Option<f64>,
+    /// v0.5.24.1: the CURRENT gesture's start Y, set on touchstart
+    /// (record_touch_start), re-anchored at every direction latch,
+    /// cleared on touchend / touchcancel / multi-touch / reset.
+    /// `record_touch_input` measures cumulative drift against this
+    /// anchor — so a hesitant slow pull (micro-pauses included)
+    /// accumulates monotonically and latches after ~TOUCH_INTENT_DRIFT_PX
+    /// of total travel, instead of losing drift on mid-gesture pauses.
+    touch_anchor_y: Option<f64>,
+    /// v0.5.24.1: a single-finger gesture is in progress on the
+    /// transcript (touchstart fired, touchend / touchcancel not yet).
+    /// While true the flat step must NOT write scroll_top (tight pin,
+    /// settle pull, park) — fighting the finger's native scroll is
+    /// exactly the "yanked back to the bottom" the user felt on a
+    /// phone; the browser owns the viewport mid-gesture.
+    touch_active: bool,
     /// v0.5.12: a passive bottom clamp was detected on the previous
     /// flat step (a scroll-top drop with no user input event — the
     /// content shrank above the viewport). The flat step consumes it
@@ -347,6 +417,18 @@ struct PileState {
     /// v0.5.16: previous frame's `streaming` flag, to detect a new model
     /// call starting (false→true) and re-arm the live follow.
     last_streaming: bool,
+    /// v0.5.38: perf-now (ms) of the most recent streaming finalization
+    /// (the in-flight `.ev-streaming` card unmounting and the canonical
+    /// `assistant_message` card mounting in its slot). During the brief
+    /// settle after that swap the content-height change can be measured
+    /// as an "unexplained" upward viewport move (the swap under-measures
+    /// `shrink` across frames); sync_stick uses this timestamp to treat
+    /// that move as a PASSIVE finalization layout shift instead of a user
+    /// scroll, so it does not misfire `release:unexplained` (which would
+    /// release the follow, latch `reading`, and strand the viewport at
+    /// the just-finalized card's top — the round-end "card top, no
+    /// follow" wedge). 0.0 = no finalization has happened this session.
+    finalize_t: f64,
     /// v0.5.18: distance to the transcript bottom (px) measured at the
     /// END of the previous frame (after its parks/pins) — the "were you
     /// at the live edge" probe. The activity re-arm gate must use this
@@ -382,6 +464,31 @@ struct PileState {
     /// suppresses the "new user message" / "new event" re-arm logic so
     /// a prepend doesn't yank the user back to the bottom.
     prepending: bool,
+    /// v0.5.34: reading mode — the user deliberately scrolled UP to
+    /// read history (wheel / touch / scrollbar). While latched, the
+    /// auto bottom-re-arms (a loop's `user_message`, a round-end
+    /// `assistant_message`, a stream start) must NOT pull the viewport
+    /// back to the newest card. It is a POSITION latch, not the
+    /// input-event `input_up` latch, so scrollbar-drag readers (which
+    /// fire no wheel/touch event) are covered too. Set at every
+    /// user-driven scroll-up release; cleared when the user lands back
+    /// at the bottom (`rearm:down`) or the session is reset.
+    reading: bool,
+    /// v0.5.37: pending "load earlier" scroll compensation (None when
+    /// no prepend awaits its DOM-catch-up frame).
+    prepend_comp: Option<PrependComp>,
+    /// v0.5.37: diagnostics — the shift and pre-scroll of the last
+    /// applied prepend compensation (surfaced by __rushiPile()).
+    last_prepend_shift: f64,
+    last_prepend_scroll_before: f64,
+    /// v0.5.37: the reader's on-screen position captured at the "load
+    /// earlier" CLICK (oldest card's offset from the transcript top +
+    /// scroll_top), taken before the pill relabels to "loading…".
+    /// apply_prepend_comp prefers this over the response-time capture
+    /// so the viewport is restored to the exact spot the user was
+    /// reading when they clicked, not where the content happened to
+    /// settle by the time the older page landed.
+    earlier_anchor: Option<(f64, f64)>,
     /// Sticky bottom ("live follow"): while true, new events keep the
     /// viewport parked at the newest card. Released by a user scroll
     /// UP (they're reading history); re-armed when they land back
@@ -415,6 +522,11 @@ struct PileState {
     /// v0.5.10: wheel / touchmove listeners (user scroll-intent input).
     wheel_cb: Option<Closure<dyn Fn(web_sys::Event)>>,
     touch_cb: Option<Closure<dyn Fn(web_sys::Event)>>,
+    /// v0.5.24.1: real gesture delimiters — touchstart sets the drift
+    /// anchor + touch_active; touchend / touchcancel end the gesture.
+    touchstart_cb: Option<Closure<dyn Fn(web_sys::Event)>>,
+    touchend_cb: Option<Closure<dyn Fn(web_sys::Event)>>,
+    touchcancel_cb: Option<Closure<dyn Fn(web_sys::Event)>>,
     animend_cb: Option<Closure<dyn Fn(web_sys::Event)>>,
     resize_cb: Option<Closure<dyn Fn()>>,
     transend_cb: Option<Closure<dyn Fn()>>,
@@ -440,6 +552,24 @@ thread_local! {
     /// timers. The Transcript effect also re-calls init on signal
     /// changes, but that may never come on its own.
     static PENDING_INIT: RefCell<Option<(AppState, u32)>> = const { RefCell::new(None) };
+}
+
+/// v0.5.23: register a fire-and-forget one-shot timer and keep the
+/// retained set BOUNDED. Every LEAKED timer is a one-shot of 80–500
+/// ms. Once the vec grows past the high-water mark the oldest entries
+/// are long since fired (dropping a fired `Timeout` is a no-op
+/// `clearTimeout`), while the most recent 1024 can still hold pending
+/// ones. Pre-v0.5.23 the vec grew without bound for the lifetime of
+/// the page, pinning every captured closure forever.
+pub(crate) fn leak_timeout(to: gloo_timers::callback::Timeout) {
+    LEAKED.with(|l| {
+        let mut v = l.borrow_mut();
+        v.push(Box::new(to));
+        if v.len() > 2048 {
+            let end = v.len() - 1024;
+            v.drain(..end);
+        }
+    });
 }
 
 /// Called from the app panic hook (lib.rs): records the last panic
@@ -492,14 +622,14 @@ pub fn init(state: AppState) {
                         }
                     });
                 });
-                LEAKED.with(|l| l.borrow_mut().push(Box::new(to)));
+                leak_timeout(to); // v0.5.23: bounded retention (see leak_timeout)
             }
             return;
         }
 
         // Build marker: name the running bundle so a stale cached
         // wasm/js is easy to spot (DevTools console).
-        let _ = js_sys::eval("console.log('[rushi-webui] build v0.5.20-flat')");
+        let _ = js_sys::eval("console.log('[rushi-webui] build v0.5.38-flat')");
 
         // Flat mode: default is the deck-less transcript (basic
         // usability); `?pile=1` restores the full card-deck engine.
@@ -548,9 +678,11 @@ pub fn init(state: AppState) {
             last_input_t: 0.0,
             input_up: false,
             down_intent: false,
-            last_touch_y: None,
+            touch_anchor_y: None,
+            touch_active: false,
             passive_clamp: false,
             last_streaming: false,
+            finalize_t: 0.0,
             prev_dist: 0.0,
             stick_hist: Vec::new(),
             last_view: None,
@@ -562,6 +694,11 @@ pub fn init(state: AppState) {
             fold_applied: false,
             park_bottom: false,
             prepending: false,
+            reading: false,
+            prepend_comp: None,
+            last_prepend_shift: 0.0,
+            last_prepend_scroll_before: 0.0,
+            earlier_anchor: None,
             stick_to_bottom: true,
             stall_reported: false,
             deal_dbg_hist: Vec::new(),
@@ -574,6 +711,9 @@ pub fn init(state: AppState) {
             scroll_cb: None,
             wheel_cb: None,
             touch_cb: None,
+            touchstart_cb: None,
+            touchend_cb: None,
+            touchcancel_cb: None,
             click_cb: None,
             animend_cb: None,
             resize_cb: None,
@@ -627,6 +767,31 @@ pub fn init(state: AppState) {
             });
             let _ = vt.add_event_listener_with_callback("touchmove", on_touch.as_js_value().unchecked_ref::<js_sys::Function>());
             ps.touch_cb = Some(on_touch);
+            // v0.5.24.1: real gesture delimiters (the v0.5.24 time-gap
+            // heuristic was replaced — a hesitant slow pull keeps the
+            // anchor alive across pauses, and the pin is suspended
+            // while a finger is on the transcript).
+            let on_touch_start = Closure::<dyn Fn(web_sys::Event)>::new(|e: web_sys::Event| {
+                let te = e.unchecked_into::<web_sys::TouchEvent>();
+                record_touch_start(&te);
+                schedule_step();
+            });
+            let _ = vt.add_event_listener_with_callback("touchstart", on_touch_start.as_js_value().unchecked_ref::<js_sys::Function>());
+            ps.touchstart_cb = Some(on_touch_start);
+            let on_touch_end = Closure::<dyn Fn(web_sys::Event)>::new(|e: web_sys::Event| {
+                let te = e.unchecked_into::<web_sys::TouchEvent>();
+                record_touch_end(&te);
+                schedule_step();
+            });
+            let _ = vt.add_event_listener_with_callback("touchend", on_touch_end.as_js_value().unchecked_ref::<js_sys::Function>());
+            ps.touchend_cb = Some(on_touch_end);
+            let on_touch_cancel = Closure::<dyn Fn(web_sys::Event)>::new(|e: web_sys::Event| {
+                let te = e.unchecked_into::<web_sys::TouchEvent>();
+                record_touch_end(&te);
+                schedule_step();
+            });
+            let _ = vt.add_event_listener_with_callback("touchcancel", on_touch_cancel.as_js_value().unchecked_ref::<js_sys::Function>());
+            ps.touchcancel_cb = Some(on_touch_cancel);
         }
 
         // transcript click → pile open/close (legacy handler).
@@ -786,9 +951,10 @@ fn register_debug_hook(w: &web_sys::Window) {
                         .map(|t| t.scroll_height() as f64 - t.scroll_top() as f64 - t.client_height() as f64)
                         .unwrap_or(-1.0);
                     format!(
-                        "init=1 flat={} steps={} fold_applied={} compact={}/{} events={} cards={} pile_face={} pile_open={} kb_open={} summary={} park_bottom={} stick={} last_range={:.0} dist={:.0} prev_dist={:.0} passive_clamp={} last_streaming={} stall_reported={} active={:?} view={:?} last_panic={} stick_hist=[{}] dbg=[{}]",
+                        "init=1 flat={} steps={} step_idle_ms={:.0} fold_applied={} compact={}/{} events={} cards={} pile_face={} pile_open={} kb_open={} summary={} park_bottom={} stick={} input_up={} reading={} touch_active={} last_range={:.0} dist={:.0} prev_dist={:.0} passive_clamp={} last_streaming={} stall_reported={} active={:?} view={:?} last_panic={} prepend_shift={:.1} prepend_scroll_before={:.0} stick_hist=[{}] dbg=[{}]",
                         st.flat,
                         st.steps,
+                        (perf_now_ms() - st.last_step_t).max(0.0),
                         st.fold_applied,
                         compact,
                         cards.len(),
@@ -800,6 +966,9 @@ fn register_debug_hook(w: &web_sys::Window) {
                         st.current_summary.is_some(),
                         st.park_bottom,
                         st.stick_to_bottom,
+                        st.input_up,
+                        st.reading,
+                        st.touch_active,
                         st.last_range,
                         dist,
                         st.prev_dist,
@@ -809,6 +978,8 @@ fn register_debug_hook(w: &web_sys::Window) {
                         st.state.active_session.get_untracked().as_deref(),
                         st.last_view,
                         last_panic_str(),
+                        st.last_prepend_shift,
+                        st.last_prepend_scroll_before,
                         st.stick_hist.join(" | "),
                         st.deal_dbg_hist.join(" | "),
                     )
@@ -837,19 +1008,98 @@ pub fn on_change() {
     });
 }
 
+/// v0.5.37: called from the "load earlier" pill's click handler,
+/// BEFORE the pill relabels to "loading…" (i.e. at the reader's exact
+/// viewport position when they clicked). Captures the oldest card's
+/// on-screen offset + scroll_top so `apply_prepend_comp` can restore
+/// the viewport to that exact spot once the older page is prepended.
+/// (#transcript has `overflow-anchor: none`, so nothing else preserves
+/// the reader's position across the prepend.)
+pub fn capture_earlier_anchor() {
+    with_pile(|cell| {
+        let st = cell.borrow();
+        if let Some(st) = st.as_ref() {
+            let mut st = st.borrow_mut();
+            if let Some(t) = &st.transcript {
+                if let Some(first) = iter_cards(&st).first() {
+                    let tr = t.get_bounding_client_rect();
+                    let cr = first.get_bounding_client_rect();
+                    st.earlier_anchor = Some((cr.top() - tr.top(), t.scroll_top() as f64));
+                }
+            }
+        }
+    });
+}
+
 /// v0.5.17: called right before older events are prepended to the
 /// event list (from ws.rs "history_page" handler).  Sets the
 /// `prepending` flag so the next `step_scrolls` run suppresses the
 /// "new user message" and "new event" re-arms that would otherwise
-/// misfire on the prepended (actually older) events.  No scroll
-/// anchoring is done here — native browser scroll anchoring handles
-/// the viewport position, and the user is at/near the top where the
-/// "load earlier" button lives.
+/// misfire on the prepended (actually older) events.
+///
+/// v0.5.37: also captures the oldest card's on-screen position as a
+/// FALLBACK scroll anchor (used only if no click-time capture is
+/// available, e.g. a programmatic prepend). The primary anchor is
+/// `earlier_anchor` from `capture_earlier_anchor`, taken at the click.
 pub fn on_history_prepended() {
     with_pile(|cell| {
         let st = cell.borrow();
         if let Some(st) = st.as_ref() {
-            st.borrow_mut().prepending = true;
+            let mut st = st.borrow_mut();
+            st.prepending = true;
+            // v0.5.38: clone the owned element up front so the DOM reads
+            // and the cleanup timer below do not hold an immutable
+            // borrow of `st` across the `st.prepend_comp` write.
+            let t_owned = st.transcript.clone();
+            // v0.5.37: capture the scroll anchor BEFORE the DOM change
+            // (ws.rs writes the merged event list right after this
+            // call, and the Leptos flush follows). The oldest loaded
+            // card's position relative to the transcript's viewport top
+            // is the anchor: after the prepend it has shifted down by
+            // exactly the inserted height, so
+            // `scroll_top += shift` keeps the screen pixel-stable.
+            if let Some(t) = t_owned.as_ref() {
+                if let Some(first) = iter_cards(&st).first() {
+                    let tr = t.get_bounding_client_rect();
+                    let cr = first.get_bounding_client_rect();
+                    st.prepend_comp = Some(PrependComp {
+                        anchor_before: cr.top() - tr.top(),
+                        scroll_before: t.scroll_top() as f64,
+                        new_count: None,
+                    });
+                } else {
+                    // No loaded cards yet (first page) — nothing to
+                    // preserve; the initial load parks at the bottom.
+                    st.prepend_comp = None;
+                }
+            }
+            // v0.5.38: the prepend re-keys the whole card list, so
+            // every existing card re-mounts and would replay its
+            // .enter fade-in (opacity 0->1 + translateY) — a visible
+            // full-transcript flicker. Hold the transcript in
+            // "prepend-quiet" mode so cards appear instantly, then
+            // release the class + strip .enter shortly after, so the
+            // fade can't replay when the quiet class comes off.
+            if let Some(t) = t_owned {
+                let _ = t.class_list().add_1("prepend-quiet");
+                let t_cleanup = t.clone();
+                let to = gloo_timers::callback::Timeout::new(400, move || {
+                    let _ = t_cleanup.class_list().remove_1("prepend-quiet");
+                    if let Ok(nodes) =
+                        t_cleanup.query_selector_all(".event.enter:not(.ev-streaming)")
+                    {
+                        for i in 0..nodes.length() {
+                            if let Some(n) = nodes.item(i) {
+                                let _ = n
+                                    .unchecked_into::<web_sys::HtmlElement>()
+                                    .class_list()
+                                    .remove_1("enter");
+                            }
+                        }
+                    }
+                });
+                leak_timeout(to);
+            }
         }
     });
 }
@@ -863,6 +1113,8 @@ pub fn on_history_loaded() {
         let Some(st) = st.as_ref() else { return };
         let mut st = st.borrow_mut();
         st.park_bottom = true;
+        st.prepend_comp = None; // v0.5.37: the history landing replaces the list
+        st.earlier_anchor = None; // v0.5.37: same
         // Landing on the last message means we're at the bottom:
         // follow the live feed from here.
         note_stick(&mut st, true, "rearm:history-land");
@@ -871,10 +1123,13 @@ pub fn on_history_loaded() {
         st.last_input_t = 0.0;
         st.input_up = false;
         st.down_intent = false;
-        st.last_touch_y = None;
+        st.touch_anchor_y = None;
+        st.touch_active = false;
         st.passive_clamp = false;
         st.last_streaming = false;
+        st.finalize_t = 0.0; // v0.5.38: no live round in the new session
         st.prev_dist = 0.0;
+        st.reading = false; // v0.5.34: landing at the bottom — not reading
         // v0.5.6: quick "enter session" transition — a one-shot fade +
         // 6 px rise on the whole transcript (style.css
         // `.transcript-in`, ~180 ms; the early webui's simple, fast
@@ -948,6 +1203,9 @@ fn step_full(st: &mut PileState) {
         st.last_applied_summary = None;
         st.last_events_len = 0;
         st.prepending = false;
+        st.prepend_comp = None; // v0.5.37: a stale session's prepend must not
+        // re-anchor into the new one
+        st.earlier_anchor = None; // v0.5.37: same — drop the old click capture
         st.last_view = view;
         // v0.5.8: clear the scroll-driven round highlight. Flat mode
         // writes it; in pile mode it is None, so this is a no-op.
@@ -958,7 +1216,9 @@ fn step_full(st: &mut PileState) {
         st.last_input_t = 0.0;
         st.input_up = false;
         st.down_intent = false;
-        st.last_touch_y = None;
+        st.touch_anchor_y = None;
+        st.reading = false; // v0.5.34: a fresh session lands at the bottom
+        st.touch_active = false;
         st.passive_clamp = false;
         st.last_streaming = false;
         st.prev_dist = 0.0;
@@ -974,6 +1234,20 @@ fn step_full(st: &mut PileState) {
         return;
     }
 
+    // v0.5.38: mark a streaming finalization BEFORE sync_stick runs, so
+    // it can classify the ensuing in-flight→canonical card-swap height
+    // change as a PASSIVE layout shift. The swap under-measures `shrink`
+    // across frames (the sentinel unmounts one frame, the canonical card
+    // mounts the next), so the residual upward move would otherwise
+    // misfire `release:unexplained` — releasing the follow, latching
+    // `reading`, and stranding the viewport at the just-finalized card's
+    // top ("card top, no follow" wedge). Detect the transition here from
+    // the PREVIOUS frame's last_streaming and the live streaming signal;
+    // only READ last_streaming — step_scrolls owns its update.
+    if st.last_streaming && !st.state.streaming.get_untracked() {
+        st.finalize_t = perf_now_ms();
+    }
+
     // Flat mode: no card deck, no card surgery, no cut lines. The
     // transcript stays a plain list of natural-height cards in one
     // scroll flow; only the sticky-bottom detection and the park /
@@ -987,7 +1261,22 @@ fn step_full(st: &mut PileState) {
         // pin below never fires, so the "pop to the top of the new
         // card" would sit visible for the whole agent think gap.
         // Park back to the true bottom in the same frame, before paint.
-        if st.stick_to_bottom && view.is_none() && active.is_some() && st.passive_clamp {
+        // v0.5.24.1: while the user's finger is on the transcript the
+        // browser owns the viewport — never write scroll_top mid-gesture.
+        // v0.5.36: gated on stick_to_bottom only (NOT on the reading
+        // latch): this is the FOLLOW rescue — if we're following
+        // (stick=true) and a passive shrink clamped the viewport, snap
+        // back to the bottom. A reader has stick=false (released), so
+        // this never fires for them. The v0.5.35 `!reading` gate here
+        // broke "keep following after a round ends": a latched reading
+        // flag suppressed this rescue and stranded the viewport at the
+        // new card's top.
+        if st.stick_to_bottom
+            && view.is_none()
+            && active.is_some()
+            && st.passive_clamp
+            && !st.touch_active
+        {
             st.passive_clamp = false;
             park_to_bottom(st, false);
             // v0.5.16: log the pull so __rushiPile() proves the settle
@@ -1006,7 +1295,17 @@ fn step_full(st: &mut PileState) {
         // Idle frames (nothing grew) write nothing (dist ≈ 0); a
         // user scroll-up released the sticky flag in sync_stick, so
         // the pin never yanks a reader.
-        if st.stick_to_bottom && view.is_none() && active.is_some() {
+        // v0.5.24.1: while the user's finger is on the transcript
+        // (touch_active) the browser owns the viewport — the pin must
+        // stay off or it fights the native pan and reads as "yanked
+        // back to the bottom" on real phones.
+        // v0.5.36: gated on stick_to_bottom only (NOT on the reading
+        // latch) — same reasoning as the settle pull: the pin is a
+        // FOLLOW mechanism (stick=true). A reader has stick=false, so
+        // the pin is already off for them; the v0.5.35 `!reading` gate
+        // only ever suppressed the pin while following, wedging the
+        // follow off after a round ended.
+        if st.stick_to_bottom && view.is_none() && active.is_some() && !st.touch_active {
             if let Some(t) = &st.transcript {
                 let dist = t.scroll_height() as f64 - t.scroll_top() as f64 - t.client_height() as f64;
                 if dist > 0.5 {
@@ -1225,6 +1524,71 @@ fn step_full(st: &mut PileState) {
 /// - `grew` (new events in same session) → auto-scroll to bottom
 /// - `park_bottom` flag → scroll to bottom + 150 ms re-park
 /// - Round-view change → scroll to bottom
+/// v0.5.37: apply the pending "load earlier" scroll compensation (see
+/// `PrependComp`). No-op until `new_count` is filled by the frame that
+/// consumes the `prepending` flag, and until the Leptos DOM holds the
+/// prepended cards. On that frame it corrects `scroll_top` so the
+/// content the user was looking at stays at the SAME screen position
+/// (`#transcript` has `overflow-anchor: none` — the engine owns
+/// programmatic scrolls — so the browser's native scroll anchoring does
+/// NOT compensate for the inserted height; without this correction a
+/// reader sees the new page pop in under the "earlier" button and the
+/// old content slide out from under their eyes).
+fn apply_prepend_comp(st: &mut PileState, events: &[serde_json::Value]) {
+    let Some(new_count) = st.prepend_comp.as_ref().and_then(|c| c.new_count) else {
+        return; // waiting for the frame that consumes `prepending`
+    };
+    let Some(t) = st.transcript.clone() else {
+        st.prepend_comp = None;
+        return;
+    };
+    // DOM-catch-up check: the rendered card count must match the
+    // expected non-ext_status event count.
+    let expected = events
+        .iter()
+        .filter(|e| e.get("type").and_then(|ty| ty.as_str()) != Some("ext_status"))
+        .count();
+    let cards = iter_cards(st);
+    if cards.len() < expected {
+        return; // Leptos has not flushed the new cards yet — retry next frame
+    }
+    let Some(comp) = st.prepend_comp.take() else {
+        return;
+    };
+    // v0.5.37: prefer the CLICK-time capture (the reader's exact position
+    // when they pressed "load earlier") over the response-time capture;
+    // the pill relabels to "loading…" between the two, so the response
+    // capture can sit a few px off the user's real position.
+    let (anchor_before, scroll_before) =
+        st.earlier_anchor.take().unwrap_or((comp.anchor_before, comp.scroll_before));
+    // The old first card (the first card of the pre-prepend window)
+    // now sits at child index = the number of RENDERED cards in the
+    // prepended page. (event_card_index can't be used: the old first
+    // *event* may itself be an ext_status, which renders no card at
+    // all — card k != event k for unrendered events.)
+    let ci = events
+        .iter()
+        .take(new_count)
+        .filter(|e| e.get("type").and_then(|ty| ty.as_str()) != Some("ext_status"))
+        .count();
+    let Some(card) = cards.get(ci).cloned() else {
+        return; // that card not flushed yet — retry next frame
+    };
+    let anchor_after = card.get_bounding_client_rect().top() - t.get_bounding_client_rect().top();
+    let shift = (anchor_after - anchor_before).max(0.0);
+    if shift > 0.5 {
+        // Instant, not the CSS `scroll-behavior:smooth`: this must
+        // land in the same frame, before paint.
+        let _ = t.style().set_property("scroll-behavior", "auto");
+        t.set_scroll_top((scroll_before + shift) as i32);
+        // Record the post-write position so the next sync_stick sees a
+        // clean delta (no false release:unexplained / clamp misread).
+        st.last_stop = t.scroll_top() as f64;
+        st.last_prepend_shift = shift;
+        st.last_prepend_scroll_before = comp.scroll_before;
+    }
+}
+
 fn step_scrolls(
     st: &mut PileState,
     events: &Vec<serde_json::Value>,
@@ -1258,15 +1622,37 @@ fn step_scrolls(
     // so the reader is not yanked to the bottom.
     let prepending = st.prepending;
     st.prepending = false;
+    // v0.5.37: "load earlier" scroll compensation. On the frame that
+    // consumes the flag, fill the page size (the only frame where
+    // events.len() - last_events_len IS the page size); then keep
+    // applying the pending correction every frame until the DOM holds
+    // the new cards.
+    if prepending {
+        if let Some(c) = st.prepend_comp.as_mut() {
+            c.new_count = Some(events.len().saturating_sub(prev_events));
+        }
+    }
+    if st.prepend_comp.is_some() {
+        apply_prepend_comp(st, events);
+    }
     // v0.5.10: a new USER message re-arms the follow even while the
     // user is reading history — sending a round means watching it.
     // Agent-driven events (tool / assistant) do NOT re-arm: a reader
     // below the live feed stays put.
-    if grew && view.is_none() && active.is_some() && !prepending {
+    // v0.5.34: a LOOP-injected user_message must not override an
+    // explicit reading position — gate on the reading latch; the
+    // interactive "I typed this" case arrives while at the bottom
+    // (reading not latched) and keeps working.
+    if grew && view.is_none() && active.is_some() && !prepending && !st.reading {
         let new_user_msg = events[prev_events..]
             .iter()
             .any(|e| e.get("type").and_then(|t| t.as_str()) == Some("user_message"));
         if new_user_msg {
+            // v0.5.24.1: sending a message is an explicit "watch this
+            // round" intent — clear the read-up latch so the follow and
+            // the round-boundary re-arms are active again.
+            st.input_up = false;
+            st.last_input_t = 0.0;
             note_stick(st, true, "rearm:new-msg");
         }
     }
@@ -1297,16 +1683,25 @@ fn step_scrolls(
     }
 
     // v0.5.19: two-tier re-arm.
-    // TIER 1 — round boundaries are the user's "show me the newest card"
-    // intent: a fresh model call starting (stream_started) or a round's
-    // final assistant_message landing rearms the follow UNCONDITIONALLY
-    // (even after a read-up) and snaps the viewport to the new bottom.
-    // TIER 2 — passive in-round events (tool noise): keep the v0.5.18
-    // band — re-arm only when the user was resting within 80 px of the
+    // TIER 1 — round boundaries were "show me the newest card": a
+    // fresh model call starting (stream_started) or a round's final
+    // assistant_message landing rearmed the follow unconditionally.
+    // TIER 2 — passive in-round events (tool noise): the v0.5.18 band
+    // — re-arm only when the user was resting within 80 px of the
     // bottom (pre-growth distance), so a reader mid-round is not
-    // yanked. In both tiers a fresh re-arm clears the input latch,
-    // otherwise sync_stick's 300 ms window re-releases the follow on
-    // the very next step (the interleaving that kept v0.5.18 stuck).
+    // yanked. A fresh re-arm clears the input latch, otherwise
+    // sync_stick's 300 ms window re-releases the follow on the very
+    // next step (the interleaving that kept v0.5.18 stuck).
+    // v0.5.24.2: READING MODE is the positional `reading` latch
+    // (v0.5.34): latched only when the user is ACTUALLY far above
+    // the bottom (d > 80) and self-cleared when they land back
+    // within the 80 px band. The v0.5.24.1 `!input_up` gate added
+    // here is removed: input_up is an INPUT latch with no position
+    // constraint — a stray upward tick at the bottom latched it, and
+    // that then blocked every round-boundary re-arm even though the
+    // user was at the live edge, wedging the follow off after a
+    // round end ("card top, no follow" regression). At the live
+    // edge, v0.5.18/19 semantics apply: at the bottom = watching.
     // Flat mode only: pile mode's sticky stays owned by sync_unfold.
     let new_assistant = grew
         && events[prev_events..]
@@ -1317,6 +1712,16 @@ fn step_scrolls(
         && active.is_some()
         && !st.stick_to_bottom
         && !prepending
+        && !st.reading
+        // v0.5.39: auto re-arms only fire from the live edge (the
+        // resting distance measured after last step's park/pin). A
+        // reader parked a few lines above the bottom (24–80 px) is
+        // inside the 80 px band but NOT at the live edge: a round
+        // ending there must not snap the viewport down — that was the
+        // "yanked to the bottom while I was reading the last lines"
+        // regression. d ≈ 0 (a true watcher) still re-arms, so the
+        // v0.5.38 round-end follow fix is preserved.
+        && st.prev_dist <= LIVE_EDGE_TIGHT
     {
         if stream_started
             || new_assistant
@@ -1366,7 +1771,10 @@ fn step_scrolls(
 
     // Park at the last message (session select → history just landed,
     // or a live event arrived while the user sat at the bottom).
-    if st.park_bottom {
+    // v0.5.24.1: defer the park while the user's finger is on the
+    // transcript — the flag stays set and fires on the next step after
+    // the gesture ends.
+    if st.park_bottom && !st.touch_active {
         st.park_bottom = false;
         park_to_bottom(st, true);
     }
@@ -1405,7 +1813,13 @@ fn park_to_bottom(st: &mut PileState, repark: bool) {
             let still = with_pile(|cell| {
                 let s = cell.borrow();
                 s.as_ref()
-                    .map(|rc| rc.borrow().stick_to_bottom)
+                    .map(|rc| {
+                        let r = rc.borrow();
+                        // v0.5.24.1: also defer while a finger is on
+                        // the transcript (the repark must not fire
+                        // mid-gesture and yank the viewport back).
+                        r.stick_to_bottom && !r.touch_active
+                    })
                     .unwrap_or(false)
             });
             if still {
@@ -1422,7 +1836,7 @@ fn park_to_bottom(st: &mut PileState, repark: bool) {
                 });
             }
         });
-        LEAKED.with(|l| l.borrow_mut().push(Box::new(to)));
+        leak_timeout(to); // v0.5.23: bounded retention (see leak_timeout)
     }
 }
 
@@ -1465,6 +1879,14 @@ fn record_wheel_input(delta_y: f64, ctrl: bool) {
         st.last_input_t = perf_now_ms();
         if delta_y < 0.0 {
             st.input_up = true;
+            // v0.5.35: release the follow synchronously so a pending
+            // re-park / the per-frame pin cannot snap the viewport back
+            // on the frame the input settles. NOTE: this latches
+            // `input_up` (releases stick) but does NOT latch `reading` —
+            // a stray upward tick at the bottom must not put us into
+            // reading mode. `reading` is latched positionally (d > 80)
+            // in sync_stick / record_touch_end only.
+            note_stick(&mut *st, false, "release:up-input");
         } else if delta_y > 0.0 {
             st.input_up = false;
             st.down_intent = true;
@@ -1472,8 +1894,99 @@ fn record_wheel_input(delta_y: f64, ctrl: bool) {
     });
 }
 
-/// v0.5.10: record a touchmove's direction (vs the previous touch Y)
+/// v0.5.24.1: touchstart on the transcript — the TRUE start of a
+/// single-finger gesture. Sets the drift anchor at the touchdown and
+/// raises `touch_active`, which suspends the sticky pin while the
+/// finger is on the screen (the v0.5.24 real-phone regression: the
+/// per-frame pin fought the native scroll, so a gentle pull read as
+/// "yanked back to the bottom"). The anchor now lives across the
+/// whole gesture — the v0.5.24 time-gap heuristic is gone, so a
+/// hesitant slow pull accumulates drift monotonically instead of
+/// losing it on micro-pauses.
+fn record_touch_start(e: &web_sys::TouchEvent) {
+    if e.touches().length() != 1 {
+        // Pinch start: not a scroll gesture — abandon the anchor.
+        with_pile(|cell| {
+            let st = cell.borrow();
+            let Some(rc) = st.as_ref() else { return };
+            let mut st = rc.borrow_mut();
+            st.touch_anchor_y = None;
+            st.touch_active = false;
+        });
+        return;
+    }
+    let y = e.changed_touches().item(0).map(|t| t.client_y() as f64);
+    with_pile(|cell| {
+        let st = cell.borrow();
+        let Some(rc) = st.as_ref() else {
+            return;
+        };
+        let mut st = rc.borrow_mut();
+        st.touch_active = true;
+        if let Some(y) = y {
+            st.touch_anchor_y = Some(y);
+        }
+    });
+}
+
+/// v0.5.24.1: touchend / touchcancel — a real gesture delimiter.
+/// When the last finger leaves the transcript the gesture ends:
+/// `touch_active` drops (the sticky pin may resume) and the anchor is
+/// cleared so the next gesture measures from its own touchdown. No
+/// intent is cleared here: a latched `input_up` / `down_intent`
+/// survives until a counter-direction input or a session reset.
+fn record_touch_end(e: &web_sys::TouchEvent) {
+    if e.touches().length() != 0 {
+        return; // other fingers still on screen
+    }
+    with_pile(|cell| {
+        let st = cell.borrow();
+        let Some(rc) = st.as_ref() else {
+            return;
+        };
+        let mut st = rc.borrow_mut();
+        st.touch_active = false;
+        st.touch_anchor_y = None;
+        // v0.5.35: POSITION-based release at gesture end. The drift-based
+        // release:up-input only latches once cumulative upward travel
+        // passes TOUCH_INTENT_DRIFT_PX (8 px) — a light pull that stays
+        // under it never releases the follow, so the very next frame
+        // (sticky pin re-armed: touch_active just dropped, stick still
+        // true) snapped the viewport back to the bottom: the "pull up,
+        // release, yanked back" mobile regression. If the gesture ENDED
+        // far above the bottom the user was reading — release the
+        // follow synchronously and latch reading mode, so neither the
+        // per-frame pin nor a pending re-park timer can yank them back.
+        if let Some(t) = &st.transcript {
+            let d = (t.scroll_height() as f64 - t.scroll_top() as f64 - t.client_height() as f64).max(0.0);
+            if d > 80.0 {
+                st.reading = true;
+                note_stick(&mut *st, false, "release:gesture-end");
+            }
+        }
+    });
+}
+
+/// v0.5.10: record a touchmove's direction (vs the gesture's start Y)
 /// as user scroll intent.
+///
+/// v0.5.24: the v0.5.10 per-event dead zone (0.5 px vs the previous
+/// event) never latched on a SLOW pull: touchmove fires at the
+/// display refresh rate, so a gentle drag moves far under 0.5 px
+/// per event and `input_up` stayed false. The sticky follow then
+/// kept pinning the viewport to the bottom every frame, and the user
+/// could only break the lock with a fast flick. Direction now latches
+/// on CUMULATIVE drift (hysteresis = TOUCH_INTENT_DRIFT_PX,
+/// re-anchored on every latch), so a slow pull registers after ~8 px
+/// of travel regardless of event cadence.
+///
+/// v0.5.24.1: the drift base is the GESTURE'S TOUCHSTART Y
+/// (record_touch_start), not a time-guessed anchor — the v0.5.24
+/// 250 ms gap heuristic reset the drift on the natural pauses of a
+/// hesitant pull, so a gentle pull could never reach the latch. If a
+/// touchstart was missed (no anchor), the first observed move sets
+/// the base instead. Multi-touch (pinch) is not scroll intent: it
+/// abandons the anchor so the next single-touch gesture starts clean.
 fn record_touch_input(e: &web_sys::TouchEvent) {
     let y = e
         .changed_touches()
@@ -1486,18 +1999,35 @@ fn record_touch_input(e: &web_sys::TouchEvent) {
                 return;
             };
             let mut st = rc.borrow_mut();
+            if e.touches().length() != 1 {
+                st.touch_anchor_y = None;
+                st.touch_active = false;
+                return;
+            }
             st.last_input_t = perf_now_ms();
-            let d = match st.last_touch_y {
-                Some(prev) if y < prev - 0.5 => -1,
-                Some(prev) if y > prev + 0.5 => 1,
-                _ => 0,
+            let d = match st.touch_anchor_y {
+                Some(anchor) => y - anchor, // negative = finger up
+                None => {
+                    st.touch_anchor_y = Some(y);
+                    0.0
+                }
             };
-            st.last_touch_y = Some(y);
-            if d < 0 {
+            if d <= -TOUCH_INTENT_DRIFT_PX {
                 st.input_up = true;
-            } else if d > 0 {
+                st.touch_anchor_y = Some(y); // re-anchor at the latch
+                // v0.5.35: release the follow SYNCHRONOUSLY in the input
+                // event so the per-frame pin / re-park cannot snap the
+                // viewport back on the frame a gesture ends (touch_active
+                // drops) — the mobile "pull up, release, yanked back" fix.
+                // Does NOT latch `reading` here: that is latched
+                // positionally (d > 80) in sync_stick / record_touch_end,
+                // so a light upward nudge at the bottom stays in follow
+                // mode rather than wedging into reading mode.
+                note_stick(&mut *st, false, "release:up-input");
+            } else if d >= TOUCH_INTENT_DRIFT_PX {
                 st.input_up = false;
                 st.down_intent = true;
+                st.touch_anchor_y = Some(y); // re-anchor at the latch
             }
         });
     }
@@ -1528,6 +2058,16 @@ fn sync_stick(st: &mut PileState) {
     let d = range - s_top; // distance to the transcript bottom
     let recent_input = perf_now_ms() - st.last_input_t < 300.0;
 
+    // v0.5.36: the reading latch is derived from POSITION, not a sticky
+    // intent. Being back within the follow band (d <= 80) means the user
+    // is at the bottom again — following, not reading. Self-clear here so
+    // a stale latch (from an earlier upward input) can never wedge the
+    // event-driven re-arms (new_user_msg / two-tier / passive-clamp) off
+    // and leave the follow dead after a round ends.
+    if d <= 80.0 && st.reading {
+        st.reading = false;
+    }
+
     // v0.5.10: release / re-arm driven by user INPUT, not by the raw
     // delta. The v0.5.9 rule read the delta as user motion, but a
     // PASSIVE delta — the browser clamping the viewport up when the
@@ -1540,18 +2080,33 @@ fn sync_stick(st: &mut PileState) {
     // carry the real intent; the frame pass only covers what no input
     // event does (scrollbar drags).
     //
-    // 1. The user's own downward motion, landing within 80 px of the
-    //    bottom, re-arms the follow (watching again / just returned).
+    // 1. The user's own downward motion, landing at the very bottom
+    //    (within LIVE_EDGE_TIGHT ≈ one line), re-arms the follow
+    //    (watching again / just returned). v0.5.39: tightened from the
+    //    80 px band — landing inside the 80 px band while still reading
+    //    the last few lines no longer snaps the viewport to the bottom;
+    //    the follow re-arms only once the user's scroll actually reaches
+    //    the bottom, so the final lines stay readable.
     if st.down_intent {
         st.down_intent = false;
-        if d <= 80.0 {
+        if d <= LIVE_EDGE_TIGHT {
             note_stick(st, true, "rearm:down");
+            // v0.5.34: back at the bottom — leave reading mode.
+            st.reading = false;
         }
     }
     // 2. A recent upward user input releases the follow immediately,
     //    at ANY distance (the v0.5.9 fix: no band to fight through).
     if recent_input && st.input_up {
         note_stick(st, false, "release:up-input");
+        // v0.5.36: only latch reading mode when the user is ACTUALLY far
+        // above the bottom (d > 80). A stray upward tick at the bottom
+        // releases the follow but must NOT enter reading mode, or the
+        // event-driven re-arms stay suppressed and the follow wedges off
+        // after a round ends (the "card top, no follow" regression).
+        if d > 80.0 {
+            st.reading = true;
+        }
     }
     // 3. An upward scroll-top delta with no recent input: a scrollbar
     //    drag (release) or a passive clamp from content shrinkage
@@ -1563,14 +2118,31 @@ fn sync_stick(st: &mut PileState) {
     //    clamp always leaves d ≈ 0, so a finalization shrink can
     //    never release the follow; the settle pull in step_full
     //    re-snaps the clamped viewport in the same frame instead.
+    //    v0.5.38: the in-flight→canonical card swap at a round end
+    //    under-measures `shrink` across frames, so the residual read
+    //    as "unexplained" and misfired this release (wedging the
+    //    follow off + stranding the view at the card top). The
+    //    finalize_t window (set in step_full) suppresses it for the
+    //    swap's settle; the settle pull re-snaps to the true bottom.
     if delta < -0.5 && !recent_input && st.last_range >= 0.0 {
         let shrink = st.last_range - range;
         let unexplained = -delta - shrink;
-        if unexplained > 0.5 && d > 80.0 {
+        // v0.5.38: within the brief settle after a streaming
+        // finalization (finalize_t set in step_full), an upward move
+        // that the one-frame `shrink` cannot fully explain is the
+        // in-flight→canonical card swap, NOT a user scroll. Route it to
+        // the passive-clamp branch below (re-arm if released) instead of
+        // misfiring release:unexplained + latching reading, which wedged
+        // the follow off and stranded the viewport at the card top.
+        let in_finalize_window = perf_now_ms() - st.finalize_t < 400.0;
+        if unexplained > 0.5 && d > 80.0 && !in_finalize_window {
             // A move the shrink cannot explain, and we are far from the
             // bottom: genuine user reading (scrollbar drag / keyboard
             // paged up) — release the follow.
             note_stick(st, false, "release:unexplained");
+            // v0.5.34: scrollbar-drag readers latch reading mode too
+            // (no wheel/touch event set input_up for them).
+            st.reading = true;
         } else {
             // v0.5.16: everything else is a PASSIVE bottom clamp — the
             // shrink explains the move, or we are still within the
@@ -1582,8 +2154,33 @@ fn sync_stick(st: &mut PileState) {
             // the live edge and wants to keep watching. The flat
             // step's settle pull then snaps to the true bottom in the
             // same frame, before paint.
-            if !st.stick_to_bottom {
+            // v0.5.24.2: the v0.5.24.1 `!input_up` gate is removed —
+            // it wedged the follow off after a round end whenever a
+            // stray up-tick at the bottom had latched input_up. The
+            // positional `reading` latch alone protects a reader who
+            // is actually far above the bottom.
+            // v0.5.34: and not when reading mode is latched via the
+            // position path (scrollbar) either.
+            // v0.5.39: only when the user was RESTING at the live edge
+            // before the shrink (prev_dist <= LIVE_EDGE_TIGHT), not on
+            // the post-shrink d. The post-shrink d is transiently large
+            // (the whole shrink amount, unbounded), which is exactly the
+            // v0.5.38 finalize shape; gating on it would wedge the
+            // round-end follow back off. prev_dist is the pre-shrink
+            // resting distance, so a bottom watcher (rested ≈0) still
+            // re-arms, while a reader parked a few lines above the
+            // bottom (rested > 24) is not yanked down.
+            if !st.stick_to_bottom
+                && !st.reading
+                && st.prev_dist <= LIVE_EDGE_TIGHT
+            {
                 note_stick(st, true, "rearm:passive-clamp");
+                // v0.5.24.2 (v0.5.16 interleaving): a re-arm means the
+                // user is at the live edge again — clear a stale
+                // input-up latch so the 300 ms release window cannot
+                // re-release the follow on the very next step.
+                st.input_up = false;
+                st.last_input_t = 0.0;
             }
             st.passive_clamp = true;
         }
@@ -1619,6 +2216,15 @@ fn detect_active_round(st: &mut PileState, events: &[serde_json::Value]) {
     let tr = match st.transcript.clone() { Some(t) => t, None => return };
     let s_top = tr.scroll_top() as f64;
     let n = events.len();
+    // v0.5.23: the expensive part below — iter_cards DOM walk plus one
+    // getBoundingClientRect (forced reflow) PER round — now only runs
+    // when the viewport actually MOVED. The pre-v0.5.23 guard re-ran it
+    // whenever `events` grew, so every streamed event (no scroll)
+    // triggered an O(rounds × reflow) pass; at 60fps that was a
+    // persistent reflow storm on top of the delta flood. Event appends
+    // without scroll keep the current round highlight; the next scroll
+    // or bottom-follow updates it.
+    let scroll_moved = s_top != st.last_round_top;
     if s_top == st.last_round_top && n == st.last_round_events_len {
         return; // idle: no scroll motion, no new events
     }
@@ -1632,38 +2238,49 @@ fn detect_active_round(st: &mut PileState, events: &[serde_json::Value]) {
         }
         return;
     }
-    let cards = iter_cards(st);
-    let tr_top = tr.get_bounding_client_rect().top();
     let client_h = tr.client_height() as f64;
-    // Sample line: 30% down the viewport — the round whose opening
-    // card sits at/above this line owns the viewport.
-    let sample = s_top + client_h * 0.30;
-    let mut active: Option<usize> = None;
-    for (i, r) in rounds.iter().enumerate() {
-        let anchor_ev = (r.start..r.end)
-            .find(|&j| {
-                events
-                    .get(j)
-                    .map(|e| e.get("type").and_then(|t| t.as_str()) != Some("ext_status"))
-                    .unwrap_or(false)
-            });
-        let Some(ci) = anchor_ev.and_then(|j| event_card_index(events, j)) else {
-            continue;
-        };
-        let Some(anchor) = cards.get(ci) else {
-            continue; // card not flushed yet; the next event/scroll heals it
-        };
-        let top = anchor.get_bounding_client_rect().top() - tr_top + s_top;
-        if top <= sample + 0.5 {
-            active = Some(i);
-        }
-    }
     // Pinned at the bottom (following the live feed): the current
     // round is the last one, even when its opener sits above the
-    // sample line.
+    // sample line. This check is cheap (no per-card reflow), so it
+    // runs on every pass.
     let dist_bottom = tr.scroll_height() as f64 - s_top - client_h;
-    if dist_bottom <= 80.0 {
-        active = Some(rounds.len() - 1);
+    let mut active: Option<usize> = if dist_bottom <= 80.0 {
+        Some(rounds.len() - 1)
+    } else if !scroll_moved {
+        // Not pinned and the viewport did not move: the round under
+        // the sample line cannot have changed — keep the last known.
+        st.state.round_active.get_untracked()
+    } else {
+        None
+    };
+    // The per-round reflow loop only pays off when the viewport moved
+    // AND the pin override above did not already settle the answer.
+    if scroll_moved && dist_bottom > 80.0 {
+        let cards = iter_cards(st);
+        let tr_top = tr.get_bounding_client_rect().top();
+        // Sample line: 30% down the viewport — the round whose opening
+        // card sits at/above this line owns the viewport.
+        let sample = s_top + client_h * 0.30;
+        active = None;
+        for (i, r) in rounds.iter().enumerate() {
+            let anchor_ev = (r.start..r.end)
+                .find(|&j| {
+                    events
+                        .get(j)
+                        .map(|e| e.get("type").and_then(|t| t.as_str()) != Some("ext_status"))
+                        .unwrap_or(false)
+                });
+            let Some(ci) = anchor_ev.and_then(|j| event_card_index(events, j)) else {
+                continue;
+            };
+            let Some(anchor) = cards.get(ci) else {
+                continue; // card not flushed yet; the next event/scroll heals it
+            };
+            let top = anchor.get_bounding_client_rect().top() - tr_top + s_top;
+            if top <= sample + 0.5 {
+                active = Some(i);
+            }
+        }
     }
     if st.state.round_active.get_untracked() != active {
         st.state.round_active.set(active);
@@ -1783,7 +2400,7 @@ pub fn nav_to_round(i: usize) {
                 }
             });
         });
-        LEAKED.with(|l| l.borrow_mut().push(Box::new(to)));
+        leak_timeout(to); // v0.5.23: bounded retention (see leak_timeout)
     });
 }
 
@@ -1957,7 +2574,7 @@ fn watch_fold_commit(st: &mut PileState, el: &HtmlElement, clip_ms: f64) {
             }
         });
     });
-    LEAKED.with(|l| l.borrow_mut().push(Box::new(to)));
+    leak_timeout(to); // v0.5.23: bounded retention (see leak_timeout)
 }
 
 /// Commit a pending fold: the card swaps to the compact layout. The
@@ -2004,7 +2621,7 @@ fn commit_fold(st: &mut PileState, el: &HtmlElement) {
                 }
             });
         });
-        LEAKED.with(|l| l.borrow_mut().push(Box::new(to)));
+        leak_timeout(to); // v0.5.23: bounded retention (see leak_timeout)
         return;
     }
     let nat = attr_nat_h(el, 52.0);
@@ -2135,6 +2752,9 @@ fn sync_unfold(st: &mut PileState, cards: &[HtmlElement]) {
         // viewport following a streaming loop card after card.
         if d > 80.0 {
             note_stick(st, false, "release:pile-dist");
+            // v0.5.34: a deck-mode reader pulled away from the deck —
+            // same reading latch as the flat-mode releases.
+            st.reading = true;
         }
         delta.abs() / dt_ms
     } else {
@@ -2144,6 +2764,9 @@ fn sync_unfold(st: &mut PileState, cards: &[HtmlElement]) {
     // of the bottom: the user is watching the feed or just returned.
     if d <= 80.0 {
         note_stick(st, true, "rearm:pile-dist");
+        // v0.5.36: back at the bottom — leave reading mode (mirror the
+        // flat-mode rearm:down so the latch can't wedge in either mode).
+        st.reading = false;
     }
     st.deal_dbg_hist.push(format!(
         "Δ={:.0} s_top={:.0}",
@@ -2356,7 +2979,7 @@ fn sync_unfold(st: &mut PileState, cards: &[HtmlElement]) {
                             }
                         });
                     });
-                    LEAKED.with(|l| l.borrow_mut().push(Box::new(to)));
+                    leak_timeout(to); // v0.5.23: bounded retention (see leak_timeout)
                     pending_slots.push((el.clone(), slot_top));
                     // Still full-height in the layout until commit: the
                     // slot walk uses the natural height, and the gluing
@@ -2725,7 +3348,7 @@ fn sync_unfold(st: &mut PileState, cards: &[HtmlElement]) {
                     let _ = s.remove_property("visibility");
                     let _ = s.set_property(
                         "box-shadow",
-                        "var(--shadow), 0 -2px 5px rgba(75, 70, 55, 0.16), 0 -1px 2px rgba(75, 70, 55, 0.10)",
+                        "var(--shadow), var(--shadow-deck-edge)",
                     );
                 } else {
                     // Fully behind the deck: the deck face is the
@@ -2809,7 +3432,7 @@ fn leave_deck(st: &mut PileState, le: &HtmlElement, now_ms: f64) {
             }
         });
     });
-    LEAKED.with(|l| l.borrow_mut().push(Box::new(to)));
+    leak_timeout(to); // v0.5.23: bounded retention (see leak_timeout)
 }
 
 /// Re-check (every 250 ms) whether a leaving edge may be cleared:
@@ -3158,7 +3781,7 @@ fn sync_last_win(st: &mut PileState, cards: &[HtmlElement]) {
             let _ = s.set_property("justify-content", "flex-end");
             let _ = s.set_property(
                 "box-shadow",
-                "var(--shadow), 0 -2px 5px rgba(75, 70, 55, 0.16), 0 -1px 2px rgba(75, 70, 55, 0.10)",
+                "var(--shadow), var(--shadow-deck-edge)",
             );
         }
         // Remember the written values for the next frame's write-skip.
@@ -3330,7 +3953,7 @@ fn on_vv_event() {
                             }
                         });
                     });
-                    LEAKED.with(|l| l.borrow_mut().push(Box::new(to)));
+                    leak_timeout(to); // v0.5.23: bounded retention (see leak_timeout)
                 }
             }
             sync_shrink(&mut st, &cards);

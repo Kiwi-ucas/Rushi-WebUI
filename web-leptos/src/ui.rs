@@ -3,12 +3,12 @@
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use serde_json::json;
-use web_sys::{KeyboardEvent, MouseEvent};
+use web_sys::{DragEvent, KeyboardEvent, MouseEvent};
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 
 use crate::api;
-use crate::model::{compute_rounds, GoalView, AppState};
+use crate::model::{compute_rounds, GoalView, AppState, SessionInfo, ordered_sessions};
 use crate::timeutil;
 use crate::ws;
 
@@ -53,6 +53,167 @@ fn set_collapsed(collapsed: bool) {
     }
 }
 
+// ── theme (v0.5.22: 3-state auto / light / dark, persisted) ────────
+/// Read the persisted theme mode. Any value other than "light"/"dark"
+/// is normalized to "auto" (the default).
+pub fn read_theme_mode() -> String {
+    let v = web_sys::window()
+        .and_then(|w| w.local_storage().ok())
+        .flatten()
+        .and_then(|s| s.get_item("rushi-theme").ok())
+        .flatten()
+        .unwrap_or_else(|| "auto".to_string());
+    match v.as_str() {
+        "light" => "light".to_string(),
+        "dark" => "dark".to_string(),
+        _ => "auto".to_string(),
+    }
+}
+
+fn set_theme_mode_stored(mode: &str) {
+    if let Some(s) = web_sys::window().and_then(|w| w.local_storage().ok()).flatten() {
+        let _ = s.set_item("rushi-theme", mode);
+    }
+}
+
+/// "auto" follows the OS color scheme; light/dark are pinned.
+fn effective_theme(mode: &str) -> &str {
+    if mode == "auto" {
+        // web-sys match_media returns Result<Option<MediaQueryList>, _>
+        // (the Option for when matchMedia is unavailable), so flatten.
+        let mq = web_sys::window()
+            .and_then(|w| w.match_media("(prefers-color-scheme: dark)").ok())
+            .flatten();
+        match mq {
+            Some(mq) if mq.matches() => "dark",
+            _ => "light",
+        }
+    } else {
+        mode
+    }
+}
+
+/// Write the effective theme to `<html data-theme>`. The pre-paint
+/// inline script in index.html does the same before first paint, so
+/// this re-applies the value the page already shows — no flash.
+pub fn theme_apply(state: AppState) {
+    let mode = state.theme_mode.get(); // owned; lives to the end of the fn
+    let eff = effective_theme(&mode);
+    if let Some(w) = web_sys::window() {
+        if let Some(doc) = w.document() {
+            if let Some(html) = doc.document_element() {
+                let _ = html.set_attribute("data-theme", eff);
+            }
+        }
+    }
+}
+
+/// One-shot theme setup (called from App mount): restore the
+/// persisted mode into the signal, apply it, then follow OS
+/// color-scheme changes while the mode is "auto". The listener
+/// closure keeps its own AppState handle; App lives for the page,
+/// so the signal outlives it.
+pub fn theme_init(state: AppState) {
+    let mode = read_theme_mode();
+    state.theme_mode.set(mode.clone());
+    theme_apply(state);
+    if let Some(mql) = web_sys::window()
+        .and_then(|w| w.match_media("(prefers-color-scheme: dark)").ok())
+        .flatten()
+    {
+        let cb = Closure::<dyn Fn()>::new(move || {
+            if state.theme_mode.get() == "auto" {
+                theme_apply(state);
+            }
+        });
+        let f: &js_sys::Function = cb.as_js_value().unchecked_ref();
+        let _ = mql.add_listener_with_opt_callback(Some(f));
+        cb.forget();
+    }
+}
+
+// ── sidebar ordering (v0.5.30: created / output / custom) ─────────
+/// Read the persisted ordering mode + custom order. Any value other
+/// than "created"/"output"/"custom" normalizes to "output" (the
+/// default, which preserves the pre-v0.5.30 "by latest output"
+/// behavior at loop granularity).
+pub fn read_persisted_sort() -> (String, Vec<String>) {
+    let stored = web_sys::window()
+        .and_then(|w| w.local_storage().ok())
+        .flatten();
+    let mode = stored
+        .as_ref()
+        .and_then(|s| s.get_item("rushi-sort-mode").ok().flatten())
+        .unwrap_or_else(|| "output".to_string());
+    let mode = match mode.as_str() {
+        "created" | "output" | "custom" => mode,
+        _ => "output".to_string(),
+    };
+    let order = stored
+        .and_then(|s| s.get_item("rushi-custom-order").ok().flatten())
+        .and_then(|v| serde_json::from_str::<Vec<String>>(&v).ok())
+        .unwrap_or_default();
+    (mode, order)
+}
+
+pub fn persist_sort_mode(mode: &str) {
+    if let Some(s) = web_sys::window().and_then(|w| w.local_storage().ok()).flatten() {
+        let _ = s.set_item("rushi-sort-mode", mode);
+    }
+}
+
+pub fn persist_custom_order(order: &[String]) {
+    if let Some(s) = web_sys::window().and_then(|w| w.local_storage().ok()).flatten() {
+        let _ = s.set_item(
+            "rushi-custom-order",
+            &serde_json::to_string(order).unwrap_or_else(|_| "[]".into()),
+        );
+    }
+}
+
+/// v0.5.30: drop `drag` onto `target` (None = end of the list): the
+/// dragged card takes the target's index; the target and everything
+/// after it shift down one. Prunes names that no longer exist, then
+/// persists. Called from the session-item / list drop handlers.
+///
+/// NOTE: a duplicate, direction-aware variant of this function existed
+/// briefly in the v0.5.30 work-in-progress and was removed to unblock
+/// the build (E0428); this is the variant the drop handlers document.
+pub fn reorder_sessions(state: AppState, drag: &str, target: Option<&str>) {
+    let names: Vec<String> = state.sessions.get().iter().map(|s| s.name.clone()).collect();
+    if !names.iter().any(|n| n == drag) {
+        return;
+    }
+    let mut order = state.custom_order.get();
+    order.retain(|n| names.iter().any(|m| m == n));
+    if !order.iter().any(|n| n == drag) {
+        order.push(drag.to_string());
+    }
+    order.retain(|n| n != drag);
+    let at = target
+        .map(|t| order.iter().position(|n| n == t).unwrap_or(order.len()))
+        .unwrap_or(order.len());
+    order.insert(at, drag.to_string());
+    state.custom_order.set(order.clone());
+    persist_custom_order(&order);
+}
+
+/// v0.5.30: carry the ordering bookkeeping across a rename: the
+/// custom order and the output rank keep working under the new name.
+pub fn rename_session_order(state: AppState, old: &str, new: &str) {
+    state.custom_order.update(|order| {
+        if let Some(i) = order.iter().position(|n| n == old) {
+            order[i] = new.to_string();
+        }
+    });
+    state.output_rank.update(|rank| {
+        if let Some(v) = rank.remove(old) {
+            rank.insert(new.to_string(), v);
+        }
+    });
+    persist_custom_order(&state.custom_order.get());
+}
+
 // ── session selection / mutation helpers ──────────────────────────
 pub fn select_session(state: AppState, name: &str) {
     // v0.5.13: leaving a session consumes its "loop finished, not
@@ -69,6 +230,11 @@ pub fn select_session(state: AppState, name: &str) {
     state.ctx_used.set(0);
     state.rounds_ctxk.set(Vec::new());
     state.goal.set(None);
+    // v0.5.38: drop the previous session's loop-cmd value so the chip
+    // does not briefly show the OTHER session's command while the new
+    // session's full-transcript fetch is in flight.
+    state.loop_cmd.set(String::new());
+    state.loop_cmd_sess.set(None);
     state.menu_session.set(None);
     state.clear_live();
 
@@ -76,11 +242,21 @@ pub fn select_session(state: AppState, name: &str) {
     let name2 = name.to_string();
     spawn_local(async move {
         if let Ok(sessions) = api::load_sessions().await {
+            s2.sync_session_bookkeeping(&sessions);
             s2.sessions.set(sessions);
         }
         ws::connect(&s2, &name2);
         s2.goal.set(api::load_goal(&name2).await);
         s2.loop_running.set(api::loop_running(&name2).await);
+        // v0.5.38: fetch the full transcript right away so the loop-cmd
+        // chip is correct from the first paint (not after the 4s poll),
+        // when its command is buried under >200 model/tool events.
+        if s2.loop_running.get() {
+            if let Ok(evs) = api::load_events(&name2).await {
+                s2.loop_cmd.set(crate::model::last_user_command_slice(&evs));
+                s2.loop_cmd_sess.set(Some(name2.clone()));
+            }
+        }
     });
 }
 
@@ -102,6 +278,7 @@ pub fn delete_session(state: AppState, name: &str) {
                     s2.ws_status.set("disconnected".to_string());
                 }
                 if let Ok(sessions) = api::load_sessions().await {
+                    s2.sync_session_bookkeeping(&sessions);
                     s2.sessions.set(sessions);
                 }
             }
@@ -134,6 +311,8 @@ pub fn rename_session(state: AppState, old: &str) {
             }
             return;
         }
+        // v0.5.30: carry the ordering bookkeeping across the rename.
+        rename_session_order(state2, &old_owned, &new_owned);
         if state2.active_session.get().as_deref() == Some(old_owned.as_str()) {
             select_session(state2, &new_owned);
         }
@@ -255,6 +434,15 @@ pub fn Sidebar(state: AppState) -> impl IntoView {
     let menu_session = state.menu_session;
     let menu_pos = state.menu_pos;
 
+    // v0.5.30: sidebar ordering — mode + custom order + the "output"
+    // rank map (bumped only on loop completion) + transient drag
+    // state (custom mode).
+    let sort_mode = state.sort_mode;
+    let custom_order = state.custom_order;
+    let output_rank = state.output_rank;
+    let dragging_session = state.dragging_session;
+    let drop_target = state.drop_target;
+
     let ws_dot_class = move || {
         let s = ws_status.get();
         match s.as_str() {
@@ -263,6 +451,19 @@ pub fn Sidebar(state: AppState) -> impl IntoView {
             "error" => "ws-dot error".to_string(),
             _ => "ws-dot disconnected".to_string(),
         }
+    };
+
+    // v0.5.22: theme cycle button (auto → light → dark → auto).
+    let theme_mode = state.theme_mode;
+    let theme_icon = move || match theme_mode.get().as_str() {
+        "light" => "\u{2600}".to_string(),
+        "dark" => "\u{263e}".to_string(),
+        _ => "\u{25d0}".to_string(),
+    };
+    let theme_title = move || match theme_mode.get().as_str() {
+        "light" => "theme: light — click for dark".to_string(),
+        "dark" => "theme: dark — click for auto".to_string(),
+        _ => "theme: auto (follows system) — click for light".to_string(),
     };
 
     let sidebar_cls = move || {
@@ -274,26 +475,130 @@ pub fn Sidebar(state: AppState) -> impl IntoView {
             <div id="sidebar-inner">
                 <div class="sb-header">
                     <h1>{ "rushi web" }</h1>
-                    <button
-                        id="sidebar-toggle"
-                        title="collapse sidebar"
-                        on:click=move |_| {
-                            let v = !collapsed.get();
-                            collapsed.set(v);
-                            set_collapsed(v);
-                        }
-                    >
-                        { "\u{2039}" }
-                    </button>
+                    <div class="sb-actions">
+                        <button
+                            id="theme-toggle"
+                            title=theme_title
+                            on:click=move |_| {
+                                // auto -> light -> dark -> auto
+                                let next = match theme_mode.get().as_str() {
+                                    "auto" => "light",
+                                    "light" => "dark",
+                                    _ => "auto",
+                                };
+                                theme_mode.set(next.to_string());
+                                set_theme_mode_stored(next);
+                                theme_apply(state);
+                            }
+                        >
+                            { theme_icon }
+                        </button>
+                        <button
+                            id="sidebar-toggle"
+                            title="collapse sidebar"
+                            on:click=move |_| {
+                                let v = !collapsed.get();
+                                collapsed.set(v);
+                                set_collapsed(v);
+                            }
+                        >
+                            { "\u{2039}" }
+                        </button>
+                    </div>
                 </div>
-                <div id="session-list">
+                <div id="session-actions">
+                    <button
+                        id="btn-new"
+                        on:click=move |_| { new_session(state); }
+                    >
+                        { "+ New Session" }
+                    </button>
+                    // v0.5.30: ordering mode — created / output / custom.
+                    // "output" moves the order only when a loop
+                    // COMPLETES; "custom" enables card drag & drop.
+                    <div class="sb-seg" title="session order">
+                        <button
+                            class=move || if sort_mode.get() == "created" { "on" } else { "" }
+                            title="by creation time — newest on top"
+                            on:click=move |_| {
+                                sort_mode.set("created".to_string());
+                                persist_sort_mode("created");
+                            }
+                        >
+                            { "newest" }
+                        </button>
+                        <button
+                            class=move || if sort_mode.get() == "output" { "on" } else { "" }
+                            title="by last output — the order updates when a loop completes"
+                            on:click=move |_| {
+                                sort_mode.set("output".to_string());
+                                persist_sort_mode("output");
+                            }
+                        >
+                            { "output" }
+                        </button>
+                        <button
+                            class=move || if sort_mode.get() == "custom" { "on" } else { "" }
+                            title="your order — drag the cards to arrange them"
+                            on:click=move |_| {
+                                sort_mode.set("custom".to_string());
+                                persist_sort_mode("custom");
+                            }
+                        >
+                            { "custom" }
+                        </button>
+                    </div>
+                </div>
+                <div
+                    id="session-list"
+                    // v0.5.30: highlight the empty area as a drop
+                    // target (append to end) while a card is dragged
+                    // and the pointer is not over a session item.
+                    class=move || {
+                        if dragging_session.get().is_some()
+                            && drop_target.get().is_none()
+                        {
+                            "drop-end".to_string()
+                        } else {
+                            String::new()
+                        }
+                    }
+                    // v0.5.30: end-of-list drop zone (custom mode):
+                    // dropping into the empty area appends to the end.
+                    on:dragover=move |e: DragEvent| {
+                        if dragging_session.get().is_some() {
+                            e.prevent_default();
+                        }
+                    }
+                    on:drop=move |e: DragEvent| {
+                        let Some(drag) = dragging_session.get() else {
+                            return;
+                        };
+                        e.prevent_default();
+                        reorder_sessions(state, &drag, None);
+                        dragging_session.set(None);
+                        drop_target.set(None);
+                    }
+                >
                     <For
-                        each=move || sessions.get()
-                        key=|s: &crate::model::SessionInfo| s.name.clone()
+                        each=move || {
+                            let s = sessions.get();
+                            let m = sort_mode.get();
+                            let o = custom_order.get();
+                            let r = output_rank.get();
+                            ordered_sessions(&s, &m, &o, &r)
+                        }
+                        key=|s: &SessionInfo| s.name.clone()
                         children=move |s| {
                             let s_name = s.name.clone();
                             let s_ts = s.last_modified;
+                            // One owned clone per `move` handler: a String
+                            // moves into only one closure, and the click +
+                            // three drag handlers each capture it.
                             let click_name = s_name.clone();
+                            let click_name_start = s_name.clone();
+                            let click_name_over = s_name.clone();
+                            let click_name_drop = s_name.clone();
                             let menu_name = s_name.clone();
                             let item_cls_name = s_name.clone();
                             let looping_set = state.looping_sessions;
@@ -321,14 +626,79 @@ pub fn Sidebar(state: AppState) -> impl IntoView {
                                 if done && !looping {
                                     c.push_str(" done");
                                 }
+                                // v0.5.30: transient drag state (custom
+                                // mode): the card being dragged fades;
+                                // the item under the cursor marks the
+                                // drop position.
+                                if dragging_session
+                                    .get()
+                                    .as_deref()
+                                    == Some(item_cls_name.as_str())
+                                {
+                                    c.push_str(" dragging");
+                                }
+                                if drop_target
+                                    .get()
+                                    .as_deref()
+                                    == Some(item_cls_name.as_str())
+                                {
+                                    c.push_str(" drop-target");
+                                }
                                 c
                             };
                             view! {
                                 <div
                                     class=item_cls
+                                    // v0.5.30: draggable only in custom
+                                    // mode (the other two modes keep a
+                                    // deterministic order).
+                                    draggable=move || sort_mode.get() == "custom"
                                     on:click=move |_| {
                                         select_session(state, &click_name);
                                         menu_session.set(None);
+                                    }
+                                    on:dragstart=move |e: DragEvent| {
+                                        if sort_mode.get() != "custom" {
+                                            return;
+                                        }
+                                        // setData is required for the
+                                        // browser to start the drag.
+                                        if let Some(dt) = e.data_transfer() {
+                                            let _ = dt.set_data("text/plain", &click_name_start);
+                                        }
+                                        dragging_session.set(Some(click_name_start.clone()));
+                                    }
+                                    on:dragover=move |e: DragEvent| {
+                                        let Some(drag) = dragging_session.get() else {
+                                            return;
+                                        };
+                                        if drag == click_name_over {
+                                            return;
+                                        }
+                                        // prevent_default is what
+                                        // makes this item a drop target.
+                                        e.prevent_default();
+                                        drop_target.set(Some(click_name_over.clone()));
+                                    }
+                                    on:drop=move |e: DragEvent| {
+                                        let Some(drag) = dragging_session.get() else {
+                                            return;
+                                        };
+                                        // Keep the list-level drop
+                                        // zone from re-firing.
+                                        e.stop_propagation();
+                                        e.prevent_default();
+                                        if drag != click_name_drop {
+                                            reorder_sessions(state, &drag, Some(&click_name_drop));
+                                        }
+                                        dragging_session.set(None);
+                                        drop_target.set(None);
+                                    }
+                                    on:dragend=move |_| {
+                                        // Drop failed (left the list) or
+                                        // completed: always clear.
+                                        dragging_session.set(None);
+                                        drop_target.set(None);
                                     }
                                 >
                                     <span class="sname">{ s_name }</span>
@@ -365,14 +735,6 @@ pub fn Sidebar(state: AppState) -> impl IntoView {
                     />
                 </div>
                 <GoalPanel state=state />
-                <div id="session-actions">
-                    <button
-                        id="btn-new"
-                        on:click=move |_| { new_session(state); }
-                    >
-                        { "+ New Session" }
-                    </button>
-                </div>
                 <div id="status-bar">
                     <span class=ws_dot_class></span>
                     { move || ws_status.get() }
@@ -630,6 +992,16 @@ fn rounds_view(
     let evs = events.get();
     let ctxk = state.rounds_ctxk.get();
 
+    // v0.5.21: global round numbering. When the loaded window is
+    // truncated (has_more), the chips cover only the window's rounds;
+    // the server-reported total_rounds gives each chip its TRUE
+    // position in the full log: window round i (0-based) is global
+    // round (total_rounds - n) + i + 1. With the full log loaded,
+    // total_rounds == n and the labels collapse to 1..n as before.
+    // 0 = unknown (server without the field) → plain window numbering.
+    let total_rounds = state.hist_total_rounds.get();
+    let base = total_rounds.saturating_sub(n as u64);
+
     let chips: Vec<AnyView> = (0..slots).map(|i| {
         if i < n {
             let range = &rounds[i];
@@ -652,7 +1024,7 @@ fn rounds_view(
             } else {
                 String::new()
             };
-            lines.push(format!("round {}{k_part}", i + 1));
+            lines.push(format!("round {}{k_part}", base + i as u64 + 1));
             let title = lines.join("\n");
             let i2 = i;
             let vr = view_round;
@@ -684,7 +1056,50 @@ fn rounds_view(
         }
     }).collect();
 
-    view! { <div>{ chips }</div> }.into_any()
+    // v0.5.21: leftmost "⋯ N earlier" chip — how many rounds exist in
+    // the full log but are not in the loaded window yet. Clicking it
+    // pages backwards like the transcript's load-earlier pill. Shown
+    // only while older pages exist AND the total is known; hidden in
+    // single-round pin view (the pill is hidden there too).
+    let earlier: AnyView = {
+        let more = total_rounds.saturating_sub(n as u64);
+        view! {
+            <Show
+                when=move || {
+                    state.hist_has_more.get()
+                        && state.hist_total_rounds.get() > 0
+                        && view_round.get().is_none()
+                }
+                fallback=|| ()
+            >
+                <button
+                    class=move || {
+                        if state.earlier_failed.get() { "ctx-round-more failed" } else { "ctx-round-more" }
+                    }
+                    title=format!("{more} earlier rounds not loaded \u{b7} click to load")
+                    disabled=move || state.loading_earlier.get()
+                    on:click=move |_| crate::ws::load_earlier(&state)
+                >
+                    { move || {
+                        if state.loading_earlier.get() {
+                            "\u{22ef}\u{2026}".to_string()
+                        } else {
+                            let m = state.hist_total_rounds.get().saturating_sub(
+                                compute_rounds(&events.get()).len() as u64,
+                            );
+                            format!("\u{22ef}{m}")
+                        }
+                    } }
+                </button>
+            </Show>
+        }
+    }
+    .into_any();
+
+    let mut all = Vec::with_capacity(chips.len() + 1);
+    all.push(earlier);
+    all.extend(chips);
+    view! { <div>{ all }</div> }.into_any()
 }
 
 // ── status strip (port of updateStatusStrip) ──────────────────────

@@ -3,3 +3,11 @@
 # picks up the WASM bundle from disk in debug mode (no rebuild needed).
 [build]
 target = "index.html"
+
+# v0.5.33: rust 1.96 emits i32.trunc_sat_f64 (saturating float-to-int) +
+# bulk-memory ops; trunk's default wasm-opt (binaryen version_123) cannot
+# validate them (the "all used features should be allowed" failure).
+# Pin a truncsat-aware optimizer; the matching feature flags are passed
+# via data-wasm-opt-params in index.html.
+[tools]
+wasm-opt = "version_130"
