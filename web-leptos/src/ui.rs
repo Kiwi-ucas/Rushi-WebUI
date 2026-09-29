@@ -376,7 +376,9 @@ pub async fn do_send(state: AppState, content: String, queue: String) {
         }
         return;
     };
-    let queue_opt = if queue.is_empty() { None } else { Some(queue) };
+    // Only `follow` writes the queue field; the steer path leaves it
+    // absent (schema: a missing field means steer, old logs stay valid).
+    let queue_opt = (queue == "follow").then(|| queue.clone());
 
     // optimistic local render (port of the doSend local push).
     // The `optimistic` flag lets the WS echo path replace this card
@@ -1430,7 +1432,7 @@ pub fn size_msg_input() {
     let _ = ta.style().set_property("height", &format!("{h:.0}px"));
 }
 
-/// One row of the queue-mode popup (direct / steer / follow). A
+/// One row of the queue-mode popup (steer / follow). A
 /// raised-look option button: hover tucks it into the panel
 /// (groove), the active one gets an accent tick.
 fn qsel_opt(
@@ -1462,13 +1464,16 @@ pub fn InputModule(state: AppState) -> impl IntoView {
     // v0.5.6: the send button doubles as the loop start/stop control
     // (green triangle = send + start; red square = stop).
     let loop_running = state.loop_running;
-    // Queue-mode picker (direct/steer/follow). A custom popup instead
+    // Queue-mode picker (steer/follow). A custom popup instead
     // of the native <select>: the OS-rendered dropdown list can't be
     // themed, so the panel is our own DOM, styled with the same rice
-    // neumorphism as the rest of the chrome. `qsel_value` is "" for
-    // "direct"; the send paths read it instead of scraping the DOM.
+    // neumorphism as the rest of the chrome. `qsel_value` is "steer"
+    // by default; the send paths read it instead of scraping the DOM.
     let qsel_open = RwSignal::new(false);
-    let qsel_value = RwSignal::new(String::new());
+    // Default queue is `steer` (the "next step" injection). Only
+    // `follow` is distinct (runs after the loop stops). The old
+    // `direct` option was just the no-field steer path, now dropped.
+    let qsel_value = RwSignal::new("steer".to_string());
 
 
     view! {
@@ -1483,11 +1488,7 @@ pub fn InputModule(state: AppState) -> impl IntoView {
                         class="qsel-btn"
                         on:click=move |_| qsel_open.update(|o| *o = !*o)
                     >
-                        { move || if qsel_value.get().is_empty() {
-                            "direct".to_string()
-                        } else {
-                            qsel_value.get().clone()
-                        } }
+                        { qsel_value.clone() }
                         <span class="qsel-chev">{"▾"}</span>
                     </button>
                     <Show
@@ -1503,7 +1504,6 @@ pub fn InputModule(state: AppState) -> impl IntoView {
                                     on:click=move |_| qo.set(false)
                                 />
                                 <div class="qsel-panel">
-                                    { qsel_opt(String::new(), "direct", qv.clone(), qo.clone()) }
                                     { qsel_opt("steer".to_string(), "steer", qv.clone(), qo.clone()) }
                                     { qsel_opt("follow".to_string(), "follow", qv, qo) }
                                 </div>
