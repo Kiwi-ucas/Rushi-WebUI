@@ -11,6 +11,7 @@ use crate::api;
 use crate::model::{compute_rounds, GoalView, AppState, SessionInfo, ordered_sessions};
 use crate::timeutil;
 use crate::ws;
+use crate::WEBUI_VERSION;
 
 /// Run `f` in a macrotask (setTimeout 0), i.e. after the current event
 /// dispatch has fully finished. Needed for closing menus / dialogs: this
@@ -171,28 +172,46 @@ pub fn persist_custom_order(order: &[String]) {
     }
 }
 
-/// v0.5.30: drop `drag` onto `target` (None = end of the list): the
-/// dragged card takes the target's index; the target and everything
-/// after it shift down one. Prunes names that no longer exist, then
-/// persists. Called from the session-item / list drop handlers.
+/// v0.5.40: drop `drag` before `target` (None = end of the list) in the
+/// custom order.
 ///
-/// NOTE: a duplicate, direction-aware variant of this function existed
-/// briefly in the v0.5.30 work-in-progress and was removed to unblock
-/// the build (E0428); this is the variant the drop handlers document.
+/// `custom_order` is kept a FULL permutation of the session names, so
+/// `ordered_sessions` renders exactly the stored order. The v0.5.30
+/// variant stored only the dragged names, so an undragged card fell to
+/// the name-ordered tail and a drop landed in the wrong place (on a
+/// target it moved the card near the top; the end drop zone moved it
+/// to the top instead of appending). Now:
+/// - the effective order starts from the current custom-mode order,
+///   pruned to live sessions, with any new sessions appended;
+/// - the dragged name moves to just before `target`, or to the end
+///   when `target` is None;
+/// - the result is persisted.
 pub fn reorder_sessions(state: AppState, drag: &str, target: Option<&str>) {
-    let names: Vec<String> = state.sessions.get().iter().map(|s| s.name.clone()).collect();
+    let sessions = state.sessions.get();
+    let names: Vec<String> = sessions.iter().map(|s| s.name.clone()).collect();
     if !names.iter().any(|n| n == drag) {
         return;
     }
-    let mut order = state.custom_order.get();
-    order.retain(|n| names.iter().any(|m| m == n));
-    if !order.iter().any(|n| n == drag) {
-        order.push(drag.to_string());
+    let mut order: Vec<String> = ordered_sessions(
+        &sessions,
+        "custom",
+        &state.custom_order.get(),
+        &state.output_rank.get(),
+    )
+    .into_iter()
+    .map(|s| s.name)
+    .filter(|n| names.iter().any(|m| m == n))
+    .collect();
+    for n in &names {
+        if !order.iter().any(|x| x == n) {
+            order.push(n.clone());
+        }
     }
     order.retain(|n| n != drag);
-    let at = target
-        .map(|t| order.iter().position(|n| n == t).unwrap_or(order.len()))
-        .unwrap_or(order.len());
+    let at = match target {
+        Some(t) => order.iter().position(|n| n == t).unwrap_or(order.len()),
+        None => order.len(),
+    };
     order.insert(at, drag.to_string());
     state.custom_order.set(order.clone());
     persist_custom_order(&order);
@@ -474,7 +493,13 @@ pub fn Sidebar(state: AppState) -> impl IntoView {
         <aside id="sidebar" class=sidebar_cls>
             <div id="sidebar-inner">
                 <div class="sb-header">
-                    <h1>{ "rushi web" }</h1>
+                    <h1>
+                        { "Rushi" }
+                        // v0.5.40: build version, injected at build
+                        // time (web-leptos/build.rs) — single source of
+                        // truth with the console marker.
+                        <span class="sb-version">{ WEBUI_VERSION }</span>
+                    </h1>
                     <div class="sb-actions">
                         <button
                             id="theme-toggle"
@@ -541,6 +566,30 @@ pub fn Sidebar(state: AppState) -> impl IntoView {
                             class=move || if sort_mode.get() == "custom" { "on" } else { "" }
                             title="your order — drag the cards to arrange them"
                             on:click=move |_| {
+                                if sort_mode.get() == "custom" {
+                                    return;
+                                }
+                                // v0.5.40: entering custom mode for the
+                                // first time freezes the CURRENT visible
+                                // order (of the mode being left) as the
+                                // starting custom order, so the list does
+                                // not jump to the name-ordered fallback.
+                                if custom_order.get().is_empty() {
+                                    let s = sessions.get();
+                                    let leaving = sort_mode.get();
+                                    let seed: Vec<String> =
+                                        ordered_sessions(
+                                            &s,
+                                            &leaving,
+                                            &custom_order.get(),
+                                            &output_rank.get(),
+                                        )
+                                        .into_iter()
+                                        .map(|x| x.name)
+                                        .collect();
+                                    custom_order.set(seed.clone());
+                                    persist_custom_order(&seed);
+                                }
                                 sort_mode.set("custom".to_string());
                                 persist_sort_mode("custom");
                             }
@@ -649,10 +698,23 @@ pub fn Sidebar(state: AppState) -> impl IntoView {
                             view! {
                                 <div
                                     class=item_cls
-                                    // v0.5.30: draggable only in custom
-                                    // mode (the other two modes keep a
-                                    // deterministic order).
-                                    draggable=move || sort_mode.get() == "custom"
+                                    // v0.5.40: `draggable` is a LIMITED
+                                    // boolean attribute — its VALUE
+                                    // matters ("true"/"false"), not just
+                                    // presence. The v0.5.30 plain-bool
+                                    // binding made Leptos emit
+                                    // draggable="" for true, which this
+                                    // Chromium does not treat as
+                                    // draggable, so a native drag never
+                                    // started (the "ineffective drag" bug).
+                                    // Bind an explicit string value.
+                                    draggable=move || {
+                                        if sort_mode.get() == "custom" {
+                                            "true".to_string()
+                                        } else {
+                                            "false".to_string()
+                                        }
+                                    }
                                     on:click=move |_| {
                                         select_session(state, &click_name);
                                         menu_session.set(None);
@@ -672,13 +734,17 @@ pub fn Sidebar(state: AppState) -> impl IntoView {
                                         let Some(drag) = dragging_session.get() else {
                                             return;
                                         };
-                                        if drag == click_name_over {
-                                            return;
-                                        }
-                                        // prevent_default is what
-                                        // makes this item a drop target.
+                                        // v0.5.40: always prevent_default
+                                        // while a drag is in progress, even
+                                        // over the dragged card itself. The
+                                        // v0.5.30 early-return made the
+                                        // browser mark a no-drop cursor on
+                                        // the source card and abort a
+                                        // release there.
                                         e.prevent_default();
-                                        drop_target.set(Some(click_name_over.clone()));
+                                        if drag != click_name_over {
+                                            drop_target.set(Some(click_name_over.clone()));
+                                        }
                                     }
                                     on:drop=move |e: DragEvent| {
                                         let Some(drag) = dragging_session.get() else {

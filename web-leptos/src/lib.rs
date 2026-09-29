@@ -9,6 +9,15 @@ mod transcript;
 mod ui;
 mod ws;
 
+/// v0.5.40: build-time webui version, injected by `build.rs`
+/// (env override → latest `vX.Y.Z` commit subject → `dev-<sha>` →
+/// "dev"). Shown in the sidebar header and the boot-time console
+/// marker — one source of truth, so the displayed version can no
+/// longer drift behind the tree. `env!` is a compile-time literal;
+/// `build.rs` guarantees the variable is always set, so this cannot
+/// panic.
+pub const WEBUI_VERSION: &str = env!("RUSHI_WEBUI_VERSION");
+
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 

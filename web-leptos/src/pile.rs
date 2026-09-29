@@ -628,8 +628,13 @@ pub fn init(state: AppState) {
         }
 
         // Build marker: name the running bundle so a stale cached
-        // wasm/js is easy to spot (DevTools console).
-        let _ = js_sys::eval("console.log('[rushi-webui] build v0.5.38-flat')");
+        // wasm/js is easy to spot (DevTools console). The version is
+        // the build-injected constant (see build.rs), not a hand-edit.
+        let marker = format!(
+            "console.log('[rushi-webui] build {v}')",
+            v = crate::WEBUI_VERSION
+        );
+        let _ = js_sys::eval(&marker);
 
         // Flat mode: default is the deck-less transcript (basic
         // usability); `?pile=1` restores the full card-deck engine.
