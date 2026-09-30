@@ -880,6 +880,13 @@ pub async fn do_send(state: AppState, content: String, queue: String) {
         state.rounds_ctxk.update(|v| v.push(state.ctx_used.get()));
     }
     state.events.update(|v| v.push(ev.clone()));
+    // v0.5.48: sending IS "watch this round". Re-arm the follow here, at
+    // the one place the user's intent is unambiguous — the trigger
+    // detection in the engine sees the same `user_message` type the loop
+    // injects, so it has to stay gated on a strict reading it can see
+    // (v0.5.34). Without this, sending from a read-up position never
+    // came back to the bottom and never followed the round's output.
+    crate::pile::note_user_send();
 
     if ws::is_open() {
         let mut payload = json!({ "kind": "message", "content": content });
@@ -1329,19 +1336,18 @@ pub fn Sidebar(state: AppState) -> impl IntoView {
                                     }
                                 >
                                     <span class="sname">{ s_name }</span>
-                                    <span class="smeta">
-                                        { move || {
-                                            s_ts.map(|ts| {
-                                                let ms = (ts * 1000.0) as f64;
-                                                let d =
-                                                    js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(ms));
-                                                let h = d.get_hours();
-                                                let mi = d.get_minutes();
-                                                let sec = d.get_seconds();
-                                                format!("{h:02}:{mi:02}:{sec:02}")
-                                            }).unwrap_or_else(|| "no events".to_string())
-                                        } }
-                                    </span>
+                                    // v0.5.48: no timestamp on the
+                                    // sidebar card (the transcript
+                                    // cards carry the full date + time
+                                    // now). Only the "no events" state
+                                    // stays — it is information, not a
+                                    // time.
+                                    <Show
+                                        when=move || s_ts.is_none()
+                                        fallback=|| ()
+                                    >
+                                        <span class="smeta">{"no events"}</span>
+                                    </Show>
                                     <SessionModelChip
                                         state=state
                                         name=chip_name
@@ -2122,10 +2128,39 @@ pub fn DeleteConfirmDialog(state: AppState) -> impl IntoView {
 /// reflow per call (height:auto → measure → set px). Called on every
 /// input event, after programmatic clears, and on window resize /
 /// keyboard lift (the pile engine's resize + vv handlers).
+///
+/// v0.5.48, three fixes around the same root: `height:auto` on a
+/// GROWN textarea momentarily shrinks the input module, which GROWS
+/// #transcript for one layout pass, and the browser then clamps
+/// #transcript.scrollTop to that transient max — the "bottom as of the
+/// default input height" position. Nothing put it back, so it read as
+/// an unexplained upward move: `release:unexplained`, the follower
+/// released, and with the 500 ms `on_vv_event` poll re-running this on
+/// an idle input, the viewport was yanked every half second (and the
+/// grown input box hid the newest card's bottom).
+///   (a) a call whose inputs (value + cap) are unchanged is a no-op, so
+///       the poll can poll without touching the layout;
+///   (b) the measure dance can never move the transcript — the
+///       scroll_top is restored if the transient clamped it;
+///   (c) a real height change notifies the engine, which re-parks the
+///       live edge while following (and stays put while reading).
 pub fn size_msg_input() {
+    thread_local! {
+        /// (value, cap px) of the last measurement: the no-op guard's
+        /// inputs. Only `size_msg_input` ever writes #msg-input's
+        /// inline height, so an unchanged pair means the applied height
+        /// is still the one we measured.
+        static LAST_FIT: std::cell::RefCell<Option<(String, f64)>> =
+            const { std::cell::RefCell::new(None) };
+    }
     let Some(w) = web_sys::window() else { return };
     let Some(doc) = w.document() else { return };
-    let Some(ta) = doc.get_element_by_id("msg-input").map(|e| e.unchecked_into::<web_sys::HtmlElement>()) else {
+    // HtmlTextAreaElement (for `.value()`), which derefs to HtmlElement
+    // (style / offset_height / scroll_height).
+    let Some(ta) = doc
+        .get_element_by_id("msg-input")
+        .and_then(|e| e.dyn_into::<web_sys::HtmlTextAreaElement>().ok())
+    else {
         return;
     };
     let cap = doc
@@ -2133,9 +2168,56 @@ pub fn size_msg_input() {
         .map(|m| m.unchecked_into::<web_sys::HtmlElement>())
         .map(|m| m.client_height() as f64 * (1.0 / 3.0))
         .unwrap_or(120.0);
-    let _ = ta.style().set_property("height", "auto");
-    let h = (ta.scroll_height() as f64).clamp(40.0, cap.max(40.0));
-    let _ = ta.style().set_property("height", &format!("{h:.0}px"));
+    // (a) Nothing that determines the height changed: leave the layout —
+    // and with it the transcript's scroll_top — completely alone.
+    let value = ta.value();
+    let unchanged = LAST_FIT.with(|c| {
+        c.borrow()
+            .as_ref()
+            .map(|(v0, cap0)| v0 == &value && (cap0 - cap).abs() < 0.5)
+            .unwrap_or(false)
+    });
+    if unchanged {
+        return;
+    }
+    // (b) Save the transcript's scroll_top across the dance below.
+    // `el` is pinned to HtmlElement: on the textarea handle `style()`
+    // would resolve to Leptos' ElementExt::style (a builder, not the
+    // CSSStyleDeclaration accessor).
+    let el: &web_sys::HtmlElement = &ta;
+    // HtmlElement (not Element): the restore below needs `style()`.
+    let tr = doc
+        .get_element_by_id("transcript")
+        .map(|t| t.unchecked_into::<web_sys::HtmlElement>());
+    let saved_top = tr.as_ref().map(|t| t.scroll_top());
+    let h_before = el.offset_height() as f64;
+    let _ = el.style().set_property("height", "auto");
+    let h = (el.scroll_height() as f64).clamp(40.0, cap.max(40.0));
+    let _ = el.style().set_property("height", &format!("{h:.0}px"));
+    if let (Some(t), Some(top)) = (&tr, saved_top) {
+        if t.scroll_top() != top {
+            // v0.5.49: #transcript carries `scroll-behavior: smooth`, so
+            // a bare programmatic write here is a ~300 ms ANIMATED
+            // scroll: the engine samples a moving viewport with no input
+            // evidence for the whole animation (and the per-frame pin
+            // fights it). Every other transcript write in the engine
+            // opts out of smooth first — this restore must too. The
+            // previous inline value is put back.
+            let prev_css = t.style().get_property_value("scroll-behavior").ok();
+            let _ = t.style().set_property("scroll-behavior", "auto");
+            let _ = t.set_scroll_top(top);
+            if let Some(p) = prev_css {
+                let _ = t.style().set_property("scroll-behavior", &p);
+            }
+        }
+    }
+    LAST_FIT.with(|c| *c.borrow_mut() = Some((value, cap)));
+    // (c) The input module's height really moved: #transcript's bottom
+    // edge moved with it, so a follower must re-park at the live edge.
+    let h_after = el.offset_height() as f64;
+    if (h_after - h_before).abs() > 0.5 {
+        crate::pile::on_input_height_changed();
+    }
 }
 
 /// One row of the queue-mode popup (steer / follow). A
@@ -2612,35 +2694,46 @@ fn tree_node(state: AppState, e: DirEntry, parent_rel: String, depth: u32) -> im
                 c
             }
         >
-            <button
-                class=move || if is_dir { "rp-caret" } else { "rp-caret leaf" }
-                title=rel_caret.clone()
-                on:click=move |_| {
-                    if is_dir {
-                        toggle_dir(state, &rel_caret);
+            // M12: head row (caret + name) is a horizontal flex row; the
+            // expanded children render in a SIBLING block below it
+            // (.rp-node-kids) so the tree grows downward. The old layout
+            // made .rp-node itself a flex row with the children as inline
+            // flex items, so expanding a directory pushed its subfolders to
+            // the RIGHT of the name and clipped wide/deep trees in the
+            // fixed 420px panel.
+            <div class="rp-node-head">
+                <button
+                    class=move || if is_dir { "rp-caret" } else { "rp-caret leaf" }
+                    title=rel_caret.clone()
+                    on:click=move |_| {
+                        if is_dir {
+                            toggle_dir(state, &rel_caret);
+                        }
                     }
-                }
-            >
-                { if is_dir { "\u{25b8}" } else { "\u{b7}" } }
-            </button>
-            <span
-                class="rp-node-name"
-                title=rel_name.clone()
-                on:click=move |_| {
-                    if is_dir {
-                        toggle_dir(state, &rel_name);
-                    } else {
-                        open_file(state, &rel_name);
+                >
+                    { if is_dir { "\u{25b8}" } else { "\u{b7}" } }
+                </button>
+                <span
+                    class="rp-node-name"
+                    title=rel_name.clone()
+                    on:click=move |_| {
+                        if is_dir {
+                            toggle_dir(state, &rel_name);
+                        } else {
+                            open_file(state, &rel_name);
+                        }
                     }
-                }
-            >
-                { name.clone() }
-            </span>
+                >
+                    { name.clone() }
+                </span>
+            </div>
             <Show
                 when=move || is_dir && expanded.get().contains(&rel_when)
                 fallback=|| ()
             >
-                { tree_level(state, rel.clone(), depth + 1) }
+                <div class="rp-node-kids">
+                    { tree_level(state, rel.clone(), depth + 1) }
+                </div>
             </Show>
         </div>
     }
@@ -2934,13 +3027,6 @@ pub fn RightPanel(state: AppState) -> impl IntoView {
                     on:click=move |_| new_terminal(state)
                 >
                     { "+" }
-                </button>
-                <button
-                    id="rp-close"
-                    title="close the panel"
-                    on:click=move |_| toggle_rp(state)
-                >
-                    { "\u{00d7}" }
                 </button>
             </div>
             <div class="rp-body">

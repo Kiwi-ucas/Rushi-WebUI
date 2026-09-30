@@ -176,6 +176,10 @@ impl ModelDraft {
             timeout_s: parse_n(&self.timeout_s),
             estimate_chars_per_token: parse_n(&self.estimate_chars_per_token),
             extra_keys: self.extra_keys.clone(),
+            // v0.5.47: tells the server this row is the entry it loaded
+            // under `orig_name`, so a rename keeps its place in [model]
+            // instead of being appended at the end.
+            orig_name: (!self.orig_name.is_empty()).then(|| self.orig_name.clone()),
         }
     }
 }

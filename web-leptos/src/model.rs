@@ -36,6 +36,12 @@ pub struct ModelEntry {
     /// Read-only: keys the panel does not edit (e.g. `api`).
     #[serde(default)]
     pub extra_keys: Vec<String>,
+    /// v0.5.47: the name this entry was loaded under, so the server can
+    /// tell a rename from a delete + add and keep the entry's place in
+    /// `[model]`. `None` for an entry the form just created; never sent
+    /// back by the server.
+    #[serde(default)]
+    pub orig_name: Option<String>,
 }
 
 /// The five `[model]` keys the kernel falls back to.

@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 // `toml` is the read-only parser (load); `toml_edit` is the writer (save).
-use toml_edit::{DocumentMut, Item, Table};
+use toml_edit::{DocumentMut, Item, Key, Table};
 
 use crate::config::WebConfig;
 
@@ -92,6 +92,13 @@ pub struct ModelEntry {
     /// see them, preserved untouched on save.
     #[serde(default)]
     pub extra_keys: Vec<String>,
+    /// v0.5.47: the name this entry was loaded under. The form sends it
+    /// back, so `save` can tell a RENAME (same entry, new name) from a
+    /// delete + add: a rename keeps the entry's place in `[model]`
+    /// instead of being appended at the end. Never set by `load`, absent
+    /// for an entry the form just created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orig_name: Option<String>,
 }
 
 /// The global `[model]` defaults.
@@ -263,17 +270,10 @@ pub fn load(cfg: &WebConfig) -> Result<ModelSettings, String> {
         key_env_present.insert(name.clone(), stored || std::env::var(&name).is_ok());
     }
 
+    // v0.5.47: no note for the dead `[model] api` key — the kernel never
+    // reads it, so what the note said was noise. The key itself is still
+    // left untouched on save.
     let mut notes = Vec::new();
-    if let Some(m) = model {
-        if m.contains_key("api") {
-            notes.push(
-                "`[model] api` is a dead key here: the kernel never reads it — `bin/model` always \
-                 posts to /v1/responses and only falls back to /v1/chat/completions on 404/405. \
-                 The panel leaves it untouched."
-                    .to_string(),
-            );
-        }
-    }
     if !active.is_empty() && !entries.iter().any(|e| e.name == active) {
         notes.push(format!(
             "`[active] model = \"{active}\"` names no [model] entry — the kernel silently falls \
@@ -331,6 +331,9 @@ fn entry_from_value(name: &str, v: &toml::Value) -> ModelEntry {
 
     ModelEntry {
         name: name.to_string(),
+        // A name read from the file has no "it used to be called" — that
+        // only exists in the form's draft (v0.5.47).
+        orig_name: None,
         model_id: s("model_id"),
         base_url: s("base_url"),
         api_key_env: s("api_key_env"),
@@ -448,33 +451,84 @@ pub fn save(cfg: &WebConfig, next: &ModelSettings) -> Result<SaveOutcome, String
         );
         set_opt_bool(model, "vision", next.globals.vision);
 
-        // Entries removed in the form are removed from the file.
-        for name in &existing {
-            if !next.entries.iter().any(|e| &e.name == name) {
-                model.remove(name);
+        // Entries added, edited and removed. Unknown keys inside an entry
+        // survive: only the fields the panel owns are set or removed.
+        //
+        // v0.5.47: a RENAME used to be a delete + an add, and because a
+        // TOML table keeps insertion order the renamed entry landed at the
+        // very end of `[model]` — the file looked rewritten for a one-word
+        // edit. The form now sends `orig_name`, so a save that renames
+        // rebuilds the entry order instead: every entry keeps the position
+        // it had, the renamed one takes the place of the name it was
+        // loaded under, a removed one disappears, and only a genuinely new
+        // entry is appended (the one order the file cannot supply). A save
+        // with no rename at all keeps the plain in-place path below, which
+        // is what makes an unchanged save byte-identical.
+        if renamed_entries(&existing, &next.entries).is_empty() {
+            for name in &existing {
+                if !next.entries.iter().any(|e| &e.name == name) {
+                    model.remove(name);
+                }
             }
-        }
-        // Entries added or edited. Unknown keys inside an entry survive:
-        // only the fields the panel owns are set or removed.
-        for e in &next.entries {
-            let needs_create = !model.get(&e.name).map(|i| i.is_table()).unwrap_or(false);
-            if needs_create {
-                model.insert(&e.name, Item::Table(Table::new()));
+            for e in &next.entries {
+                let needs_create = !model.get(&e.name).map(|i| i.is_table()).unwrap_or(false);
+                if needs_create {
+                    model.insert(&e.name, Item::Table(Table::new()));
+                }
+                let t = model
+                    .get_mut(&e.name)
+                    .and_then(|i| i.as_table_mut())
+                    .ok_or_else(|| format!("cannot write [model.\"{}\"]", e.name))?;
+                apply_entry_fields(t, e);
             }
-            let t = model
-                .get_mut(&e.name)
-                .and_then(|i| i.as_table_mut())
-                .ok_or_else(|| format!("cannot write [model.\"{}\"]", e.name))?;
-            set_opt_str(t, "model_id", e.model_id.as_deref());
-            let base_url = e.base_url.as_deref().map(normalize_base_url);
-            set_opt_str(t, "base_url", base_url.as_deref());
-            set_opt_str(t, "api_key_env", e.api_key_env.as_deref());
-            set_opt_int(t, "context_tokens", e.context_tokens);
-            set_opt_int(t, "max_output_tokens", e.max_output_tokens);
-            set_opt_str(t, "reasoning_effort", e.reasoning_effort.as_deref());
-            set_opt_bool(t, "vision", e.vision);
-            set_opt_int(t, "timeout_s", e.timeout_s);
-            set_opt_int(t, "estimate_chars_per_token", e.estimate_chars_per_token);
+        } else {
+            // `remove_entry`/`insert_formatted` rather than
+            // `remove`/`insert`: the pair keeps each key's own
+            // representation, so a file that writes `[model."alpha"]`
+            // does not come back with the quotes stripped off.
+            let mut taken: Vec<(Key, Item)> = Vec::new();
+            for name in &existing {
+                if let Some(kv) = model.remove_entry(name) {
+                    taken.push(kv);
+                }
+            }
+            let mut placed = vec![false; next.entries.len()];
+            let mut order: Vec<(Key, Item)> = Vec::new();
+            for (key, mut item) in taken {
+                let old = key.get().to_string();
+                // The entry that claims the name `old` used to have: the
+                // one still called that, else the one renamed away from
+                // it. Neither means the form dropped it.
+                let slot = next
+                    .entries
+                    .iter()
+                    .position(|e| e.name == old)
+                    .or_else(|| {
+                        next.entries
+                            .iter()
+                            .position(|e| e.orig_name.as_deref() == Some(old.as_str()))
+                    });
+                let Some(i) = slot else { continue };
+                // `taken` holds the sub-tables of `existing`, nothing else.
+                if let Some(t) = item.as_table_mut() {
+                    apply_entry_fields(t, &next.entries[i]);
+                }
+                placed[i] = true;
+                let name = next.entries[i].name.clone();
+                let key = if name == old { key } else { renamed_key(&key, &name) };
+                order.push((key, item));
+            }
+            for (i, e) in next.entries.iter().enumerate() {
+                if placed[i] {
+                    continue;
+                }
+                let mut t = Table::new();
+                apply_entry_fields(&mut t, e);
+                order.push((Key::new(&e.name), Item::Table(t)));
+            }
+            for (key, item) in order {
+                model.insert_formatted(&key, item);
+            }
         }
     }
 
@@ -581,6 +635,53 @@ pub fn save(cfg: &WebConfig, next: &ModelSettings) -> Result<SaveOutcome, String
     })
 }
 
+/// v0.5.47: `(orig_name, name)` for every entry the form renamed — the
+/// name it was loaded under exists in the file, the new one differs.
+/// Empty for the ordinary "edited some fields" save.
+fn renamed_entries(existing: &[String], entries: &[ModelEntry]) -> Vec<(String, String)> {
+    entries
+        .iter()
+        .filter_map(|e| {
+            let orig = e.orig_name.as_deref()?;
+            if orig.is_empty() || orig == e.name || e.name.trim().is_empty() {
+                return None;
+            }
+            existing
+                .iter()
+                .any(|x| x == orig)
+                .then(|| (orig.to_string(), e.name.clone()))
+        })
+        .collect()
+}
+
+/// The key for a renamed entry, written the way the file wrote the old
+/// one: a quoted key stays quoted (a bare-safe name like `alpha` would
+/// otherwise lose its quotes and read as a rewrite instead of a rename).
+fn renamed_key(old: &Key, name: &str) -> Key {
+    let repr = old.display_repr();
+    let text = if repr.starts_with('"') || repr.starts_with('\'') {
+        format!("\"{name}\"")
+    } else {
+        name.to_string()
+    };
+    text.parse().unwrap_or_else(|_| Key::new(name))
+}
+
+/// The fields the panel owns inside one `[model."…"]` entry. Unknown keys
+/// survive: only these are set or removed.
+fn apply_entry_fields(t: &mut Table, e: &ModelEntry) {
+    set_opt_str(t, "model_id", e.model_id.as_deref());
+    let base_url = e.base_url.as_deref().map(normalize_base_url);
+    set_opt_str(t, "base_url", base_url.as_deref());
+    set_opt_str(t, "api_key_env", e.api_key_env.as_deref());
+    set_opt_int(t, "context_tokens", e.context_tokens);
+    set_opt_int(t, "max_output_tokens", e.max_output_tokens);
+    set_opt_str(t, "reasoning_effort", e.reasoning_effort.as_deref());
+    set_opt_bool(t, "vision", e.vision);
+    set_opt_int(t, "timeout_s", e.timeout_s);
+    set_opt_int(t, "estimate_chars_per_token", e.estimate_chars_per_token);
+}
+
 fn validate(next: &ModelSettings, before: &toml::Value) -> Result<(), String> {
     if next.entries.is_empty() {
         return Err("keep at least one model entry".to_string());
@@ -608,10 +709,18 @@ fn validate(next: &ModelSettings, before: &toml::Value) -> Result<(), String> {
                 .collect()
         })
         .unwrap_or_default();
+    let mut seen: Vec<&str> = Vec::new();
     for e in &next.entries {
         if e.name.trim().is_empty() {
             return Err("an entry name must not be empty".to_string());
         }
+        if seen.contains(&e.name.as_str()) {
+            return Err(format!(
+                "two entries are named \"{}\" — TOML cannot hold both; pick another name",
+                e.name
+            ));
+        }
+        seen.push(&e.name);
         if e.name.contains('"') || e.name.contains('\n') {
             return Err(format!("entry name has an illegal character: {}", e.name));
         }
@@ -1361,9 +1470,10 @@ line
         assert_eq!(m.entries[0].vision, Some(true));
         assert_eq!(m.globals.max_output_tokens, Some(32768));
         assert_eq!(m.globals.reasoning_effort.as_deref(), Some("xhigh"));
-        // The dead `api` key is reported, never treated as an entry.
+        // The dead `api` key never becomes an entry, and (v0.5.47) it is
+        // not reported as a note either — the kernel never reads it.
         assert!(m.entries.iter().all(|e| e.name != "api"));
-        assert!(m.notes.iter().any(|n| n.contains("api")));
+        assert!(m.notes.is_empty(), "unexpected notes: {:?}", m.notes);
     }
 
     #[test]
@@ -1393,6 +1503,104 @@ line
         // repo's `config*.toml` ignore rule).
         assert!(out.backup.unwrap().ends_with("config.bak.toml"));
         assert!(dir.path().join("config.bak.toml").exists());
+    }
+
+    /// Two entries in a known order, so a rename's POSITION is checkable.
+    const TWO: &str = r#"[model]
+max_output_tokens = 32768
+
+[model."alpha"]
+model_id = "a"
+base_url = "http://127.0.0.1:1000"
+
+[model."beta"]
+model_id = "b"
+base_url = "http://127.0.0.1:2000"
+
+[active]
+model = "alpha"
+"#;
+
+    fn write_two(dir: &Path) -> PathBuf {
+        let p = dir.join("config.toml");
+        std::fs::write(&p, TWO).unwrap();
+        p
+    }
+
+    fn entry_names(text: &str) -> Vec<String> {
+        let doc: toml::Value = text.parse().unwrap();
+        doc.get("model")
+            .and_then(|m| m.as_table())
+            .map(|t| {
+                t.iter()
+                    .filter(|(_, v)| v.is_table())
+                    .map(|(k, _)| k.to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn save_renames_an_entry_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_two(dir.path());
+        let mut next = settings_from(TWO);
+        next.entries[0].orig_name = Some("alpha".to_string());
+        next.entries[0].name = "alpha-x".to_string();
+        next.active = "alpha-x".to_string();
+
+        save(&cfg_at(&p), &next).unwrap();
+        let after = std::fs::read_to_string(&p).unwrap();
+
+        // The rename lands where the old name was: the file is the sample
+        // with the name substituted, nothing else moved.
+        assert_eq!(after, TWO.replace("alpha", "alpha-x"));
+        assert_eq!(entry_names(&after), vec!["alpha-x", "beta"]);
+    }
+
+    #[test]
+    fn save_rename_keeps_the_other_entries_and_appends_a_new_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_two(dir.path());
+        let mut next = settings_from(TWO);
+        // alpha -> alpha-x (stays first), beta removed, gamma added.
+        next.entries[0].orig_name = Some("alpha".to_string());
+        next.entries[0].name = "alpha-x".to_string();
+        next.entries.remove(1);
+        let mut gamma = ModelEntry {
+            name: "gamma".to_string(),
+            base_url: Some("http://127.0.0.1:3000".to_string()),
+            ..Default::default()
+        };
+        gamma.orig_name = None;
+        next.entries.push(gamma);
+        next.active = "alpha-x".to_string();
+
+        save(&cfg_at(&p), &next).unwrap();
+        let after = std::fs::read_to_string(&p).unwrap();
+
+        assert_eq!(entry_names(&after), vec!["alpha-x", "gamma"]);
+        assert!(!after.contains("[model.\"beta\"]"));
+        // A brand-new entry is written with a bare key when the name
+        // allows it — the same shape `[model.deepseek-flash]` has in a
+        // real config. Only a RENAME inherits the old key's quoting.
+        assert!(after.contains("[model.gamma]"), "{after}");
+        assert!(after.contains("[model.\"alpha-x\"]"), "{after}");
+    }
+
+    #[test]
+    fn save_rejects_two_entries_with_the_same_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_two(dir.path());
+        let mut next = settings_from(TWO);
+        let mut dup = next.entries[0].clone();
+        dup.orig_name = None;
+        next.entries.push(dup);
+
+        let err = save(&cfg_at(&p), &next).unwrap_err();
+        assert!(err.contains("two entries are named"), "{err}");
+        // Nothing was written.
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), TWO);
     }
 
     #[test]

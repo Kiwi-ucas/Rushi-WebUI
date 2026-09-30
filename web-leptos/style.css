@@ -1020,7 +1020,9 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
 
 /* M11: the tab bar band — a raised strip that floats over the sunken
    body below it (mirrors #context-bar on the left). Holds the
-   browser-style tab items, the "+" new-terminal button, and #rp-close. */
+   browser-style tab items and the "+" new-terminal button (M12: the
+   panel's #rp-close was removed; #rp-toggle in the main context bar
+   owns open/close). */
 .rp-tabbar {
   display: flex;
   align-items: center;
@@ -1130,7 +1132,10 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
 }
 .rp-tab-item:hover .rp-tab-x, .rp-tab-item.active .rp-tab-x { opacity: .9; }
 .rp-tab-x:hover { color: var(--danger); background: rgba(var(--shadow-tint), .10); }
-/* the "+" new-terminal button (disabled until a session is active) */
+/* the "+" new-terminal button (disabled until a session is active).
+   M12: sits at the far right of the tab bar (margin-left:auto) — the
+   panel's own #rp-close button was removed; open/close is owned by the
+   main context bar's #rp-toggle. */
 .rp-tab-new {
   display: inline-flex;
   align-items: center;
@@ -1138,6 +1143,7 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
   width: 26px;
   height: 26px;
   flex: none;
+  margin-left: auto;
   background: var(--bg-elev);
   border: none;
   border-radius: 7px;
@@ -1150,21 +1156,6 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
 .rp-tab-new:hover { color: var(--accent); box-shadow: var(--shadow); transform: translateY(-1px); }
 .rp-tab-new:active { transform: translateY(0); box-shadow: var(--shadow-pressed); }
 .rp-tab-new:disabled { opacity: .35; cursor: default; box-shadow: var(--groove); transform: none; }
-#rp-close {
-  margin-left: auto;
-  background: var(--bg-elev);
-  border: none;
-  border-radius: 8px;
-  color: var(--text-muted);
-  font-size: 15px;
-  line-height: 1.2;
-  padding: 3px 10px;
-  cursor: pointer;
-  box-shadow: var(--groove);
-  transition: box-shadow .12s ease, transform .06s ease, color .12s ease;
-}
-#rp-close:hover { color: var(--danger); box-shadow: var(--shadow); transform: translateY(-1px); }
-#rp-close:active { transform: translateY(0); box-shadow: var(--shadow-pressed); }
 
 .rp-body { flex: 1; min-height: 0; position: relative; }
 /* M11: every open tab's pane is stacked in the body and kept mounted
@@ -1199,8 +1190,15 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
   overflow: auto;
   padding: 4px 10px 4px;
 }
-/* Nested level = one .rp-node nested inside its parent row. */
-.rp-node {
+/* M12: top-down file tree. Each .rp-node is a block that owns a
+   horizontal head row (.rp-node-head: caret + name) and, when expanded,
+   a vertical .rp-node-kids block stacked below it. Children therefore
+   grow downward (the common accordion feel), never sideways — the old
+   flex-row .rp-node nested its children as inline flex items, pushing
+   subfolders to the RIGHT of the parent's name and clipping wide/deep
+   trees inside the fixed 420px panel. */
+.rp-node { display: block; }
+.rp-node-head {
   display: flex;
   align-items: center;
   gap: 7px;
@@ -1209,20 +1207,21 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
   border-radius: 7px;
   transition: background .1s ease, box-shadow .1s ease;
 }
-.rp-node > .rp-node { margin-left: 16px; position: relative; }
-/* faint tree-guide line for nested rows */
-.rp-node > .rp-node::before {
+/* children stack below the parent row, indented one level */
+.rp-node-kids { margin-left: 16px; position: relative; }
+/* a single faint guide line spanning the whole children block */
+.rp-node-kids::before {
   content: '';
   position: absolute;
   left: -7px;
-  top: -1px;
-  bottom: -1px;
+  top: 0;
+  bottom: 0;
   width: 1px;
   background: rgba(var(--shadow-tint), 0.12);
   border-radius: 1px;
 }
-.rp-node:hover { background: var(--bg-elev); box-shadow: var(--shadow); }
-.rp-node.sel {
+.rp-node-head:hover { background: var(--bg-elev); box-shadow: var(--shadow); }
+.rp-node.sel > .rp-node-head {
   background: var(--bg-elev);
   box-shadow: inset 3px 0 0 var(--accent), var(--shadow);
 }
@@ -1246,9 +1245,14 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
 }
 .rp-caret:hover { color: var(--accent); }
 .rp-caret.leaf { opacity: .4; cursor: default; font-size: 9px; }
-.rp-node.open > .rp-caret { transform: rotate(90deg); color: var(--accent); }
+.rp-node.open > .rp-node-head > .rp-caret { transform: rotate(90deg); color: var(--accent); }
+/* M12: filenames share the main interface's typeface (the body system
+   stack, via inherit) instead of a monospace face. */
 .rp-node-name {
-  font: 500 12.5px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 500;
+  line-height: 1.55;
   letter-spacing: 0;
   white-space: nowrap;
   overflow: hidden;
@@ -1257,7 +1261,7 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
   color: var(--text);
   transition: color .1s ease;
 }
-.rp-node:hover .rp-node-name { color: var(--accent); }
+.rp-node-head:hover .rp-node-name { color: var(--accent); }
 
 /* Preview: a rounded sunken card sitting on the tool face. */
 .rp-preview {
@@ -1497,4 +1501,5 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
 }
 .term-exit-btn:hover { box-shadow: var(--shadow-hover); transform: translateY(-1px); }
 .term-exit-btn:active { box-shadow: var(--shadow-pressed); transform: translateY(0); }
+
 

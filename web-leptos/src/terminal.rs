@@ -106,6 +106,11 @@ fn create_xterm(
     let _ = js_sys::Reflect::set(&opts_v, &JsValue::from_str("cursorBlink"), &JsValue::from(true));
     let _ = js_sys::Reflect::set(&opts_v, &JsValue::from_str("scrollback"), &JsValue::from(5000u32));
     let _ = js_sys::Reflect::set(&opts_v, &JsValue::from_str("fontSize"), &JsValue::from(12.0f64));
+    // M12 follow-up (user decision, 2026-10-01): the terminal KEEPS the
+    // classic monospace stack. The "match the main-interface font" request
+    // was tried first, then the user reverted it — a proportional face
+    // misaligns xterm's fixed cell grid (ls columns / box-drawing go ragged).
+    // Do not switch back to the UI system stack without asking.
     let _ = js_sys::Reflect::set(
         &opts_v,
         &JsValue::from_str("fontFamily"),

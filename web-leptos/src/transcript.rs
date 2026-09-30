@@ -326,7 +326,10 @@ fn event_card_view(key: usize, events: RwSignal<Vec<Value>>, state: AppState) ->
         _ => t.replace('_', " "),
     };
 
-    let ts_str = crate::timeutil::ts(ev.get("ts").and_then(|v| v.as_str()).unwrap_or(""));
+    // v0.5.48: the card's top-right stamp is the full local date + time
+    // (the sidebar cards dropped their timestamp, so this is the only
+    // place a time is shown).
+    let ts_str = crate::timeutil::ts_full(ev.get("ts").and_then(|v| v.as_str()).unwrap_or(""));
 
     let body = ev_body(&ev, &t, state, events);
     let type_word = t.replace('_', " ");

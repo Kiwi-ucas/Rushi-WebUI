@@ -84,6 +84,17 @@ const TOUCH_INTENT_DRIFT_PX: f64 = 8.0;
 /// 14 px transcript line) — being within one line of the bottom is
 /// "watching"; more than that is "reading". A down-scroll still resumes
 /// the follow: it crosses this line on the way to the bottom.
+/// v0.5.50: how long after an interactive send a release with NO
+/// input evidence (`release:unexplained`) is treated as layout churn
+/// instead of the user leaving the live edge. Bounded and one-sided:
+/// the wheel / touch / key branches run first, so a release the user
+/// actually drove is never swallowed.
+const POST_SEND_GUARD_MS: f64 = 800.0;
+/// v0.5.50: a loop start within this window of a send is that send's
+/// own `ensureLoopRunning` — the user is watching the round it just
+/// started, so the follow is re-asserted on the transition.
+const POST_SEND_LOOPSTART_MS: f64 = 5_000.0;
+
 const LIVE_EDGE_TIGHT: f64 = 24.0;
 
 /// Velocity-matched in/out animation duration (ms).
@@ -371,7 +382,35 @@ struct PileState {
     /// client_height); -1 = unseeded. Measures the content shrink a
     /// passive browser clamp explains, so a DOM-induced upward
     /// scroll-top delta is not misread as user motion.
+    /// v0.5.49: use it TOGETHER with `prev_client_h` — the range delta
+    /// alone is not a content measure (see prev_client_h).
     last_range: f64,
+    /// v0.5.49: previous frame's #transcript client height; -1 =
+    /// unseeded. `range` is `scroll_height - client_height`, so a
+    /// VIEWPORT-SIZE change moves `range` with zero content change: the
+    /// input box growing by k shrinks #transcript by k, which reads as
+    /// `shrink = -k` and fabricated `unexplained = -delta + k` — k
+    /// pixels of phantom "user scrolled up" on every frame the input
+    /// grew. With `d > 80` that misfired `release:unexplained` + the
+    /// reading latch (which then suppresses the event-driven re-arms),
+    /// so typing a multi-line draft while a round streamed killed the
+    /// follow, and the send that followed never came back to the
+    /// bottom. The decomposition now runs in CONTENT space
+    /// (`shrink = (last_range - range) - (client_h - prev_client_h)`),
+    /// so a pure viewport resize contributes nothing to it.
+    prev_client_h: f64,
+    /// v0.5.50: perf.now() ms of the last interactive send
+    /// (`note_user_send`); 0 = none yet. A send is an explicit "watch
+    /// this round" intent, so a release that lands inside
+    /// POST_SEND_GUARD_MS of it AND carries no input evidence (the
+    /// geometry moved, not the hand) is layout churn — the optimistic
+    /// card being replaced by the canonical event, the loop
+    /// indicator / status chips mounting, the input box shrinking
+    /// back — not the user leaving.
+    last_send_t: f64,
+    /// v0.5.50: how many such post-send releases were swallowed
+    /// (diagnostic, see __rushiPile()).
+    post_send_rescued: u32,
 /// v0.5.10: perf.now() ms of the last wheel / touch input on the
     /// transcript (0 = none yet).
     last_input_t: f64,
@@ -603,6 +642,42 @@ fn with_pile<T>(f: impl FnOnce(&RefCell<Option<Rc<RefCell<PileState>>>>) -> T) -
     PILE.with(f)
 }
 
+/// v0.5.51: `with_pile` for callbacks that may already be running
+/// INSIDE an engine borrow (a UI entry point invoked from a pile
+/// callback — e.g. `ui::size_msg_input`, which the visualViewport
+/// handler calls while it holds the lock, or a hook the engine fires
+/// mid-step). Taking the lock again is a `RefCell` panic, and a panic
+/// inside an event callback ABORTS THE WHOLE WASM APP: every later
+/// call traps, so the UI silently freezes — no jump, no follow, no
+/// re-render. That is the "sent from history and nothing happened"
+/// report. Returns `None` instead so the caller can skip the update
+/// and leave a trace in the diagnostics ring.
+fn try_with_pile<T>(
+    f: impl FnOnce(&RefCell<Option<Rc<RefCell<PileState>>>>) -> T,
+) -> Option<T> {
+    PILE.with(|cell| {
+        if cell.try_borrow_mut().is_err() {
+            return None;
+        }
+        Some(f(cell))
+    })
+}
+
+/// v0.5.51: record a skipped engine update (a re-entrant call that
+/// would have panicked) so `__rushiPile()`'s `dbg=[…]` shows it.
+fn note_reentry_skip(what: &str) {
+    PILE.with(|cell| {
+        let Ok(c) = cell.try_borrow() else { return };
+        let Some(rc) = c.as_ref() else { return };
+        let Ok(mut st) = rc.try_borrow_mut() else { return };
+        st.deal_dbg_hist.push(format!("reentry-skip {what}"));
+        let len = st.deal_dbg_hist.len();
+        if len > 12 {
+            st.deal_dbg_hist.drain(0..len - 12);
+        }
+    });
+}
+
 // ── M6: full-layout (dispatch view) hiding ────────────────────────
 /// The "full" layout hides #main with display:none while the sidebar
 /// owns the window. Call this when the layout enters/leaves that
@@ -732,6 +807,9 @@ pub fn init(state: AppState) {
             last_round_top: -1.0,
             last_round_events_len: 0,
             last_range: -1.0,
+            prev_client_h: -1.0,
+            last_send_t: 0.0,
+            post_send_rescued: 0,
             last_input_t: 0.0,
             input_up: false,
             down_intent: false,
@@ -1015,8 +1093,13 @@ fn register_debug_hook(w: &web_sys::Window) {
                         .as_ref()
                         .map(|t| t.scroll_height() as f64 - t.scroll_top() as f64 - t.client_height() as f64)
                         .unwrap_or(-1.0);
+                    let client_h = st
+                        .transcript
+                        .as_ref()
+                        .map(|t| t.client_height() as f64)
+                        .unwrap_or(-1.0);
                     format!(
-                        "init=1 flat={} steps={} step_idle_ms={:.0} fold_applied={} compact={}/{} events={} cards={} pile_face={} pile_open={} kb_open={} summary={} park_bottom={} stick={} input_up={} reading={} touch_active={} last_range={:.0} dist={:.0} prev_dist={:.0} passive_clamp={} glide={} last_streaming={} stall_reported={} active={:?} view={:?} last_panic={} prepend_shift={:.1} prepend_scroll_before={:.0} stick_hist=[{}] dbg=[{}]",
+                        "init=1 flat={} steps={} step_idle_ms={:.0} fold_applied={} compact={}/{} events={} cards={} pile_face={} pile_open={} kb_open={} summary={} park_bottom={} stick={} input_up={} reading={} touch_active={} last_range={:.0} client_h={:.0} post_send_rescued={} dist={:.0} prev_dist={:.0} passive_clamp={} glide={} last_streaming={} stall_reported={} active={:?} view={:?} last_panic={} prepend_shift={:.1} prepend_scroll_before={:.0} stick_hist=[{}] dbg=[{}]",
                         st.flat,
                         st.steps,
                         (perf_now_ms() - st.last_step_t).max(0.0),
@@ -1035,6 +1118,8 @@ fn register_debug_hook(w: &web_sys::Window) {
                         st.reading,
                         st.touch_active,
                         st.last_range,
+                        client_h,
+                        st.post_send_rescued,
                         dist,
                         st.prev_dist,
                         st.passive_clamp,
@@ -1072,6 +1157,131 @@ pub fn on_change() {
             schedule_step();
         }
     });
+}
+
+/// v0.5.48: the user pressed send. Sending IS the "watch this round"
+/// intent — re-arm the follow and park at the live edge, even when the
+/// reading latch is set.
+///
+/// The `new_user_msg` re-arm in `step_scrolls` is gated on `!reading`
+/// (v0.5.34: a LOOP-injected `user_message` must not yank a reader).
+/// That gate also swallowed the *interactive* case: a user who scrolled
+/// up to read history, then typed a message, never jumped back to the
+/// bottom and never followed the round's output (the v0.5.34 comment
+/// assumed "the interactive case arrives while at the bottom", which is
+/// not true — the input box is always live). The UI knows the
+/// difference, so it tells us explicitly here instead of us guessing
+/// from an event type the loop shares.
+pub fn note_user_send() {
+    let done = try_with_pile(|cell| {
+        let st = cell.borrow();
+        if let Some(st) = st.as_ref() {
+            let mut st = st.borrow_mut();
+            // Watch again: drop the read-up latch and every stale
+            // input-intent flag that could re-release the follow on the
+            // very next scroll event.
+            st.reading = false;
+            st.input_up = false;
+            st.down_intent = false;
+            st.last_input_t = 0.0;
+            st.passive_clamp = false;
+            st.glide_until = 0.0; // a pending round-glide is superseded
+            // v0.5.50: remember WHEN — the guard below and the
+            // loop-start re-arm both hang off this timestamp.
+            st.last_send_t = perf_now_ms();
+            // v0.5.49: a send also LEAVES a round view. Every park /
+            // follow / live-pin path in this engine is gated on
+            // `view.is_none()` — `park_to_bottom` returns early when
+            // `last_view` is set — so a send from inside a round view
+            // got no jump to the bottom AND no follow for the round it
+            // had just started (pile mode's chip click sets
+            // `view_round`; the flat-mode chip only glides). Sending is
+            // the "watch this round" intent, so the round filter is
+            // dropped here; the UI's view signal owns the re-render.
+            if st.state.view_round.get_untracked().is_some() {
+                st.state.view_round.set(None);
+            }
+            st.last_view = None;
+            note_stick(&mut st, true, "rearm:user-send");
+            // Park now (the optimistic card is already in the event
+            // list) and once more after the 150 ms flush, so the new
+            // card's own height lands inside the follow.
+            park_to_bottom(&mut st, true);
+        }
+    });
+    if done.is_none() {
+        note_reentry_skip("user-send");
+    }
+}
+
+
+/// v0.5.50: the loop just transitioned to running for the session on
+/// screen. When that start is the one our own send asked for
+/// (`ensureLoopRunning`), the user is watching the round it starts, so
+/// re-assert the follow and park: the loop's first frames are exactly
+/// when the status chips / indicator mount and re-flow the transcript,
+/// and a release anywhere in that churn used to leave a send-from-
+/// history stranded with no follow at all. Gated on the send window,
+/// so a loop started by someone else (another client, the CLI) never
+/// yanks a reader back down.
+pub fn on_loop_start() {
+    let done = try_with_pile(|cell| {
+        let st = cell.borrow();
+        let Some(rc) = st.as_ref() else { return };
+        let mut st = rc.borrow_mut();
+        if !(st.last_send_t > 0.0 && perf_now_ms() - st.last_send_t < POST_SEND_LOOPSTART_MS) {
+            return;
+        }
+        st.reading = false;
+        st.input_up = false;
+        st.down_intent = false;
+        st.last_input_t = 0.0;
+        st.passive_clamp = false;
+        st.glide_until = 0.0;
+        if st.state.view_round.get_untracked().is_some() {
+            st.state.view_round.set(None);
+        }
+        st.last_view = None;
+        note_stick(&mut st, true, "rearm:loop-start");
+        park_to_bottom(&mut st, true);
+    });
+    if done.is_none() {
+        note_reentry_skip("loop-start");
+    }
+}
+
+/// v0.5.48: `#msg-input`'s auto-fit changed the input module's height,
+/// so `#transcript`'s viewport shrank or grew by the same amount and
+/// its scrollable bottom edge moved with it.
+///
+/// While following, re-park at the live edge: without this the grown
+/// input box hides the newest card's bottom (the viewport keeps its old
+/// scroll_top while the bottom edge moved up), and the engine never
+/// notices because a pure layout change fires no scroll/resize event.
+/// While reading (stick=false) the viewport is left alone — the caller
+/// (`ui::size_msg_input`) restores the pre-measure scroll_top itself.
+pub fn on_input_height_changed() {
+    let done = try_with_pile(|cell| {
+        let st = cell.borrow();
+        if let Some(st) = st.as_ref() {
+            let mut st = st.borrow_mut();
+            // Same gates as the flat step's tight pin: a reader
+            // (stick=false) keeps their position, a finger on the
+            // transcript owns the viewport, and the round views park
+            // their own card.
+            if !st.stick_to_bottom || st.touch_active || st.last_view.is_some() {
+                return;
+            }
+            park_to_bottom(&mut st, true);
+        }
+    });
+    if done.is_none() {
+        // The engine is mid-borrow (a pile callback called the UI):
+        // skip this re-park rather than abort the app. The next step —
+        // or the send's own park — puts the viewport back at the
+        // bottom.
+        note_reentry_skip("input-height");
+    }
 }
 
 /// v0.5.37: called from the "load earlier" pill's click handler,
@@ -1186,6 +1396,7 @@ pub fn on_history_loaded() {
         note_stick(&mut st, true, "rearm:history-land");
         // v0.5.10: re-seed the intent bookkeeping for the landing.
         st.last_range = -1.0;
+        st.prev_client_h = -1.0;
         st.last_input_t = 0.0;
         st.input_up = false;
         st.down_intent = false;
@@ -1286,6 +1497,7 @@ fn step_full(st: &mut PileState) {
         // v0.5.10: drop the user-intent bookkeeping of the old
         // session (stale intent must not leak into the new one).
         st.last_range = -1.0;
+        st.prev_client_h = -1.0;
         st.last_input_t = 0.0;
         st.input_up = false;
         st.down_intent = false;
@@ -1328,9 +1540,22 @@ fn step_full(st: &mut PileState) {
                 } else {
                     let max = t.scroll_height() - t.client_height();
                     let target = (st.saved_scroll as i32).min(max.max(0));
+                    // v0.5.49: #transcript carries `scroll-behavior:
+                    // smooth`, so a bare programmatic write is a ~300 ms
+                    // ANIMATED scroll — the engine samples a moving
+                    // viewport with no input evidence for the whole
+                    // animation. Every other write in this module opts
+                    // out first; this one (and the input-height restore
+                    // in ui::size_msg_input) did not.
+                    let prev_css = t.style().get_property_value("scroll-behavior").ok();
+                    let _ = t.style().set_property("scroll-behavior", "auto");
                     t.set_scroll_top(target);
+                    if let Some(p) = prev_css {
+                        let _ = t.style().set_property("scroll-behavior", &p);
+                    }
                     st.last_stop = t.scroll_top() as f64;
                     st.last_range = t.scroll_height() as f64 - t.client_height() as f64;
+                    st.prev_client_h = t.client_height() as f64;
                     note_stick(st, false, "layout-rearm:restore");
                 }
             }
@@ -2162,7 +2387,8 @@ fn note_stick(st: &mut PileState, to: bool, reason: &str) {
 fn sync_stick(st: &mut PileState) {
     let Some(tr) = &st.transcript else { return };
     let s_top = tr.scroll_top() as f64;
-    let range = tr.scroll_height() as f64 - tr.client_height() as f64;
+    let client_h = tr.client_height() as f64;
+    let range = tr.scroll_height() as f64 - client_h;
     let delta = s_top - st.last_stop;
     st.last_stop = s_top;
     let d = range - s_top; // distance to the transcript bottom
@@ -2238,7 +2464,10 @@ fn sync_stick(st: &mut PileState) {
     //    drag (release) or a passive clamp from content shrinkage
     //    above the viewport (keep the flag — the finalization case).
     //    Only the part of the move NOT explained by the shrink
-    //    (last_range - range) counts as user motion.
+    //    counts as user motion. v0.5.49: the shrink is measured in
+    //    CONTENT space — `(last_range - range) - (client_h -
+    //    prev_client_h)` — so a viewport-size change (the input box
+    //    growing) contributes nothing to it.
     //    v0.5.12: release ONLY when the unexplained move left the
     //    viewport far above the bottom (d > 80). A passive bottom
     //    clamp always leaves d ≈ 0, so a finalization shrink can
@@ -2251,7 +2480,23 @@ fn sync_stick(st: &mut PileState) {
     //    finalize_t window (set in step_full) suppresses it for the
     //    swap's settle; the settle pull re-snaps to the true bottom.
     if delta < -0.5 && !recent_input && st.last_range >= 0.0 {
-        let shrink = st.last_range - range;
+        // v0.5.49: measure the shrink in CONTENT space. `range` is
+        // `scroll_height - client_height`, so `last_range - range`
+        // carries the viewport-size delta too: the input box growing by
+        // k shrinks #transcript by k and fabricates `shrink = -k`, i.e.
+        // `unexplained = -delta + k` — k pixels of phantom "user
+        // scrolled up" on that frame. Any genuine clamp in the same
+        // window (`delta < -0.5`) then read as user motion, and with
+        // `d > 80` that released the follow and latched reading mode
+        // (which suppresses the event-driven re-arms). Subtracting the
+        // viewport part leaves exactly the content shrink, so a pure
+        // resize contributes nothing to `unexplained`.
+        let d_client = if st.prev_client_h >= 0.0 {
+            client_h - st.prev_client_h
+        } else {
+            0.0
+        };
+        let shrink = (st.last_range - range) - d_client;
         let unexplained = -delta - shrink;
         // v0.5.38: within the brief settle after a streaming
         // finalization (finalize_t set in step_full), an upward move
@@ -2261,7 +2506,28 @@ fn sync_stick(st: &mut PileState) {
         // misfiring release:unexplained + latching reading, which wedged
         // the follow off and stranded the viewport at the card top.
         let in_finalize_window = perf_now_ms() - st.finalize_t < 400.0;
-        if unexplained > 0.5 && d > 80.0 && !in_finalize_window {
+        // v0.5.50: "sending is watching" has to survive the layout
+        // churn the send itself starts. Right after a send the
+        // transcript rearranges under the parked viewport: the
+        // optimistic card is swapped for the canonical event, the
+        // loop indicator / status chips mount, the input box shrinks
+        // back to one line. Each of those moves content the shrink
+        // decomposition cannot attribute, so a `release:unexplained`
+        // here would drop the follow the send just asked for — the
+        // "sent from history, loop started, nothing followed" report.
+        // Only releases WITHOUT input evidence are swallowed: the
+        // wheel / touch / key branches run before this one, so a
+        // scroll the user actually drove still lands.
+        let post_send =
+            st.last_send_t > 0.0 && perf_now_ms() - st.last_send_t < POST_SEND_GUARD_MS;
+        let misfire = unexplained > 0.5 && d > 80.0 && !in_finalize_window;
+        if misfire && post_send {
+            st.post_send_rescued = st.post_send_rescued.saturating_add(1);
+            if st.stick_to_bottom {
+                st.park_bottom = true;
+            }
+        }
+        if misfire && !post_send {
             // A move the shrink cannot explain, and we are far from the
             // bottom: genuine user reading (scrollbar drag / keyboard
             // paged up) — release the follow.
@@ -2313,6 +2579,9 @@ fn sync_stick(st: &mut PileState) {
     }
     } // v0.5.43: end of the glide-window guard (input-intent suspended)
     st.last_range = range;
+    // v0.5.49: the viewport height is part of the decomposition's base
+    // (see prev_client_h); base syncs stay outside the glide guard.
+    st.prev_client_h = client_h;
 }
 
 // ── v0.5.8: flat-mode round-chip scroll coupling ───────────────────
@@ -4073,6 +4342,15 @@ pub fn sync_input_gutter() {
 
 // ── visualViewport keyboard lift (legacy onVV listener) ───────────
 fn on_vv_event() {
+    // v0.5.51: the input auto-fit must run OUTSIDE the engine borrow
+    // below. `ui::size_msg_input` re-enters the engine (its tail hook
+    // re-parks a follower after the input module's height change), and
+    // taking the lock again while THIS function holds it panicked the
+    // RefCell — which aborts the wasm app, so a send with a
+    // grown (multi-line) draft froze the whole UI: no jump to the
+    // bottom, no follow, nothing rendered afterwards. Flag it inside,
+    // run it after the borrow is released.
+    let mut refit_input = false;
     with_pile(|cell| {
         let st = cell.borrow();
         let Some(st) = st.as_ref() else { return };
@@ -4097,7 +4375,18 @@ fn on_vv_event() {
                     // The Timeout must stay alive or it clears itself
                     // (legacy `setTimeout` had the same semantics).
                     let to = gloo_timers::callback::Timeout::new(320, move || {
+                        // v0.5.49: opt out of the CSS `scroll-behavior:
+                        // smooth` (see the note in the layout-restore
+                        // path): a bare write would animate, and every
+                        // frame of that animation reads as unattributed
+                        // viewport motion.
+                        let prev_css =
+                            t2.style().get_property_value("scroll-behavior").ok();
+                        let _ = t2.style().set_property("scroll-behavior", "auto");
                         let _ = t2.set_scroll_top(t2.scroll_height());
+                        if let Some(p) = prev_css {
+                            let _ = t2.style().set_property("scroll-behavior", &p);
+                        }
                         with_pile(|cell| {
                             let s = cell.borrow();
                             if let Some(s) = s.as_ref() {
@@ -4128,10 +4417,13 @@ fn on_vv_event() {
         // v0.5.6: the auto-size input's cap tracks the main panel
         // height — re-fit it when the keyboard lifts/drops the
         // viewport.
-        crate::ui::size_msg_input();
+        refit_input = true;
         sync_shrink(&mut st, &cards);
         sync_last_win(&mut st, &cards);
     });
+    if refit_input {
+        crate::ui::size_msg_input();
+    }
 }
 
 // silence unused-import noise on non-wasm builds

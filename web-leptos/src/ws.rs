@@ -563,7 +563,15 @@ pub fn connect(state: &AppState, session: &str) {
                             });
                         }
                         if sname == session_name {
+                            // v0.5.50: the loop we started from a send is
+                            // the "watch this round" signal itself — the
+                            // engine re-asserts the follow on this edge
+                            // (see pile::on_loop_start).
+                            let was_running = loop_running.get_untracked();
                             loop_running.set(running);
+                            if running && !was_running {
+                                crate::pile::on_loop_start();
+                            }
                             // An unexpected death (non-zero exit or
                             // killed by a signal, not our stop command)
                             // gets a card so the user can see the loop
