@@ -69,11 +69,15 @@
   --shadow-hover: 0 3px 8px rgba(var(--shadow-tint), 0.22), 0 1px 3px rgba(var(--shadow-tint), 0.12), inset 0 1px 0 rgba(var(--shadow-rim), 0.55);
   --groove: inset 0 1px 2px rgba(var(--shadow-tint), 0.20), inset 0 -1px 0 rgba(var(--shadow-rim), 0.50);
   --shadow-pressed: inset 0 2px 4px rgba(var(--shadow-tint), 0.20);
-  /* v0.5.12: scrollbar relief pair — a sunken channel track + a raised
-     thumb, both clearly off the face color (the v0.5.11 thumb was
-     --bg-elev on a --bg face: nearly invisible). */
-  --scroll-track: #d8cfb5;
+  /* v0.5.46: capsule-in-groove scrollbars. The track is a sunken
+     channel painted with the recessed beige of #msg-input (--bg-elev,
+     "输入框凹陷浮雕的浅米色"); the thumb is a raised capsule
+     (--scroll-relief). The v0.5.12 pair (#d8cfb5 / #b7a87f) was
+     replaced: the track read too dark. */
+  --scroll-track: var(--bg-elev);
   --scroll-thumb: #b7a87f;
+  --scroll-groove: inset 1px 0 2px rgba(var(--shadow-tint), 0.30), inset -1px 0 2px rgba(var(--shadow-tint), 0.30), inset 0 1px 2px rgba(var(--shadow-tint), 0.18);
+  --scroll-relief: 0 1px 3px rgba(var(--shadow-tint), 0.50), inset 0 1px 0 rgba(var(--shadow-rim), 0.50), inset 0 -1px 1px rgba(var(--shadow-tint), 0.25);
   --band-h: 46px;
   /* v0.4.3: the opaque deck plate under the pinned pile is gone
      (--deck-h removed). The pile's boundary is now the top edge of
@@ -130,8 +134,12 @@ html[data-theme="dark"] {
      and the amber warn face (paused): dark rice-brown letters read on
      all of them (the v0.5.22 baseline). */
   --on-badge: #100d08;
-  --scroll-track: #0e0c08;
+  --scroll-track: var(--bg-elev);
   --scroll-thumb: #453b2a;
+  --scroll-groove: inset 1px 0 2px rgba(var(--shadow-tint), 0.55), inset -1px 0 2px rgba(var(--shadow-tint), 0.55), inset 0 1px 2px rgba(var(--shadow-tint), 0.40);
+  /* keep the pre-v0.5.46 dark thumb baseline (0.60 drop / 0.08 warm
+     rim) so the dark capsule reads exactly as before. */
+  --scroll-relief: 0 1px 4px rgba(var(--shadow-tint), 0.60), inset 0 1px 0 rgba(var(--shadow-rim), 0.08);
 }
 /* dark-theme selector overrides for call sites whose light-tuned
    alphas are too strong on the dark base (the token values above
@@ -139,12 +147,6 @@ html[data-theme="dark"] {
    hard-coded sites need an override). */
 html[data-theme="dark"] #sidebar { box-shadow: inset 0 1px 0 rgba(255, 235, 200, 0.05); } /* v0.5.44: restored with the sidebar lit-top rim (pre-pipeline dark value) */
 html[data-theme="dark"] #transcript .load-earlier { box-shadow: 0 1px 2px rgba(0, 0, 0, 0.50), inset 0 1px 0 rgba(255, 235, 200, 0.05); } /* v0.5.45: baseline dark value for the load-earlier pill */
-html[data-theme="dark"] #transcript::-webkit-scrollbar-thumb,
-html[data-theme="dark"] #msg-input::-webkit-scrollbar-thumb,
-html[data-theme="dark"] .ev-result::-webkit-scrollbar-thumb,
-html[data-theme="dark"] .ev-args::-webkit-scrollbar-thumb {
-  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.60), inset 0 1px 0 rgba(255, 235, 200, 0.08);
-} /* v0.5.45: baseline dark scrollbar-thumb relief */
 html[data-theme="dark"] #transcript .load-earlier:hover {
   background: var(--bg-elev);
 }
@@ -737,11 +739,27 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
    v0.5.12: contrast pass — the v0.5.11 thumb was face-colored
    (--bg-elev) and nearly invisible; now a dedicated darker pair
    (--scroll-track / --scroll-thumb) with a real raised shadow. */
-#transcript, #msg-input, .ev-result, .ev-args, #session-list, #sidebar-inner, .rp-tree, .rp-code, .rp-img-wrap, .rp-tabbar, .term-host .xterm .xterm-viewport { scrollbar-width: thin; scrollbar-color: var(--scroll-thumb) var(--scroll-track); }
-#transcript::-webkit-scrollbar, #msg-input::-webkit-scrollbar, .ev-result::-webkit-scrollbar, .ev-args::-webkit-scrollbar, #session-list::-webkit-scrollbar, #sidebar-inner::-webkit-scrollbar, .rp-tree::-webkit-scrollbar, .rp-code::-webkit-scrollbar, .rp-img-wrap::-webkit-scrollbar, .term-host .xterm .xterm-viewport::-webkit-scrollbar { width: 10px; height: 10px; background: transparent; }
-#transcript::-webkit-scrollbar-track, #msg-input::-webkit-scrollbar-track, .ev-result::-webkit-scrollbar-track, .ev-args::-webkit-scrollbar-track, #session-list::-webkit-scrollbar-track, #sidebar-inner::-webkit-scrollbar-track, .rp-tree::-webkit-scrollbar-track, .rp-code::-webkit-scrollbar-track, .rp-img-wrap::-webkit-scrollbar-track, .term-host .xterm .xterm-viewport::-webkit-scrollbar-track { background: var(--scroll-track); box-shadow: inset 1px 0 2px rgba(var(--shadow-tint), 0.14), inset -1px 0 2px rgba(var(--shadow-tint), 0.14); }
-/* v0.5.14: the thumb needed a stronger drop shadow to read against the darker track (round-5: "滚动条看不清楚"). */
-#transcript::-webkit-scrollbar-thumb, #msg-input::-webkit-scrollbar-thumb, .ev-result::-webkit-scrollbar-thumb, .ev-args::-webkit-scrollbar-thumb, #session-list::-webkit-scrollbar-thumb, #sidebar-inner::-webkit-scrollbar-thumb, .rp-tree::-webkit-scrollbar-thumb, .rp-code::-webkit-scrollbar-thumb, .rp-img-wrap::-webkit-scrollbar-thumb, .term-host .xterm .xterm-viewport::-webkit-scrollbar-thumb { background: var(--scroll-thumb); border-radius: 6px; border: 2px solid transparent; background-clip: padding-box; box-shadow: 0 1px 4px rgba(var(--shadow-tint), 0.55), inset 0 1px 0 rgba(var(--shadow-rim), 0.45), inset 0 -1px 0 rgba(var(--shadow-tint), 0.30); }
+/* v0.5.46: capsule-in-groove scrollbars, unified over EVERY scroller in
+   the UI. Track = a sunken channel: --scroll-track (the recessed beige
+   of #msg-input, i.e. --bg-elev) carrying the --scroll-groove inset
+   pair. Thumb = a raised capsule: --scroll-thumb on a fully-rounded
+   (999px) pill that floats inside the channel with the --scroll-relief
+   drop/rim. Arrows are gone (::-webkit-scrollbar-button). Firefox gets
+   the equivalent: scrollbar-width: thin (no arrow buttons) +
+   scrollbar-color with the same two tokens. */
+#transcript, #msg-input, .ev-result, .ev-args, #session-list, #sidebar-inner, #status-strip, .ev-tool-args pre, .ev-content pre, #ns-dialog, .ns-browser, #ms-dialog, .ms-fetched, .sess-model-panel, .rp-tree, .rp-code, .rp-img-wrap, .rp-tabbar, .term-host .xterm .xterm-viewport { scrollbar-width: thin; scrollbar-color: var(--scroll-thumb) var(--scroll-track); }
+/* v0.5.47: FIX — the pseudo-element must be repeated on EVERY selector.
+   v0.5.46 wrote each rule as one flat list with :::-webkit-scrollbar(-button/
+   -track/-thumb) on the LAST item only; a flat list does not distribute a
+   pseudo-element, so the rule bound to the plain elements instead: the
+   -button rule's `display: none` erased #sidebar-inner / #session-list /
+   #transcript / #msg-input / #status-strip / #ns-dialog / #ms-dialog, the
+   :::-webkit-scrollbar rule pinned them to 10x10px, and the -thumb rule
+   painted them --scroll-thumb with a 999px radius. Never write it flat. */
+#transcript::-webkit-scrollbar, #msg-input::-webkit-scrollbar, .ev-result::-webkit-scrollbar, .ev-args::-webkit-scrollbar, #session-list::-webkit-scrollbar, #sidebar-inner::-webkit-scrollbar, #status-strip::-webkit-scrollbar, .ev-tool-args pre::-webkit-scrollbar, .ev-content pre::-webkit-scrollbar, #ns-dialog::-webkit-scrollbar, .ns-browser::-webkit-scrollbar, #ms-dialog::-webkit-scrollbar, .ms-fetched::-webkit-scrollbar, .sess-model-panel::-webkit-scrollbar, .rp-tree::-webkit-scrollbar, .rp-code::-webkit-scrollbar, .rp-img-wrap::-webkit-scrollbar, .rp-tabbar::-webkit-scrollbar, .term-host .xterm .xterm-viewport::-webkit-scrollbar { width: 10px; height: 10px; background: var(--scroll-track); }
+#transcript::-webkit-scrollbar-button, #msg-input::-webkit-scrollbar-button, .ev-result::-webkit-scrollbar-button, .ev-args::-webkit-scrollbar-button, #session-list::-webkit-scrollbar-button, #sidebar-inner::-webkit-scrollbar-button, #status-strip::-webkit-scrollbar-button, .ev-tool-args pre::-webkit-scrollbar-button, .ev-content pre::-webkit-scrollbar-button, #ns-dialog::-webkit-scrollbar-button, .ns-browser::-webkit-scrollbar-button, #ms-dialog::-webkit-scrollbar-button, .ms-fetched::-webkit-scrollbar-button, .sess-model-panel::-webkit-scrollbar-button, .rp-tree::-webkit-scrollbar-button, .rp-code::-webkit-scrollbar-button, .rp-img-wrap::-webkit-scrollbar-button, .rp-tabbar::-webkit-scrollbar-button, .term-host .xterm .xterm-viewport::-webkit-scrollbar-button { display: none; width: 0; height: 0; background: transparent; border: none; }
+#transcript::-webkit-scrollbar-track, #msg-input::-webkit-scrollbar-track, .ev-result::-webkit-scrollbar-track, .ev-args::-webkit-scrollbar-track, #session-list::-webkit-scrollbar-track, #sidebar-inner::-webkit-scrollbar-track, #status-strip::-webkit-scrollbar-track, .ev-tool-args pre::-webkit-scrollbar-track, .ev-content pre::-webkit-scrollbar-track, #ns-dialog::-webkit-scrollbar-track, .ns-browser::-webkit-scrollbar-track, #ms-dialog::-webkit-scrollbar-track, .ms-fetched::-webkit-scrollbar-track, .sess-model-panel::-webkit-scrollbar-track, .rp-tree::-webkit-scrollbar-track, .rp-code::-webkit-scrollbar-track, .rp-img-wrap::-webkit-scrollbar-track, .rp-tabbar::-webkit-scrollbar-track, .term-host .xterm .xterm-viewport::-webkit-scrollbar-track { background: var(--scroll-track); box-shadow: var(--scroll-groove); }
+#transcript::-webkit-scrollbar-thumb, #msg-input::-webkit-scrollbar-thumb, .ev-result::-webkit-scrollbar-thumb, .ev-args::-webkit-scrollbar-thumb, #session-list::-webkit-scrollbar-thumb, #sidebar-inner::-webkit-scrollbar-thumb, #status-strip::-webkit-scrollbar-thumb, .ev-tool-args pre::-webkit-scrollbar-thumb, .ev-content pre::-webkit-scrollbar-thumb, #ns-dialog::-webkit-scrollbar-thumb, .ns-browser::-webkit-scrollbar-thumb, #ms-dialog::-webkit-scrollbar-thumb, .ms-fetched::-webkit-scrollbar-thumb, .sess-model-panel::-webkit-scrollbar-thumb, .rp-tree::-webkit-scrollbar-thumb, .rp-code::-webkit-scrollbar-thumb, .rp-img-wrap::-webkit-scrollbar-thumb, .rp-tabbar::-webkit-scrollbar-thumb, .term-host .xterm .xterm-viewport::-webkit-scrollbar-thumb { background: var(--scroll-thumb); border: 2px solid transparent; background-clip: padding-box; border-radius: 999px; margin: 2px 0; box-shadow: var(--scroll-relief); }
 
 /* v0.5.16b: the loop-in-progress marker, in the gap between the last
    card and the input box. Three-ring "breathing" in this theme's
@@ -857,16 +875,21 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
 .ms-path { font-size: 11px; color: var(--text-muted); font-family: "SF Mono", Consolas, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ms-cols { display: flex; gap: 16px; align-items: flex-start; }
 .ms-list { width: 260px; flex: 0 0 260px; display: flex; flex-direction: column; gap: 4px; }
-.ms-row { display: grid; grid-template-columns: 10px 1fr; grid-template-rows: auto auto; column-gap: 6px; padding: 7px 9px; border-radius: 8px; background: var(--bg-elev); border: 1px solid var(--border); cursor: pointer; box-shadow: var(--groove); }
+/* v0.5.47: the left rail is the provider list again — a row per provider
+   carrying its reachability dot, its name and its endpoint. Third column
+   holds the re-test button (spanning both text rows). */
+.ms-row { display: grid; grid-template-columns: 10px 1fr auto; grid-template-rows: auto auto; column-gap: 6px; padding: 7px 9px; border-radius: 8px; background: var(--bg-elev); border: 1px solid var(--border); cursor: pointer; box-shadow: var(--groove); }
 .ms-row:hover { box-shadow: var(--shadow); }
 .ms-row.ms-sel { border-color: var(--accent); box-shadow: var(--shadow); }
-.ms-dot { grid-row: 1 / span 2; align-self: center; width: 8px; height: 8px; border-radius: 50%; background: var(--border); }
-.ms-dot.on { background: var(--accent); }
+.ms-row .ms-mini { grid-row: 1 / span 2; align-self: center; }
 .ms-name { font-size: 13px; font-weight: 700; color: var(--text); overflow: hidden; text-overflow: ellipsis; }
 .ms-sub { font-size: 11px; color: var(--text-muted); font-family: "SF Mono", Consolas, monospace; overflow: hidden; text-overflow: ellipsis; }
 .ms-add { margin-top: 4px; background: var(--bg-elev); color: var(--text); font-size: 12px; padding: 7px 10px; }
 .ms-form { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
 .ms-key-hint { font-size: 11px; color: var(--text-muted); margin-top: -4px; }
+.ms-keyrow { display: flex; gap: 6px; align-items: stretch; }
+.ms-keyrow .ns-input { flex: 1 1 auto; min-width: 0; }
+.ms-keyrow .ns-btn { padding: 6px 12px; }
 .ms-seg { display: flex; flex-wrap: wrap; gap: 4px; margin: 2px 0 4px; }
 .ms-seg button { border: 1px solid var(--border); background: var(--bg-elev); color: var(--text-muted); border-radius: 6px; padding: 4px 9px; font-size: 12px; cursor: pointer; box-shadow: var(--groove); }
 .ms-seg button.on { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
@@ -881,6 +904,44 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
 .ms-banner { margin-top: 12px; padding: 9px 12px; border-radius: 8px; background: var(--bg-elev); border: 1px solid var(--border); color: var(--text); font-size: 12px; white-space: pre-wrap; box-shadow: var(--groove); }
 .ms-notes { margin-top: 8px; font-size: 11px; color: var(--text-muted); white-space: pre-wrap; }
 .ms-effective { margin-top: 6px; font-size: 11px; color: var(--text-muted); font-family: "SF Mono", Consolas, monospace; }
+
+/* v0.5.47: the reachability dot on a left-rail card. Lit = the provider
+   answered the last probe; the muted state means untested (never a claim
+   either way). */
+.ms-card-dot { grid-row: 1 / span 2; align-self: center; width: 10px; height: 10px; border-radius: 50%; background: var(--border); box-shadow: var(--groove); }
+.ms-card-dot.on { background: var(--accent); }
+.ms-card-dot.unknown { background: var(--text-muted); opacity: .45; }
+.ms-mini { border: none; background: var(--bg-panel); color: var(--text-muted); border-radius: 6px; width: 22px; height: 22px; line-height: 1; font-size: 12px; cursor: pointer; box-shadow: var(--shadow); font-family: inherit; }
+.ms-mini:hover { box-shadow: var(--shadow-hover); color: var(--text); }
+.ms-mini:active { transform: translateY(1px); box-shadow: var(--shadow-pressed); }
+.ms-mini-danger:hover { color: var(--danger); }
+.ms-models { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.ms-model { border-radius: 8px; background: var(--bg); border: 1px solid var(--border); padding: 6px 8px; box-shadow: var(--groove); }
+.ms-model-row { display: flex; align-items: center; gap: 6px; }
+.ms-model-id { flex: 1 1 auto; min-width: 0; padding: 6px 10px; font-size: 13px; font-family: "SF Mono", Consolas, monospace; }
+/* v0.5.47: a column, so each label/input pair gets its own line — as a
+   plain block the inline <label>/<input> ran together on one row. */
+.ms-model-details { margin-top: 4px; display: flex; flex-direction: column; }
+.ns-seg { margin-top: 2px; }
+.ms-fetched { display: flex; flex-direction: column; gap: 3px; margin: 4px 0 2px; max-height: 150px; overflow-y: auto; background: var(--bg-elev); border: 1px solid var(--border); border-radius: 8px; padding: 4px; box-shadow: var(--groove); }
+.ms-fetched-opt { justify-content: flex-start; text-align: left; font-size: 12px; font-family: "SF Mono", Consolas, monospace; }
+
+/* v0.5.44: model settings sits at the sidebar's bottom-right. */
+#status-bar #model-settings { margin-left: auto; flex: 0 0 auto; }
+
+/* v0.5.44: the session card's model chip. Raised (--shadow) like the
+   status-strip chips, but on --bg-panel rather than --bg-elev: the card
+   itself turns --bg-elev on hover/active, and a chip of the same color
+   would dissolve into it. */
+.sess-model { display: flex; margin-top: 3px; align-self: flex-start; max-width: 100%; }
+.sess-model-chip { display: inline-flex; align-items: center; gap: 4px; max-width: 100%; background: var(--bg-panel); color: var(--text-muted); border: 1px solid var(--border); border-radius: 9px; padding: 1px 7px; font-size: 11px; font-weight: 700; font-family: inherit; cursor: pointer; box-shadow: var(--shadow); }
+.sess-model-chip:hover:not(:disabled) { box-shadow: var(--shadow-hover); color: var(--text); }
+.sess-model-chip:active:not(:disabled) { transform: translateY(1px); box-shadow: var(--shadow-pressed); }
+.sess-model-chip:disabled { opacity: .55; cursor: default; }
+.smc-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 150px; }
+.sess-model .qsel-chev { font-size: 9px; }
+/* Fixed so the scrollable session list cannot clip it. */
+.sess-model-panel { position: fixed; left: auto; right: auto; bottom: auto; max-height: 280px; overflow-y: auto; max-width: 280px; }
 
 /* explicit type scale for .md content: without font-size/weight rules the
    headings fall back to UA defaults (h1=2em, h2=1.5em, h3≈1.17em on the

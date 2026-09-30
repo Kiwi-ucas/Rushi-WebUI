@@ -30,6 +30,26 @@ pub struct EventsPage {
     pub total_rounds: u64,
 }
 
+/// v0.5.44: the model entry the user picked for this session (absent =
+/// follow the config's active entry).
+pub const MODEL_MARKER: &str = ".model";
+/// v0.5.44: the entry the webui actually pinned when it launched the last
+/// loop — the only record of "what this session last ran with", since the
+/// kernel writes no model identity into the event log.
+pub const MODEL_USED_MARKER: &str = ".model.used";
+/// v0.5.45: this session's reasoning effort, overriding the entry's own
+/// (the kernel keeps effort per entry, so the webui pins it in the
+/// session config it generates at launch).
+pub const EFFORT_MARKER: &str = ".effort";
+
+/// Read a one-line marker file, trimmed; `None` when absent or empty.
+pub fn read_marker(session_dir: &Path, name: &str) -> Option<String> {
+    std::fs::read_to_string(session_dir.join(name))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// The session's recorded working directory, as a plain string.
 ///
 /// The kernel writes `<session>/cwd` (no dot) and rewrites it on every
@@ -39,12 +59,7 @@ pub struct EventsPage {
 /// session that never ran a loop carries only the dotted name. Read the
 /// kernel's marker first and fall back to ours.
 pub fn read_cwd_marker(session_dir: &Path) -> Option<String> {
-    ["cwd", ".cwd"].iter().find_map(|name| {
-        std::fs::read_to_string(session_dir.join(name))
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-    })
+    read_marker(session_dir, "cwd").or_else(|| read_marker(session_dir, ".cwd"))
 }
 
 /// Manages session directories and their `events.jsonl` logs.
@@ -79,6 +94,8 @@ impl SessionManager {
     pub async fn list(&self) -> Vec<SessionInfo> {
         let root = self.sessions_root().to_path_buf();
         let mut out = Vec::new();
+        // Read once for every session's fallback rather than per row.
+        let active_model = crate::modelcfg::active_model(&self.cfg);
 
         let mut entries = match fs::read_dir(&root).await {
             Ok(e) => e,
@@ -107,6 +124,19 @@ impl SessionManager {
             // missing/stale marker is fine (None), unlike cwd() which
             // also validates the dir still exists.
             let cwd = read_cwd_marker(&dir);
+            // v0.5.44: what this session runs with. `.model.used` is what
+            // the webui pinned at the last launch (the kernel logs no
+            // model identity, so this is the only record), `.model` is
+            // the pending choice for the next launch.
+            // The pending choice first: while a loop runs it is what the
+            // loop was pinned to (the chip is disabled mid-run, so the
+            // two cannot disagree), and while idle it is what the next
+            // launch will use. `.model.used` then reports the entry the
+            // LAST launch used, which can differ from the global active
+            // if that changed afterwards.
+            let model = read_marker(&dir, MODEL_MARKER)
+                .or_else(|| read_marker(&dir, MODEL_USED_MARKER))
+                .or_else(|| active_model.clone());
 
             out.push(SessionInfo {
                 name,
@@ -114,6 +144,8 @@ impl SessionManager {
                 last_modified,
                 created: Self::created_ts(&dir, &ev_path).await,
                 cwd,
+                model,
+                effort: read_marker(&dir, EFFORT_MARKER),
             });
         }
 
@@ -331,6 +363,49 @@ impl SessionManager {
         read_cwd_marker(&self.session_dir(id))
     }
 
+    /// v0.5.44: the model entry this session was told to run with, or
+    /// `None` to follow the config's active entry.
+    pub fn model_choice(&self, id: &str) -> Option<String> {
+        read_marker(&self.session_dir(id), MODEL_MARKER)
+    }
+
+    /// v0.5.45: record (or, with `None`, clear) this session's reasoning
+    /// effort. Applied in the session config the loop is pinned to, so it
+    /// takes effect the next time the loop starts.
+    pub async fn set_effort(&self, id: &str, effort: Option<&str>) -> Result<()> {
+        validate_session_name(id)?;
+        self.ensure_session(id).await?;
+        let path = self.session_dir(id).join(EFFORT_MARKER);
+        match effort.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(e) => fs::write(&path, e.as_bytes()).await?,
+            None => {
+                let _ = fs::remove_file(&path).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Set (or, with `None`, clear) this session's model entry. The
+    /// choice takes effect the next time the session's loop starts: the
+    /// loop pins a config whose `[active]` is this entry, so the loop and
+    /// every stage binary agree (see `modelcfg::session_config_with_active`).
+    pub async fn set_model(&self, id: &str, model: Option<&str>) -> Result<()> {
+        validate_session_name(id)?;
+        self.ensure_session(id).await?;
+        let path = self.session_dir(id).join(MODEL_MARKER);
+        match model.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(m) => fs::write(&path, m.as_bytes()).await?,
+            None => {
+                let _ = fs::remove_file(&path).await;
+                // "Follow the global entry again" also drops the record of
+                // the last run, so the card shows the entry the next
+                // launch will actually use.
+                let _ = fs::remove_file(self.session_dir(id).join(MODEL_USED_MARKER)).await;
+            }
+        }
+        Ok(())
+    }
+
     /// Create a session and optionally record its working directory.
     /// `cwd`, when non-empty, must be an existing directory.
     pub async fn create(&self, id: &str, cwd: Option<&str>) -> Result<()> {
@@ -455,6 +530,15 @@ pub struct SessionInfo {
     /// project. `None` when the marker is absent or empty.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// v0.5.44: the model entry this session runs with — the entry the
+    /// last loop was pinned to (`.model.used`), else the pending choice
+    /// (`.model`), else the global active entry. `None` only when the
+    /// config cannot be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// v0.5.45: this session's reasoning effort override, if it has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
 }
 
 /// Tail `path` for new lines and forward them over `tx`.

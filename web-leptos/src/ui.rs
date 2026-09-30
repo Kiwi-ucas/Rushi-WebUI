@@ -227,6 +227,156 @@ fn model_settings_icon() -> AnyView {
     .into_any()
 }
 
+/// v0.5.44: the session card's model chip — the entry this session runs
+/// with, plus a popup styled after the input box's steer selector to
+/// change it. The chip is disabled while the session's loop runs: the
+/// choice applies at the next launch, so changing it mid-run would only
+/// mislead (and, worse, make the chip disagree with what is running).
+#[component]
+fn SessionModelChip(
+    state: AppState,
+    name: String,
+    model: Option<String>,
+    running: Signal<bool>,
+) -> impl IntoView {
+    let open = RwSignal::new(false);
+    // The popup is positioned `fixed` at the click point (like #sess-menu):
+    // the card lives in `#session-list`, whose `overflow-y:auto` would
+    // clip an absolutely positioned panel.
+    let pos = RwSignal::new((0.0_f64, 0.0_f64));
+    let names = state.model_names;
+    // Signals, not plain Strings: a `move` closure nested in the `view!`
+    // body would otherwise move them out of the view closure, which must
+    // stay `Fn`.
+    let current = RwSignal::new(model.unwrap_or_default());
+    let session_name = RwSignal::new(name);
+    let label = move || {
+        let c = current.get();
+        if c.is_empty() {
+            "auto".to_string()
+        } else {
+            c
+        }
+    };
+    let title = move || {
+        let l = label();
+        if running.get() {
+            format!("model: {l} — locked while the loop runs")
+        } else {
+            format!("model: {l} — click to change")
+        }
+    };
+
+    view! {
+        <div class="sess-model">
+            <button
+                class="sess-model-chip"
+                disabled=move || running.get()
+                title=title
+                on:click=move |e: MouseEvent| {
+                    e.stop_propagation();
+                    // Open above the chip, or below when it sits too high.
+                    let y = if e.client_y() as f64 > 260.0 {
+                        e.client_y() as f64 - 8.0
+                    } else {
+                        e.client_y() as f64 + 22.0
+                    };
+                    pos.set((e.client_x() as f64, y));
+                    open.update(|o| *o = !*o);
+                }
+            >
+                <span class="smc-text">{ move || label() }</span>
+                <span class="qsel-chev">{ "\u{25be}" }</span>
+            </button>
+            <Show when=move || open.get() fallback=|| ()>
+                <div
+                    class="qsel-backdrop"
+                    on:click=move |e: MouseEvent| {
+                        e.stop_propagation();
+                        open.set(false);
+                    }
+                />
+                <div
+                    class="qsel-panel sess-model-panel"
+                    style=move || {
+                        let (x, y) = pos.get();
+                        format!("left:{x:.0}px; top:{y:.0}px;")
+                    }
+                    on:click=move |e: MouseEvent| e.stop_propagation()
+                >
+                    { move || {
+                        let cur = current.get();
+                        let session_base = session_name.get();
+                        let mut opts: Vec<AnyView> = names
+                            .get()
+                            .into_iter()
+                            .map(|n| {
+                                let sel = n == cur;
+                                let value = n.clone();
+                                let session = session_base.clone();
+                                let st = state;
+                                view! {
+                                    <button
+                                        class="qsel-opt"
+                                        aria-selected=sel
+                                        on:click=move |_| {
+                                            let session = session.clone();
+                                            let value = value.clone();
+                                            spawn_local(async move {
+                                                let _ = api::set_session_model(
+                                                    &session,
+                                                    Some(value.as_str()),
+                                                )
+                                                    .await;
+                                                if let Ok(list) = api::load_sessions().await {
+                                                    st.sessions.set(list);
+                                                }
+                                            });
+                                            open.set(false);
+                                        }
+                                    >
+                                        <span class="qsel-tick">{ "\u{2713}" }</span>
+                                        { n.clone() }
+                                    </button>
+                                }
+                                .into_any()
+                            })
+                            .collect();
+                        {
+                            let session = session_base.clone();
+                            let st = state;
+                            let sel = cur.is_empty();
+                            opts.push(
+                                view! {
+                                    <button
+                                        class="qsel-opt"
+                                        aria-selected=sel
+                                        on:click=move |_| {
+                                            let session = session.clone();
+                                            spawn_local(async move {
+                                                let _ = api::set_session_model(&session, None).await;
+                                                if let Ok(list) = api::load_sessions().await {
+                                                    st.sessions.set(list);
+                                                }
+                                            });
+                                            open.set(false);
+                                        }
+                                    >
+                                        <span class="qsel-tick">{ "\u{2713}" }</span>
+                                        { "follow global" }
+                                    </button>
+                                }
+                                .into_any(),
+                            );
+                        }
+                        opts
+                    } }
+                </div>
+            </Show>
+        </div>
+    }
+}
+
 // ── sidebar ordering (v0.5.30: created / output / custom) ─────────
 /// Read the persisted ordering mode + custom order. Any value other
 /// than "created"/"output"/"custom" normalizes to "output" (the
@@ -808,16 +958,6 @@ pub fn Sidebar(state: AppState) -> impl IntoView {
                         <span class="sb-version">{ WEBUI_VERSION }</span>
                     </h1>
                     <div class="sb-actions">
-                        // v0.5.42: model settings (provider entries,
-                        // active model, global defaults) — same global,
-                        // non-session-scoped slot as the theme button.
-                        <button
-                            id="model-settings"
-                            title="model settings"
-                            on:click=move |_| state.model_open.set(true)
-                        >
-                            { model_settings_icon() }
-                        </button>
                         <button
                             id="theme-toggle"
                             title=theme_title
@@ -1027,6 +1167,12 @@ pub fn Sidebar(state: AppState) -> impl IntoView {
                         children=move |s| {
                             let s_name = s.name.clone();
                             let s_ts = s.last_modified;
+                            let s_model = s.model.clone();
+                            // v0.5.44: the chip's own clones (its name goes
+                            // into a derived signal, its model into the
+                            // component).
+                            let chip_name = s_name.clone();
+                            let chip_signal_name = s_name.clone();
                             // One owned clone per `move` handler: a String
                             // moves into only one closure, and the click +
                             // three drag handlers each capture it.
@@ -1167,6 +1313,18 @@ pub fn Sidebar(state: AppState) -> impl IntoView {
                                             }).unwrap_or_else(|| "no events".to_string())
                                         } }
                                     </span>
+                                    <SessionModelChip
+                                        state=state
+                                        name=chip_name
+                                        model=s_model
+                                        running=Signal::derive(move || {
+                                            let n = chip_signal_name.as_str();
+                                            state.looping_sessions.get().contains(n)
+                                                || (state.active_session.get().as_deref()
+                                                    == Some(n)
+                                                    && state.loop_running.get())
+                                        })
+                                    />
                                     <button
                                         class="sess-more"
                                         title="session actions"
@@ -1202,6 +1360,15 @@ pub fn Sidebar(state: AppState) -> impl IntoView {
                             } }
                         </span>
                     </Show>
+                    // v0.5.44: model settings, pinned to the sidebar's
+                    // bottom-right (margin-left:auto in CSS).
+                    <button
+                        id="model-settings"
+                        title="model settings"
+                        on:click=move |_| state.model_open.set(true)
+                    >
+                        { model_settings_icon() }
+                    </button>
                 </div>
             </div>
         </aside>
@@ -1648,6 +1815,11 @@ pub fn NewSessionDialog(state: AppState) -> impl IntoView {
     let browse_err = RwSignal::new(Option::<String>::None);
     let create_err = RwSignal::new(Option::<String>::None);
     let busy = RwSignal::new(false);
+    // v0.5.45: which model and thinking effort this session starts with.
+    // Empty model = follow the config's active entry.
+    let model = RwSignal::new(String::new());
+    let effort = RwSignal::new(String::new());
+    let entries = RwSignal::new(Vec::<crate::model::ModelEntry>::new());
 
     // Browse into a directory: updates the cwd field + the dir list.
     let browse_to = move |path: Option<String>| {
@@ -1671,6 +1843,15 @@ pub fn NewSessionDialog(state: AppState) -> impl IntoView {
         if let Some(def) = open.get() {
             name.set(String::new());
             create_err.set(None);
+            model.set(String::new());
+            effort.set(String::new());
+            // The entries feed both the model picker and (through their
+            // model_id) the level list the effort picker offers.
+            spawn_local(async move {
+                if let Ok(v) = api::load_model().await {
+                    entries.set(v.entries);
+                }
+            });
             let def = if def.is_empty() { None } else { Some(def) };
             browse_to(def);
         }
@@ -1694,10 +1875,18 @@ pub fn NewSessionDialog(state: AppState) -> impl IntoView {
         }
         let c = cwd.get();
         let cwd_opt = if c.trim().is_empty() { None } else { Some(c.trim().to_string()) };
+        // v0.5.45: the model and effort picked here become the session's
+        // markers; empty = follow the config's active entry.
+        let m = model.get();
+        let model_opt = if m.trim().is_empty() { None } else { Some(m.trim().to_string()) };
+        let e = effort.get();
+        let effort_opt = if e.trim().is_empty() { None } else { Some(e.trim().to_string()) };
         busy.set(true);
         create_err.set(None);
         spawn_local(async move {
-            match api::create_session(&n, cwd_opt.as_deref()).await {
+            match api::create_session(&n, cwd_opt.as_deref(), model_opt.as_deref(), effort_opt.as_deref())
+                .await
+            {
                 Ok(()) => {
                     open.set(None);
                     select_session(state, &n);
@@ -1714,11 +1903,71 @@ pub fn NewSessionDialog(state: AppState) -> impl IntoView {
                 <div id="ns-dialog" on:click=move |e: MouseEvent| e.stop_propagation()>
                     <div class="ns-title">{ "New Session" }</div>
 
-                    <label class="ns-label" for="ns-name">{ "名称 Name" }</label>
+                    <label class="ns-label" for="ns-name">{ "Name" }</label>
                     <input id="ns-name" class="ns-input" placeholder="session name" bind:value=name />
 
-                    <label class="ns-label" for="ns-cwd">{ "工作目录 Working directory" }</label>
+                    <label class="ns-label" for="ns-cwd">{ "Working directory" }</label>
                     <input id="ns-cwd" class="ns-input" placeholder="/path/to/project" bind:value=cwd />
+
+                    // v0.5.45: model + thinking effort for THIS session.
+                    // The model panel deliberately has no global default.
+                    <label class="ns-label">{ "model" }</label>
+                    <div class="ms-seg ns-seg">
+                        <button
+                            class:on=move || model.get().is_empty()
+                            on:click=move |_| model.set(String::new())
+                        >{ "follow config" }</button>
+                        { move || {
+                            entries
+                                .get()
+                                .into_iter()
+                                .map(|e| {
+                                    let name = e.name.clone();
+                                    let n2 = name.clone();
+                                    view! {
+                                        <button
+                                            class:on=move || model.get() == n2
+                                            on:click=move |_| {
+                                                let name = name.clone();
+                                                model.set(name);
+                                                effort.set(String::new());
+                                            }
+                                        >{ e.name.clone() }</button>
+                                    }
+                                })
+                                .collect_view()
+                        } }
+                    </div>
+                    <label class="ns-label">{ "thinking effort" }</label>
+                    <div class="ms-seg ns-seg">
+                        <button
+                            class:on=move || effort.get().is_empty()
+                            on:click=move |_| effort.set(String::new())
+                        >{ "inherit" }</button>
+                        { move || {
+                            let id = entries
+                                .get()
+                                .into_iter()
+                                .find(|e| e.name == model.get())
+                                .and_then(|e| e.model_id)
+                                .unwrap_or_default();
+                            crate::ms::effort_choices(&id)
+                                .into_iter()
+                                .map(|v| {
+                                    let vv = v.to_string();
+                                    view! {
+                                        <button
+                                            class:on=move || effort.get() == vv
+                                            on:click=move |_| {
+                                                let v = v.to_string();
+                                                effort.set(v);
+                                            }
+                                        >{ v }</button>
+                                    }
+                                })
+                                .collect_view()
+                        } }
+                    </div>
 
                     <div class="ns-browser">
                         <div class="ns-dir ns-up" on:click=move |_| browse_to(parent.get())>

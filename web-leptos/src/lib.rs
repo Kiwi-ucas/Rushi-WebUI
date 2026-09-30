@@ -73,6 +73,17 @@ fn App() -> impl IntoView {
         });
     }
 
+    // v0.5.44: the model entry names behind the session-card popup. Read
+    // once at mount; the settings panel refreshes the list after a save.
+    {
+        let st = state;
+        spawn_local(async move {
+            if let Ok(names) = api::load_model_names().await {
+                st.model_names.set(names);
+            }
+        });
+    }
+
     // Background: initial session load + periodic polling (port of JS setInterval loops)
     let s1 = state;
     spawn_local(async move {

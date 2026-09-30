@@ -33,7 +33,7 @@
          pinned tool) cannot validate them. Pass the feature gates so a
          truncsat-capable optimizer accepts the build. (Bump trunk's
          wasm-opt tool to ≥ version_130 for a clean toolchain match.) -->
-    <link data-trunk rel="rust" data-type="main" data-wasm-opt-params="--enable-bulk-memory --enable-nontrapping-float-to-int" />
+    <link data-trunk rel="rust" data-type="main" data-wasm-opt="z" data-wasm-opt-params="--enable-bulk-memory --enable-nontrapping-float-to-int" />
   </head>
   <body>
     <!-- The app mounts INTO #mount-root (the element stays, its
@@ -47,10 +47,9 @@
       // A genuine WASM failure (blocked fetch, 404, bad build,
       // instantiation error) rejects the module-level init promise;
       // surface that immediately instead of waiting for the slow-load
-      // timeout. A slow download (e.g. the 8 MB debug WASM over a
-      // remote tailnet link on a phone) just takes longer: keep the
-      // "loading…" state until the longer timeout so it does not read
-      // as a failure.
+      // timeout. A slow download (a debug WASM over a long-haul link)
+      // just takes longer: keep the "loading…" state until the longer
+      // timeout so it does not read as a failure.
       var bootFailed = false;
       function showBootError(title, detail) {
         if (window.__rushiMounted || bootFailed) return;
@@ -82,9 +81,10 @@
       setTimeout(function () {
         showBootError(
           'still loading…',
-          'the WASM bundle has not finished loading. The debug build ' +
-          'is ~8 MB — on a slow connection this can take a while. ' +
-          'Check the console for a fetch or instantiation error'
+          'the WASM bundle has not finished loading — on a slow ' +
+          'connection this can take a while. Check the console for a ' +
+          'fetch or instantiation error. Serving the release build ' +
+          '(trunk build --release) makes this ~10x smaller'
         );
       }, 30000);
     </script>

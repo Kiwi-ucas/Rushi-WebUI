@@ -120,10 +120,16 @@ pub struct ModelSettings {
     /// The `kernelsync/config.local.toml` mirror, when one was found.
     #[serde(default)]
     pub mirror_path: Option<String>,
-    /// For every `api_key_env` in use: is that variable present in the
-    /// webui server's environment? The key itself never reaches the
+    /// For every `api_key_env` in use: is a key available for it — from
+    /// the `config.secrets.toml` file the panel writes, or from the
+    /// webui process's own environment? The key itself never reaches the
     /// browser — only this yes/no.
     pub key_env_present: BTreeMap<String, bool>,
+    /// The subset of those that come from `config.secrets.toml` (a key
+    /// pasted in the panel), so the form can offer "clear" for exactly
+    /// those.
+    #[serde(default)]
+    pub key_env_stored: BTreeMap<String, bool>,
     /// `model --describe` output: the values actually in effect, resolved
     /// by the kernel's own code rather than re-derived here.
     #[serde(default)]
@@ -170,7 +176,11 @@ pub struct ProbeResult {
 fn config_path(cfg: &WebConfig) -> Result<PathBuf, String> {
     cfg.config_path
         .clone()
-        .ok_or_else(|| "webui 启动时没有 --config，无法定位内核 config.toml".to_string())
+        .ok_or_else(|| {
+            "the webui was started without --config, so the kernel config.toml cannot be \
+             located"
+                .to_string()
+        })
 }
 
 /// The `kernelsync/config.local.toml` mirror that `sync.sh` restores the
@@ -208,10 +218,10 @@ fn mirror_path(config: &Path) -> Option<PathBuf> {
 pub fn load(cfg: &WebConfig) -> Result<ModelSettings, String> {
     let path = config_path(cfg)?;
     let text = std::fs::read_to_string(&path)
-        .map_err(|e| format!("读取 {} 失败: {e}", path.display()))?;
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let doc: toml::Value = text
         .parse()
-        .map_err(|e| format!("config.toml 解析失败: {e}"))?;
+        .map_err(|e| format!("config.toml does not parse: {e}"))?;
 
     let model = doc.get("model").and_then(|m| m.as_table());
     let entries: Vec<ModelEntry> = model
@@ -240,29 +250,34 @@ pub fn load(cfg: &WebConfig) -> Result<ModelSettings, String> {
         .unwrap_or_default()
         .to_string();
 
+    let secrets = load_secrets(cfg);
     let mut key_env_present = BTreeMap::new();
+    let mut key_env_stored = BTreeMap::new();
     for e in &entries {
         let name = e
             .api_key_env
             .clone()
             .unwrap_or_else(|| "MODEL_API_KEY".to_string());
-        key_env_present.insert(name.clone(), std::env::var(&name).is_ok());
+        let stored = secrets.contains_key(&name);
+        key_env_stored.insert(name.clone(), stored);
+        key_env_present.insert(name.clone(), stored || std::env::var(&name).is_ok());
     }
 
     let mut notes = Vec::new();
     if let Some(m) = model {
         if m.contains_key("api") {
             notes.push(
-                "`[model] api` 是本机配置里的**死键**：内核从不读它，`bin/model` 永远先发 \
-                 /v1/responses，只有 404/405 才回退 /v1/chat/completions。面板保留该键不动。"
+                "`[model] api` is a dead key here: the kernel never reads it — `bin/model` always \
+                 posts to /v1/responses and only falls back to /v1/chat/completions on 404/405. \
+                 The panel leaves it untouched."
                     .to_string(),
             );
         }
     }
     if !active.is_empty() && !entries.iter().any(|e| e.name == active) {
         notes.push(format!(
-            "`[active] model = \"{active}\"` 在 [model] 里找不到对应条目 —— 内核会**静默**退回\
-             全部默认值（base_url 127.0.0.1:8080 等）。"
+            "`[active] model = \"{active}\"` names no [model] entry — the kernel silently falls \
+             back to every built-in default (base_url 127.0.0.1:8080 and so on)."
         ));
     }
 
@@ -276,6 +291,7 @@ pub fn load(cfg: &WebConfig) -> Result<ModelSettings, String> {
         config_path: path.display().to_string(),
         mirror_path: mirror.map(|p| p.display().to_string()),
         key_env_present,
+        key_env_stored,
         effective,
         notes,
     })
@@ -365,7 +381,7 @@ fn describe(config: &Path) -> Option<serde_json::Value> {
 /// original file's permissions carried over. The loop's stage binaries
 /// read this file on every spawn, so a half-written config must never be
 /// observable.
-fn write_atomic(path: &Path, content: &str) -> Result<(), String> {
+pub(crate) fn write_atomic(path: &Path, content: &str) -> Result<(), String> {
     use std::io::Write;
 
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
@@ -376,31 +392,31 @@ fn write_atomic(path: &Path, content: &str) -> Result<(), String> {
     let tmp = dir.join(format!(".{file_name}.tmp"));
 
     let mut f = std::fs::File::create(&tmp)
-        .map_err(|e| format!("写 {} 失败: {e}", tmp.display()))?;
+        .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
     f.write_all(content.as_bytes())
         .and_then(|_| f.sync_all())
-        .map_err(|e| format!("写 {} 失败: {e}", tmp.display()))?;
+        .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
     drop(f);
     if let Ok(md) = std::fs::metadata(path) {
         let _ = std::fs::set_permissions(&tmp, md.permissions());
     }
-    std::fs::rename(&tmp, path).map_err(|e| format!("替换 {} 失败: {e}", path.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("cannot replace {}: {e}", path.display()))?;
     Ok(())
 }
 
 pub fn save(cfg: &WebConfig, next: &ModelSettings) -> Result<SaveOutcome, String> {
     let path = config_path(cfg)?;
     let original = std::fs::read_to_string(&path)
-        .map_err(|e| format!("读取 {} 失败: {e}", path.display()))?;
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let before: toml::Value = original
         .parse()
-        .map_err(|e| format!("config.toml 解析失败（未写入）: {e}"))?;
+        .map_err(|e| format!("config.toml does not parse (nothing written): {e}"))?;
 
     validate(next, &before)?;
 
     let mut doc: DocumentMut = original
         .parse()
-        .map_err(|e| format!("config.toml 解析失败（未写入）: {e}"))?;
+        .map_err(|e| format!("config.toml does not parse (nothing written): {e}"))?;
 
     // Names of the sub-tables present right now (the global scalar keys
     // live in the same table and must not be mistaken for entries).
@@ -419,7 +435,7 @@ pub fn save(cfg: &WebConfig, next: &ModelSettings) -> Result<SaveOutcome, String
         let model = doc
             .get_mut("model")
             .and_then(|i| i.as_table_mut())
-            .ok_or_else(|| "config.toml 缺少 [model] 表".to_string())?;
+            .ok_or_else(|| "config.toml has no [model] table".to_string())?;
 
         // Globals (only the five the kernel falls back to).
         set_opt_int(model, "max_output_tokens", next.globals.max_output_tokens);
@@ -448,7 +464,7 @@ pub fn save(cfg: &WebConfig, next: &ModelSettings) -> Result<SaveOutcome, String
             let t = model
                 .get_mut(&e.name)
                 .and_then(|i| i.as_table_mut())
-                .ok_or_else(|| format!("无法写入 [model.\"{}\"]", e.name))?;
+                .ok_or_else(|| format!("cannot write [model.\"{}\"]", e.name))?;
             set_opt_str(t, "model_id", e.model_id.as_deref());
             let base_url = e.base_url.as_deref().map(normalize_base_url);
             set_opt_str(t, "base_url", base_url.as_deref());
@@ -485,7 +501,7 @@ pub fn save(cfg: &WebConfig, next: &ModelSettings) -> Result<SaveOutcome, String
     // edit above, not user error — the original file is untouched.
     let after: toml::Value = rendered
         .parse()
-        .map_err(|e| format!("内部错误：渲染后的配置无法解析（未写入）: {e}"))?;
+        .map_err(|e| format!("internal error: the rendered config does not parse (nothing written): {e}"))?;
     let names: Vec<String> = after
         .get("model")
         .and_then(|m| m.as_table())
@@ -498,14 +514,15 @@ pub fn save(cfg: &WebConfig, next: &ModelSettings) -> Result<SaveOutcome, String
         .unwrap_or_default();
     if !names.iter().any(|n| n == &next.active) {
         return Err(format!(
-            "内部错误：`[active] model = \"{}\"` 在 [model] 中没有对应条目（未写入）",
+            "internal error: `[active] model = \"{}\"` names no [model] entry (nothing written)",
             next.active
         ));
     }
     for (section, key) in LEGACY_KEYS {
         if after.get(section).and_then(|s| s.get(key)).is_some() {
             return Err(format!(
-                "内部错误：配置里出现 legacy 键 [{section}] {key}（内核会 exit(1)，未写入）"
+                "internal error: the config would carry the legacy key [{section}] {key}, \
+                 which makes the kernel exit(1) (nothing written)"
             ));
         }
     }
@@ -515,7 +532,7 @@ pub fn save(cfg: &WebConfig, next: &ModelSettings) -> Result<SaveOutcome, String
     // `config*.toml` keeps it untracked without touching the kernel tree.
     let backup = path.with_extension("bak.toml");
     std::fs::copy(&path, &backup)
-        .map_err(|e| format!("备份 {} 失败（未写入）: {e}", backup.display()))?;
+        .map_err(|e| format!("cannot back up to {} (nothing written): {e}", backup.display()))?;
 
     let mut mirror_written = None;
     if let Some(mirror) = mirror_path(&path) {
@@ -528,7 +545,8 @@ pub fn save(cfg: &WebConfig, next: &ModelSettings) -> Result<SaveOutcome, String
                 return Ok(SaveOutcome {
                     needs_loop_restart: diffs(&before, &after),
                     warnings: vec![format!(
-                        "内核 config 已保存，但镜像 {} 写入失败：{e}（下次 sync.sh 可能回滚这次改动）",
+                        "the kernel config was saved, but the mirror {} could not be written: \
+                         {e} (the next sync.sh may roll this change back)",
                         mirror.display()
                     )],
                     backup: Some(backup.display().to_string()),
@@ -545,8 +563,9 @@ pub fn save(cfg: &WebConfig, next: &ModelSettings) -> Result<SaveOutcome, String
         if let Some(eff) = &e.reasoning_effort {
             if !EFFORT_VALUES.contains(&eff.as_str()) {
                 warnings.push(format!(
-                    "条目 {} 的 reasoning_effort = \"{eff}\" 不在内核认的取值 [{}] 里；\
-                     内核不校验，会原样发给服务端",
+                    "entry {} sets reasoning_effort = \"{eff}\", which is not one of the values \
+                     the kernel knows [{}]; the kernel does not validate it and sends it to the \
+                     provider verbatim",
                     e.name,
                     EFFORT_VALUES.join(", ")
                 ));
@@ -564,14 +583,15 @@ pub fn save(cfg: &WebConfig, next: &ModelSettings) -> Result<SaveOutcome, String
 
 fn validate(next: &ModelSettings, before: &toml::Value) -> Result<(), String> {
     if next.entries.is_empty() {
-        return Err("至少要保留一个模型条目".to_string());
+        return Err("keep at least one model entry".to_string());
     }
     if next.active.trim().is_empty() {
-        return Err("活跃模型不能为空".to_string());
+        return Err("the active model must not be empty".to_string());
     }
     if !next.entries.iter().any(|e| e.name == next.active) {
         return Err(format!(
-            "活跃模型 \"{}\" 不在条目列表里；内核会静默退回全部默认值",
+            "active model \"{}\" is not one of the entries; the kernel would silently fall back \
+             to every built-in default",
             next.active
         ));
     }
@@ -590,21 +610,22 @@ fn validate(next: &ModelSettings, before: &toml::Value) -> Result<(), String> {
         .unwrap_or_default();
     for e in &next.entries {
         if e.name.trim().is_empty() {
-            return Err("模型条目名不能为空".to_string());
+            return Err("an entry name must not be empty".to_string());
         }
         if e.name.contains('"') || e.name.contains('\n') {
-            return Err(format!("模型条目名含非法字符: {}", e.name));
+            return Err(format!("entry name has an illegal character: {}", e.name));
         }
         if scalar_keys.contains(&e.name) || GLOBAL_KEYS.contains(&e.name.as_str()) {
             return Err(format!(
-                "条目名 \"{}\" 与 [model] 下的全局键同名，TOML 里无法共存；请换一个名字",
+                "entry \"{}\" collides with a global [model] key — TOML cannot hold both; pick \
+                 another name",
                 e.name
             ));
         }
         if let Some(url) = &e.base_url {
             if !url.trim().is_empty() && !url.starts_with("http://") && !url.starts_with("https://") {
                 return Err(format!(
-                    "条目 {} 的 base_url 必须以 http:// 或 https:// 开头",
+                    "entry {} needs a base_url starting with http:// or https://",
                     e.name
                 ));
             }
@@ -628,8 +649,8 @@ fn diffs(before: &toml::Value, after: &toml::Value) -> Vec<String> {
     let new_active = s(after, "active", "model").unwrap_or_default();
     if old_active != new_active {
         out.push(format!(
-            "活跃模型已切换（{old_active} → {new_active}）：循环在启动时快照活跃条目，\
-             需重启会话 loop 才一致"
+            "active model switched ({old_active} -> {new_active}): a loop snapshots the active \
+             entry at startup, so restart the session's loop"
         ));
     }
 
@@ -647,12 +668,13 @@ fn diffs(before: &toml::Value, after: &toml::Value) -> Vec<String> {
     let (b, a) = (entries(before), entries(after));
     for (name, av) in &a {
         match b.get(name) {
-            None => out.push(format!("新增了模型条目 {name}")),
+            None => out.push(format!("added model entry {name}")),
             Some(bv) => {
                 if bv.get("context_tokens") != av.get("context_tokens") {
                     out.push(format!(
-                        "条目 {name} 的 context_tokens 已修改：循环启动时按旧窗口算压缩阈值，\
-                         需重启会话 loop"
+                        "entry {name} changed context_tokens: the loop computes its compaction \
+                         threshold from the window it snapshotted at startup, so restart the \
+                         session's loop"
                     ));
                 }
             }
@@ -660,7 +682,7 @@ fn diffs(before: &toml::Value, after: &toml::Value) -> Vec<String> {
     }
     for name in b.keys() {
         if !a.contains_key(name) {
-            out.push(format!("删除了模型条目 {name}"));
+            out.push(format!("removed model entry {name}"));
         }
     }
     out
@@ -712,14 +734,14 @@ fn set_opt_bool(t: &mut Table, key: &str, v: Option<bool>) {
 /// Probe a candidate provider endpoint the way the kernel will use it:
 /// `GET /v1/models` first (free), then a one-token `POST /v1/responses`,
 /// then the `/v1/chat/completions` fallback the kernel takes on 404/405.
-pub async fn probe(req: &ProbeRequest) -> ProbeResult {
+pub async fn probe(cfg: &WebConfig, req: &ProbeRequest) -> ProbeResult {
     let base = req.base_url.trim().trim_end_matches('/').to_string();
     if base.is_empty() {
         return ProbeResult {
             ok: false,
             endpoint: String::new(),
             status: None,
-            detail: "base_url 为空".to_string(),
+            detail: "base_url is empty".to_string(),
         };
     }
     let key = match req
@@ -728,18 +750,20 @@ pub async fn probe(req: &ProbeRequest) -> ProbeResult {
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        Some(name) => match std::env::var(name) {
-            Ok(v) => v,
+        Some(name) => match key_for(cfg, name) {
+            Some(v) => v,
             // Not fatal — an unauthenticated endpoint is legitimate —
             // but it is the most common cause of a 401, so say so now.
-            Err(_) => {
+            None => {
                 return ProbeResult {
                     ok: false,
                     endpoint: String::new(),
                     status: None,
                     detail: format!(
-                        "环境变量 {name} 在 webui 服务进程里不存在；key 会以空串发出\
-                         （服务端若要鉴权就会 401）。在 run-webui.sh 里 export 它再重启服务。"
+                        "no key for {name}: paste it in the panel (it is stored in \
+                         config.secrets.toml) or export {name} before starting the webui. \
+                         Without one the key goes out empty and a server that authenticates \
+                         answers 401."
                     ),
                 }
             }
@@ -757,7 +781,7 @@ pub async fn probe(req: &ProbeRequest) -> ProbeResult {
                 ok: false,
                 endpoint: String::new(),
                 status: None,
-                detail: format!("HTTP 客户端构造失败: {e}"),
+                detail: format!("cannot build an HTTP client: {e}"),
             }
         }
     };
@@ -778,14 +802,14 @@ pub async fn probe(req: &ProbeRequest) -> ProbeResult {
                 .ok()
                 .and_then(|v| v.get("data").and_then(|d| d.as_array()).map(|a| a.len()));
             let list = match n {
-                Some(n) => format!("，列出 {n} 个模型"),
+                Some(n) => format!(", {n} model(s) listed"),
                 None => String::new(),
             };
             return ProbeResult {
                 ok: true,
                 endpoint: "/v1/models".to_string(),
                 status: Some(200),
-                detail: format!("服务可达{list}"),
+                detail: format!("reachable{list}"),
             };
         }
         Ok(resp) => {
@@ -807,7 +831,7 @@ pub async fn probe(req: &ProbeRequest) -> ProbeResult {
                 ok: false,
                 endpoint: "/v1/models".to_string(),
                 status: None,
-                detail: format!("连不上 {models_url}：{}", transport_error(&e)),
+                detail: format!("cannot reach {models_url}: {}", transport_error(&e)),
             }
         }
     }
@@ -831,7 +855,7 @@ pub async fn probe(req: &ProbeRequest) -> ProbeResult {
         ok: false,
         endpoint: "/v1/responses".to_string(),
         status: None,
-        detail: "未尝试".to_string(),
+        detail: "not attempted".to_string(),
     };
     for endpoint in ["/v1/responses", "/v1/chat/completions"] {
         let url = format!("{base}{endpoint}");
@@ -858,7 +882,7 @@ pub async fn probe(req: &ProbeRequest) -> ProbeResult {
                     ok: true,
                     endpoint: endpoint.to_string(),
                     status: Some(resp.status().as_u16()),
-                    detail: format!("{endpoint} 返回 200（模型 {model} 可用）"),
+                    detail: format!("{endpoint} answered 200 (model {model} works)"),
                 }
             }
             Ok(resp) => {
@@ -879,7 +903,7 @@ pub async fn probe(req: &ProbeRequest) -> ProbeResult {
                     ok: false,
                     endpoint: endpoint.to_string(),
                     status: None,
-                    detail: format!("请求 {url} 失败：{}", transport_error(&e)),
+                    detail: format!("request to {url} failed: {}", transport_error(&e)),
                 };
             }
         }
@@ -892,9 +916,9 @@ pub async fn probe(req: &ProbeRequest) -> ProbeResult {
 /// server is down, slow, or unreachable.
 fn transport_error(e: &reqwest::Error) -> String {
     if e.is_connect() {
-        format!("无法建立连接（服务没起？端口/隧道对不对？）：{e}")
+        format!("cannot connect (is the server up? right port/tunnel?): {e}")
     } else if e.is_timeout() {
-        format!("超时：{e}")
+        format!("timed out: {e}")
     } else {
         e.to_string()
     }
@@ -911,19 +935,327 @@ fn truncate(s: String) -> String {
 
 fn explain(status: u16, body: &str) -> String {
     let hint = match status {
-        400 => "请求被拒（多半是模型名或参数不被接受）",
-        401 | 403 => "鉴权失败（api_key_env 指向的环境变量是否配好）",
-        404 => "路径或模型不存在",
-        405 => "该方法不被支持",
-        429 => "限流",
-        500..=599 => "服务端错误（模型服务自己崩了？）",
-        _ => "非预期状态",
+        400 => "the request was rejected (usually an unknown model name or an unsupported parameter)",
+        401 | 403 => {
+            "authentication failed (paste the key in the panel, or export the env var named by \
+             api_key_env, then restart the server)"
+        }
+        404 => "no such path or model",
+        405 => "that method is not supported here",
+        429 => "rate limited",
+        500..=599 => "server error (did the model service crash?)",
+        _ => "unexpected status",
     };
     if body.is_empty() {
-        format!("HTTP {status}：{hint}")
+        format!("HTTP {status}: {hint}")
     } else {
-        format!("HTTP {status}：{hint}；响应体：{body}")
+        format!("HTTP {status}: {hint}; body: {body}")
     }
+}
+
+/// The config's `[active].model` — what a session without a choice of its
+/// own follows, and the fallback shown on its card.
+pub fn active_model(cfg: &WebConfig) -> Option<String> {
+    active_model_in(cfg.config_path.as_deref()?)
+}
+
+/// `active_model` for an explicit config path (the per-session config a
+/// loop was pinned to).
+pub fn active_model_in(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let doc: toml::Value = text.parse().ok()?;
+    doc.get("active")
+        .and_then(|a| a.get("model"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
+}
+
+// ── pasted keys ─────────────────────────────────────────────────────
+//
+// The kernel reads a key only from the environment: its config has
+// `api_key_env` (a NAME) and nothing else, and `bin/model` falls back to
+// an empty string when that name is unset. Pasting a key into the panel
+// therefore stores it here, and the webui injects it into every loop it
+// spawns under that same name — no kernel change, and the key never
+// travels back to the browser.
+
+const SECRETS_HEADER: &str = "\
+# Provider keys pasted in the webui's model panel.
+#
+# The kernel never reads this file. The webui injects each value into
+# every loop it spawns, under the env var name the entry's `api_key_env`
+# declares (a value here wins over an env var of the same name).
+# Keep it out of version control: the kernel repo's `config*.toml`
+# ignore rule already covers this file name.
+
+";
+
+/// `<config dir>/config.secrets.toml`.
+pub fn secrets_path(cfg: &WebConfig) -> Option<PathBuf> {
+    let dir = cfg.config_path.as_ref()?.parent()?;
+    Some(dir.join("config.secrets.toml"))
+}
+
+pub fn load_secrets(cfg: &WebConfig) -> BTreeMap<String, String> {
+    let Some(path) = secrets_path(cfg) else {
+        return BTreeMap::new();
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return BTreeMap::new();
+    };
+    let Ok(doc) = text.parse::<toml::Value>() else {
+        return BTreeMap::new();
+    };
+    doc.get("env")
+        .and_then(|e| e.as_table())
+        .map(|t| {
+            t.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Store (or, with `None`/empty, delete) one key. The file is written
+/// atomically and left mode 0600.
+pub fn set_secret(cfg: &WebConfig, name: &str, value: Option<&str>) -> Result<(), String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("api_key_env is empty: name the environment variable first".to_string());
+    }
+    let path = secrets_path(cfg)
+        .ok_or_else(|| "cannot locate config.secrets.toml (no --config)".to_string())?;
+
+    let mut map = load_secrets(cfg);
+    match value.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(v) => {
+            map.insert(name.to_string(), v.to_string());
+        }
+        None => {
+            map.remove(name);
+        }
+    }
+    if map.is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return Ok(());
+    }
+
+    let mut doc = DocumentMut::new();
+    let mut env = Table::new();
+    for (k, v) in &map {
+        env.insert(k, toml_edit::value(v));
+    }
+    doc.insert("env", Item::Table(env));
+    let rendered = format!("{SECRETS_HEADER}{doc}");
+    write_atomic(&path, &rendered)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+/// The value to send for the env var `name`: the secrets file first (an
+/// explicit choice made in the panel), then the process environment.
+pub fn key_for(cfg: &WebConfig, name: &str) -> Option<String> {
+    load_secrets(cfg)
+        .get(name)
+        .cloned()
+        .or_else(|| std::env::var(name).ok())
+}
+
+// ── provider model list ─────────────────────────────────────────────
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct FetchRequest {
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct FetchedModel {
+    pub id: String,
+    /// Reported window, when the provider exposes one. sglang returns
+    /// `max_model_len`; OpenAI-compatible servers usually report nothing.
+    #[serde(default)]
+    pub context_window: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct FetchResult {
+    pub ok: bool,
+    pub models: Vec<FetchedModel>,
+    pub detail: String,
+}
+
+/// `GET {base_url}/v1/models` — the one piece of provider metadata that
+/// is actually discoverable at runtime. Reasoning capabilities are NOT
+/// (the reference harness, dsh/pi-ai, ships a generated per-model catalog
+/// with an explicit `thinkingLevelMap` instead of probing).
+pub async fn fetch_models(cfg: &WebConfig, req: &FetchRequest) -> FetchResult {
+    let base = req.base_url.trim().trim_end_matches('/').to_string();
+    if base.is_empty() {
+        return FetchResult {
+            ok: false,
+            models: Vec::new(),
+            detail: "base_url is empty".to_string(),
+        };
+    }
+    let key = req
+        .api_key_env
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|name| key_for(cfg, name))
+        .unwrap_or_default();
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return FetchResult {
+                ok: false,
+                models: Vec::new(),
+                detail: format!("cannot build an HTTP client: {e}"),
+            }
+        }
+    };
+
+    let url = format!("{base}/v1/models");
+    match client.get(&url).bearer_auth(&key).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let body = resp.text().await.unwrap_or_default();
+            match parse_model_list(&body) {
+                Ok(models) => {
+                    let n = models.len();
+                    FetchResult {
+                        ok: true,
+                        models,
+                        detail: format!("{n} model(s)"),
+                    }
+                }
+                Err(e) => FetchResult {
+                    ok: false,
+                    models: Vec::new(),
+                    detail: format!("{url} did not return a model list: {e}"),
+                },
+            }
+        }
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let body = truncate(resp.text().await.unwrap_or_default());
+            FetchResult {
+                ok: false,
+                models: Vec::new(),
+                detail: explain(status, &body),
+            }
+        }
+        Err(e) => FetchResult {
+            ok: false,
+            models: Vec::new(),
+            detail: format!("cannot reach {url}: {}", transport_error(&e)),
+        },
+    }
+}
+
+/// Parse an OpenAI-shaped `/v1/models` body. Ids keep the bare name (a
+/// trailing slash is dropped — sglang reports `Qwen3...-v2/`); a window
+/// is picked up from whichever key the provider uses.
+fn parse_model_list(body: &str) -> Result<Vec<FetchedModel>, String> {
+    let doc: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("invalid JSON: {e}"))?;
+    let arr = doc
+        .get("data")
+        .and_then(|d| d.as_array())
+        .ok_or_else(|| "no `data` array".to_string())?;
+    let mut models: Vec<FetchedModel> = arr
+        .iter()
+        .filter_map(|m| {
+            let id = m.get("id").and_then(|i| i.as_str())?;
+            let id = id.trim().trim_end_matches('/').to_string();
+            if id.is_empty() {
+                return None;
+            }
+            let context_window = ["max_model_len", "context_window", "context_length"]
+                .iter()
+                .find_map(|k| m.get(*k).and_then(|v| v.as_u64()));
+            Some(FetchedModel { id, context_window })
+        })
+        .collect();
+    models.sort_by(|a, b| a.id.cmp(&b.id));
+    models.dedup_by(|a, b| a.id == b.id);
+    Ok(models)
+}
+
+// ── per-session config ──────────────────────────────────────────────
+
+/// Rewrite `[active] model` — and, when given, that entry's
+/// `reasoning_effort` — in a copy of the kernel config, leaving every
+/// other byte alone.
+///
+/// A per-session model cannot ride on the `$MODEL` env var: only
+/// `bin/model`, `bin/assemble` and `bin/compact` read it, while the loop
+/// itself snapshots its context budget from `[active]` at startup — the
+/// request would use B while compaction math used A. `$CONFIG` pointing
+/// at a config whose `[active]` is B is the one channel the loop and
+/// every stage follow together (the webui already pins `$CONFIG` per
+/// loop). Reasoning effort is per-entry in the kernel, so a per-session
+/// effort rides along in the same file.
+pub fn session_config(
+    original: &str,
+    entry: Option<&str>,
+    effort: Option<&str>,
+) -> Result<String, String> {
+    let mut doc: DocumentMut = original
+        .parse()
+        .map_err(|e| format!("config.toml does not parse: {e}"))?;
+
+    if let Some(entry) = entry {
+        let active = doc.get_mut("active").and_then(|i| i.as_table_mut());
+        match active {
+            Some(a) => {
+                a.insert("model", toml_edit::value(entry));
+            }
+            None => {
+                let mut a = Table::new();
+                a.insert("model", toml_edit::value(entry));
+                doc.insert("active", Item::Table(a));
+            }
+        }
+    }
+
+    if let Some(effort) = effort {
+        // The entry the session will actually run: its own pick, else
+        // whatever `[active]` names.
+        let target = entry.map(str::to_string).or_else(|| {
+            doc.get("active")
+                .and_then(|a| a.get("model"))
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+        });
+        if let Some(target) = target {
+            let model = doc
+                .get_mut("model")
+                .and_then(|i| i.as_table_mut())
+                .ok_or_else(|| "config.toml has no [model] table".to_string())?;
+            let needs_create = !model.get(&target).map(|i| i.is_table()).unwrap_or(false);
+            if needs_create {
+                model.insert(&target, Item::Table(Table::new()));
+            }
+            let t = model
+                .get_mut(&target)
+                .and_then(|i| i.as_table_mut())
+                .ok_or_else(|| format!("cannot write [model.\"{target}\"]"))?;
+            t.insert("reasoning_effort", toml_edit::value(effort));
+        }
+    }
+
+    Ok(doc.to_string())
 }
 
 // ── tests ───────────────────────────────────────────────────────────
@@ -1010,6 +1342,7 @@ line
             config_path: String::new(),
             mirror_path: None,
             key_env_present: BTreeMap::new(),
+            key_env_stored: BTreeMap::new(),
             effective: None,
             notes: Vec::new(),
         }
@@ -1101,7 +1434,7 @@ line
         let mut next = settings_from(SAMPLE);
         next.active = "nope".into();
         let err = save(&cfg_at(&p), &next).unwrap_err();
-        assert!(err.contains("不在条目列表里"), "got: {err}");
+        assert!(err.contains("is not one of the entries"), "got: {err}");
         // The file is untouched.
         assert_eq!(std::fs::read_to_string(&p).unwrap(), SAMPLE);
     }
@@ -1113,7 +1446,7 @@ line
         let mut next = settings_from(SAMPLE);
         next.entries.push(ModelEntry { name: "vision".into(), ..Default::default() });
         let err = save(&cfg_at(&p), &next).unwrap_err();
-        assert!(err.contains("与 [model] 下的全局键同名"), "got: {err}");
+        assert!(err.contains("collides with a global [model] key"), "got: {err}");
     }
 
     #[test]
@@ -1145,19 +1478,136 @@ line
             .parse()
             .unwrap();
         let d = diffs(&before, &after);
-        assert!(d.iter().any(|s| s.contains("活跃模型已切换")));
+        assert!(d.iter().any(|s| s.contains("active model switched")));
         assert!(d.iter().any(|s| s.contains("context_tokens")));
     }
 
     #[test]
+    fn parse_model_list_trims_the_shared_id_shape() {
+        // The exact shape this machine's sglang returns.
+        let body = r#"{"object":"list","data":[
+            {"id":"Qwen3.8-27B-NVFP4-RTX5090-v2/","object":"model","created":1,
+             "owned_by":"sglang","root":"x/","parent":null,"max_model_len":262144}]}"#;
+        let m = parse_model_list(body).unwrap();
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].id, "Qwen3.8-27B-NVFP4-RTX5090-v2");
+        assert_eq!(m[0].context_window, Some(262144));
+    }
+
+    #[test]
+    fn parse_model_list_accepts_a_plain_openai_payload() {
+        let body = r#"{"object":"list","data":[{"id":"gpt-5","object":"model"},{"id":"o3"}]}"#;
+        let m = parse_model_list(body).unwrap();
+        assert_eq!(m.iter().map(|x| x.id.as_str()).collect::<Vec<_>>(), ["gpt-5", "o3"]);
+        assert!(m.iter().all(|x| x.context_window.is_none()));
+        assert!(parse_model_list("not json").is_err());
+        assert!(parse_model_list(r#"{"data":"nope"}"#).is_err());
+    }
+
+    #[test]
+    fn session_config_swaps_only_the_active_entry() {
+        let out = session_config(SAMPLE, Some("cloud"), None).unwrap();
+        let doc: toml::Value = out.parse().unwrap();
+        assert_eq!(
+            doc.get("active").and_then(|a| a.get("model")).and_then(|v| v.as_str()),
+            Some("cloud")
+        );
+        // Everything else is byte-identical to the source.
+        let expected = SAMPLE.replace(r#"model = "local""#, r#"model = "cloud""#);
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn session_config_can_pin_a_reasoning_effort() {
+        let out = session_config(SAMPLE, Some("cloud"), Some("low")).unwrap();
+        let doc: toml::Value = out.parse().unwrap();
+        // The entry the session runs carries the effort...
+        assert_eq!(
+            doc.get("model")
+                .and_then(|m| m.get("cloud"))
+                .and_then(|e| e.get("reasoning_effort"))
+                .and_then(|v| v.as_str()),
+            Some("low")
+        );
+        assert_eq!(
+            doc.get("active").and_then(|a| a.get("model")).and_then(|v| v.as_str()),
+            Some("cloud")
+        );
+        // ...and the shared config is untouched: the original sample's
+        // entry has no effort key at all.
+        let orig: toml::Value = SAMPLE.parse().unwrap();
+        assert!(orig
+            .get("model")
+            .and_then(|m| m.get("local"))
+            .and_then(|e| e.get("reasoning_effort"))
+            .is_none());
+
+        // Effort alone (no entry pick) applies to whatever `[active]`
+        // names.
+        let out = session_config(SAMPLE, None, Some("high")).unwrap();
+        let doc: toml::Value = out.parse().unwrap();
+        assert_eq!(
+            doc.get("model")
+                .and_then(|m| m.get("local"))
+                .and_then(|e| e.get("reasoning_effort"))
+                .and_then(|v| v.as_str()),
+            Some("high")
+        );
+    }
+
+    #[test]
     fn probe_reports_a_missing_key_env_without_network() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_sample(dir.path());
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let r = rt.block_on(probe(&ProbeRequest {
-            base_url: "http://127.0.0.1:1".into(),
-            api_key_env: Some("RUSHI_TEST_ABSENT_VAR".into()),
-            model_id: None,
-        }));
+        let r = rt.block_on(probe(
+            &cfg_at(&p),
+            &ProbeRequest {
+                base_url: "http://127.0.0.1:1".into(),
+                api_key_env: Some("RUSHI_TEST_ABSENT_VAR".into()),
+                model_id: None,
+            },
+        ));
         assert!(!r.ok);
         assert!(r.detail.contains("RUSHI_TEST_ABSENT_VAR"), "got: {}", r.detail);
+    }
+
+    #[test]
+    fn a_pasted_key_is_stored_0600_and_preferred() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_sample(dir.path());
+        let cfg = cfg_at(&p);
+
+        // Nothing stored, nothing in the env.
+        assert!(key_for(&cfg, "RUSHI_TEST_KEY").is_none());
+
+        set_secret(&cfg, "RUSHI_TEST_KEY", Some("sk-abc")).unwrap();
+        let secrets = secrets_path(&cfg).unwrap();
+        assert!(secrets.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&secrets).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "secrets must not be world readable");
+        }
+        assert_eq!(key_for(&cfg, "RUSHI_TEST_KEY").as_deref(), Some("sk-abc"));
+        assert_eq!(load_secrets(&cfg).len(), 1);
+
+        // The secrets file wins over an env var of the same name.
+        std::env::set_var("RUSHI_TEST_KEY", "from-env");
+        assert_eq!(key_for(&cfg, "RUSHI_TEST_KEY").as_deref(), Some("sk-abc"));
+        std::env::remove_var("RUSHI_TEST_KEY");
+
+        // A second key is added without dropping the first, and clearing
+        // the last one removes the file.
+        set_secret(&cfg, "RUSHI_TEST_OTHER", Some("sk-def")).unwrap();
+        assert_eq!(load_secrets(&cfg).len(), 2);
+        set_secret(&cfg, "RUSHI_TEST_KEY", None).unwrap();
+        assert_eq!(load_secrets(&cfg).len(), 1);
+        set_secret(&cfg, "RUSHI_TEST_OTHER", Some("")).unwrap();
+        assert!(!secrets.exists(), "an empty store removes the file");
+
+        // The kernel config itself is never touched by any of this.
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), SAMPLE);
     }
 }

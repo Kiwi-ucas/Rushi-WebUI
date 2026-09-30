@@ -8,7 +8,10 @@ axum = { version = "0.8", features = ["ws", "query"] }
 axum-extra = { version = "0.10", features = ["typed-header"] }
 tokio = { version = "1", features = ["full"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["fs", "cors"] }
+# v0.5.47: compression-br + compression-gzip back the frontend's
+# CompressionLayer — the WASM bundle is the whole page load over a slow
+# link, and brotli takes it down ~3x (see `serve_frontend`).
+tower-http = { version = "0.6", features = ["fs", "cors", "compression-br", "compression-gzip"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"

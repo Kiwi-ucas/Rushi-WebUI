@@ -172,7 +172,73 @@ impl LoopManager {
             // to its own CWD (the session working directory), so a
             // relative pin would point at the wrong file.
             let cfg_pin = std::fs::canonicalize(&cfg_pin).unwrap_or(cfg_pin);
-            cmd.env("CONFIG", cfg_pin.display().to_string());
+
+            // v0.5.44: a session may run a model entry other than the
+            // config's active one. The `$MODEL` env var cannot express
+            // that — only `model`/`assemble`/`compact` read it, while the
+            // loop itself snapshots its context budget from `[active]` at
+            // startup (the request would use B while the compaction math
+            // used A). Pinning a config whose `[active]` is B is the one
+            // channel the loop and every stage follow together.
+            let session_dir = self.cfg.sessions_root.join(session);
+            let choice = crate::sessions::read_marker(
+                &session_dir,
+                crate::sessions::MODEL_MARKER,
+            );
+            let effort = crate::sessions::read_marker(
+                &session_dir,
+                crate::sessions::EFFORT_MARKER,
+            );
+            let mut pinned = cfg_pin.clone();
+            if choice.is_some() || effort.is_some() {
+                match std::fs::read_to_string(&cfg_pin)
+                    .map_err(|e| e.to_string())
+                    .and_then(|text| {
+                        crate::modelcfg::session_config(
+                            &text,
+                            choice.as_deref(),
+                            effort.as_deref(),
+                        )
+                    })
+                {
+                    Ok(text) => {
+                        let path = session_dir.join("config.session.toml");
+                        match crate::modelcfg::write_atomic(&path, &text) {
+                            Ok(()) => pinned = path,
+                            Err(e) => warn!(
+                                session,
+                                %e,
+                                "cannot write the per-session config; using the shared one"
+                            ),
+                        }
+                    }
+                    Err(e) => warn!(
+                        session,
+                        %e,
+                        "cannot derive the per-session config; using the shared one"
+                    ),
+                }
+            }
+            // Record what this launch actually runs with: the kernel logs
+            // no model identity, so this marker is the only record of
+            // "the model this session last used".
+            if let Some(used) =
+                crate::modelcfg::active_model_in(&pinned).or_else(|| choice.clone())
+            {
+                let _ = std::fs::write(
+                    session_dir.join(crate::sessions::MODEL_USED_MARKER),
+                    used,
+                );
+            }
+            cmd.env("CONFIG", pinned.display().to_string());
+            // Keys pasted in the model panel live in config.secrets.toml
+            // (the kernel reads a key only from the environment). Inject
+            // them under the names the entries declare; they win over an
+            // inherited env var of the same name, matching what the
+            // panel reports.
+            for (name, value) in crate::modelcfg::load_secrets(&self.cfg) {
+                cmd.env(name, value);
+            }
             cmd.stdin(Stdio::null());
             cmd.stdout(Stdio::null());
             // Keep stderr on disk: a loop that dies at startup (e.g. it

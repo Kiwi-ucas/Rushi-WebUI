@@ -20,9 +20,20 @@ pub async fn load_sessions() -> Result<Vec<crate::model::SessionInfo>, String> {
     serde_json::from_str(&text).map_err(|e| e.to_string())
 }
 
-/// Create a session, optionally with a chosen working directory.
-pub async fn create_session(name: &str, cwd: Option<&str>) -> Result<(), String> {
-    let status = post_json("/api/sessions", &json!({ "name": name, "cwd": cwd })).await?;
+/// Create a session, optionally with a chosen working directory, model
+/// entry and reasoning effort (v0.5.45: the new-session form picks the
+/// model, so the model panel no longer has to expose a global default).
+pub async fn create_session(
+    name: &str,
+    cwd: Option<&str>,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> Result<(), String> {
+    let status = post_json(
+        "/api/sessions",
+        &json!({ "name": name, "cwd": cwd, "model": model, "effort": effort }),
+    )
+    .await?;
     if status >= 400 {
         Err(format!("create failed: HTTP {status}"))
     } else {
@@ -78,6 +89,43 @@ pub async fn probe_model(
     let res = req.send().await.map_err(|e| e.to_string())?;
     let text = res.text().await.map_err(|e| e.to_string())?;
     serde_json::from_str(&text).map_err(|e| e.to_string())
+}
+
+/// v0.5.44: set (or clear, with `None`) a session's model entry. The
+/// choice takes effect the next time that session's loop starts.
+pub async fn set_session_model(session: &str, model: Option<&str>) -> Result<(), String> {
+    let url = format!("/api/sessions/{}/model", js_sys::encode_uri_component(session));
+    let payload = serde_json::json!({ "model": model });
+    let req = Request::post(&url)
+        .header("Content-Type", "application/json")
+        .body(payload.to_string())
+        .map_err(|e| e.to_string())?;
+    let res = req.send().await.map_err(|e| e.to_string())?;
+    if res.status() >= 400 {
+        return Err(res.text().await.unwrap_or_default());
+    }
+    Ok(())
+}
+
+/// v0.5.44: store (or, with `None`, clear) the key for one env var name.
+/// The key is never read back — only its presence is reported.
+pub async fn set_model_key(name: &str, value: Option<&str>) -> Result<(), String> {
+    let payload = json!({ "name": name, "value": value });
+    let req = Request::post("/api/model/key")
+        .header("Content-Type", "application/json")
+        .body(payload.to_string())
+        .map_err(|e| e.to_string())?;
+    let res = req.send().await.map_err(|e| e.to_string())?;
+    if res.status() >= 400 {
+        return Err(res.text().await.unwrap_or_default());
+    }
+    Ok(())
+}
+
+/// v0.5.44: the configured model entry names (options for the card popup).
+pub async fn load_model_names() -> Result<Vec<String>, String> {
+    let v = load_model().await?;
+    Ok(v.entries.into_iter().map(|e| e.name).collect())
 }
 
 /// The server's default working directory (prefill for the picker).

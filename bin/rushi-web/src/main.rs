@@ -11,6 +11,7 @@ use axum::routing::{delete, get, post};
 use axum::Router;
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 
 mod config;
@@ -81,6 +82,13 @@ struct PostSession {
     name: String,
     #[serde(default)]
     cwd: Option<String>,
+    /// v0.5.45: the model entry this session should run (absent = follow
+    /// the config's active entry).
+    #[serde(default)]
+    model: Option<String>,
+    /// v0.5.45: this session's reasoning effort (absent = the entry's).
+    #[serde(default)]
+    effort: Option<String>,
 }
 
 /// Create a session, optionally with a chosen working directory.
@@ -93,7 +101,18 @@ async fn create_session(
         return (StatusCode::BAD_REQUEST, "empty session name".to_string()).into_response();
     }
     match st.sessions.create(name, body.cwd.as_deref()).await {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
+        Ok(()) => {
+            // v0.5.45: the new-session form also picks the model and the
+            // thinking effort, recorded as the same markers the card chip
+            // writes (they are applied in the session config at launch).
+            if let Err(e) = st.sessions.set_model(name, body.model.as_deref()).await {
+                return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+            }
+            if let Err(e) = st.sessions.set_effort(name, body.effort.as_deref()).await {
+                return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+            }
+            (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
+        }
         Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     }
 }
@@ -338,8 +357,91 @@ async fn post_model(State(st): State<AppState>, Json(body): Json<modelcfg::Model
     }
 }
 
-async fn post_model_probe(Json(body): Json<modelcfg::ProbeRequest>) -> impl IntoResponse {
-    (StatusCode::OK, Json(modelcfg::probe(&body).await)).into_response()
+async fn post_model_probe(
+    State(st): State<AppState>,
+    Json(body): Json<modelcfg::ProbeRequest>,
+) -> impl IntoResponse {
+    (StatusCode::OK, Json(modelcfg::probe(&st.cfg, &body).await)).into_response()
+}
+
+async fn post_model_models(
+    State(st): State<AppState>,
+    Json(body): Json<modelcfg::FetchRequest>,
+) -> impl IntoResponse {
+    (StatusCode::OK, Json(modelcfg::fetch_models(&st.cfg, &body).await)).into_response()
+}
+
+#[derive(Deserialize)]
+struct ModelKeyBody {
+    /// The env var name the entry declares in `api_key_env`.
+    name: String,
+    /// The key to store, or `null`/empty to forget it.
+    #[serde(default)]
+    value: Option<String>,
+}
+
+/// Store (or clear) a pasted provider key. The key never comes back out:
+/// GET /api/model only reports whether one is available.
+async fn post_model_key(
+    State(st): State<AppState>,
+    Json(body): Json<ModelKeyBody>,
+) -> impl IntoResponse {
+    match modelcfg::set_secret(&st.cfg, &body.name, body.value.as_deref()) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "ok": true })),
+        )
+            .into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct SessionModelBody {
+    /// The model entry this session should run, or `null` to follow the
+    /// config's active entry again.
+    #[serde(default)]
+    model: Option<String>,
+    /// v0.5.45: the session's reasoning effort, or `null` to keep the
+    /// entry's own. Absent (rather than null) leaves it untouched — the
+    /// card chip only edits the model.
+    #[serde(default, deserialize_with = "double_option")]
+    effort: Option<Option<String>>,
+}
+
+/// Tell "absent" from "explicit null" for an optional field.
+fn double_option<'de, D>(de: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(de).map(Some)
+}
+
+async fn post_session_model(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<SessionModelBody>,
+) -> impl IntoResponse {
+    if let Err(e) = st.sessions.set_model(&id, body.model.as_deref()).await {
+        return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+    if let Some(effort) = body.effort {
+        if let Err(e) = st.sessions.set_effort(&id, effort.as_deref()).await {
+            return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "model": st.sessions.model_choice(&id),
+            "effort": crate::sessions::read_marker(
+                &st.sessions.session_dir(&id),
+                crate::sessions::EFFORT_MARKER,
+            ),
+        })),
+    )
+        .into_response()
 }
 
 // ── WebSocket: live event stream + in-band commands ────────────────
@@ -764,6 +866,16 @@ fn content_type(name: &str) -> &'static str {
     }
 }
 
+/// The static frontend as its own router, so the compression layer wraps
+/// only these responses. Scoped on purpose: a layer on the whole router
+/// would sit in front of the websocket upgrade and the streaming
+/// endpoints as well.
+fn frontend() -> Router {
+    Router::new()
+        .fallback(serve_frontend)
+        .layer(CompressionLayer::new())
+}
+
 async fn serve_frontend(req: axum::extract::Request) -> Response {
     let rel = req.uri().path().trim_start_matches('/').to_string();
     let key = if rel.is_empty() { "index.html" } else { rel.as_str() };
@@ -777,7 +889,15 @@ async fn serve_frontend(req: axum::extract::Request) -> Response {
                 .header(header::CONTENT_TYPE, if is_html { "text/html; charset=utf-8" } else { content_type(key) })
                 .header(
                     header::CACHE_CONTROL,
-                    if is_html { "no-cache" } else { "public, max-age=3600" },
+                    // Trunk writes the content hash into every asset file
+                    // name, so a non-html asset can never go stale under
+                    // its own URL: cache it for good. index.html keeps the
+                    // hash of the current build and must be revalidated.
+                    if is_html {
+                        "no-cache"
+                    } else {
+                        "public, max-age=31536000, immutable"
+                    },
                 )
                 .body(axum::body::Body::from(file.data.to_vec()))
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
@@ -964,11 +1084,14 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/sessions/{id}/goal", get(get_goal).post(post_goal))
         .route("/api/model", get(get_model).post(post_model))
         .route("/api/model/probe", post(post_model_probe))
+        .route("/api/model/models", post(post_model_models))
+        .route("/api/model/key", post(post_model_key))
+        .route("/api/sessions/{id}/model", post(post_session_model))
         .route("/api/sessions/{id}/rename", post(post_rename))
         .route("/api/sessions/{id}", delete(delete_session))
         .route("/api/sessions/{id}/loop", get(get_loop))
         .route("/ws/sessions/{id}", get(ws_handler))
-        .fallback(serve_frontend)
+        .fallback_service(frontend())
         .layer(CorsLayer::permissive())
         .with_state(state);
 
