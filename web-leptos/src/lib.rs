@@ -4,6 +4,7 @@ mod api;
 mod markdown;
 mod model;
 mod pile;
+mod terminal;
 mod timeutil;
 mod transcript;
 mod ui;
@@ -31,10 +32,12 @@ fn App() -> impl IntoView {
     // the app's signals.
     model::AppState::set_app_state(state);
 
-    // Restore persisted sidebar-collapse state
+    // M6: restore the persisted three-state layout ("main" | "split" |
+    // "full"; legacy `rushi-sidebar-collapsed` key migrates inside
+    // read_layout_mode).
     {
-        let collapsed = ui::read_collapsed();
-        state.sidebar_collapsed.set(collapsed);
+        let mode = ui::read_layout_mode();
+        state.layout_mode.set(mode);
     }
 
     // v0.5.22: theme (auto/light/dark). The pre-paint inline script in
@@ -145,8 +148,35 @@ fn App() -> impl IntoView {
         }
     }
 
+    // M8: restore the persisted right-panel open/closed state. (M11: the
+    // tabs are connection-scoped, so only open/closed is persisted.)
+    state.rp_open.set(ui::read_rp_open());
+
+    // M6: the "full" layout hides #main (display:none) — the sidebar owns
+    // the whole window as the dispatch view. Tell the pile engine so it
+    // stops doing DOM work while hidden and re-arms when it returns.
+    {
+        let st = state;
+        Effect::new(move || {
+            crate::pile::set_main_hidden(st.layout_mode.get() == "full");
+        });
+    }
+
+    // M6 layout class + M11 "rp-open" flag: the CSS uses `#app.rp-open`
+    // to mirror the left-column corner/relief onto the right panel
+    // (#main's top-R corner + right-edge relief strip). The layout_mode
+    // class is kept too (full/main/split).
     let app_class = move || {
-        if state.sidebar_collapsed.get() { "sidebar-collapsed".to_string() } else { String::new() }
+        let layout = match state.layout_mode.get().as_str() {
+            "main" => "layout-main",
+            "full" => "layout-full",
+            _ => "layout-split",
+        };
+        if state.rp_open.get() {
+            format!("{layout} rp-open")
+        } else {
+            layout.to_string()
+        }
     };
 
     view! {
@@ -198,6 +228,18 @@ fn App() -> impl IntoView {
                 </Show>
                 <ui::InputModule state=state />
             </main>
+            // M8: the right tool panel (Files tree + preview / terminal).
+            // A flex column in #app — `#main` shrinks to make room.
+            // Hidden in the "full" layout (the dispatch view owns the
+            // window).
+            <Show
+                when=move || {
+                    state.rp_open.get() && state.layout_mode.get() != "full"
+                }
+                fallback=|| ()
+            >
+                <ui::RightPanel state=state />
+            </Show>
             <ui::NewSessionDialog state=state />
             <ui::DeleteConfirmDialog state=state />
         </div>

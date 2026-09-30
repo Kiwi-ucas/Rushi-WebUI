@@ -414,6 +414,17 @@ struct PileState {
     /// (the in-flight card finalizes in place); this now covers the
     /// residual shrink cases (thinking-block collapse, error swaps).
     passive_clamp: bool,
+    /// v0.5.43: perf-now (ms) until which the transcript viewport is
+    /// owned by a programmatic chip-glide — `nav_to_round`'s one-shot
+    /// smooth scroll to a round. While `perf_now < glide_until` the
+    /// input-intent bookkeeping in sync_stick is suspended: the glide's
+    /// own upward scroll delta must not be classified as a passive
+    /// bottom-clamp (that misfired `rearm:passive-clamp` + the settle
+    /// pull yanked the viewport straight back to the live edge, which
+    /// is why "a round-chip click does nothing while pinned"). Any
+    /// user wheel / touch input clears the window — the user re-owns
+    /// the viewport. 0.0 = no glide in progress.
+    glide_until: f64,
     /// v0.5.16: previous frame's `streaming` flag, to detect a new model
     /// call starting (false→true) and re-arm the live follow.
     last_streaming: bool,
@@ -497,6 +508,16 @@ struct PileState {
     /// One-shot stall alarm already fired (DOM-lag gate retried 90
     /// frames without the For DOM catching up).
     stall_reported: bool,
+    /// M6: #main is display:none (the "full" layout dispatch view).
+    /// While true, on_frame skips all DOM work.
+    main_hidden: bool,
+    /// M6: scroll_top captured at the moment #main was hidden.
+    saved_scroll: f64,
+    /// M6: stick_to_bottom at the moment #main was hidden.
+    hidden_stuck: bool,
+    /// M6: one-shot flag consumed at the top of the next step_full to
+    /// restore the viewport after #main is re-shown.
+    restore_pending: bool,
     /// Ring of the last few deal decisions (diagnostics).
     deal_dbg_hist: Vec<String>,
     /// Wall time (ms) of the previous full step: feeds the scroll
@@ -580,6 +601,37 @@ pub fn record_panic(msg: &str) {
 
 fn with_pile<T>(f: impl FnOnce(&RefCell<Option<Rc<RefCell<PileState>>>>) -> T) -> T {
     PILE.with(f)
+}
+
+// ── M6: full-layout (dispatch view) hiding ────────────────────────
+/// The "full" layout hides #main with display:none while the sidebar
+/// owns the window. Call this when the layout enters/leaves that
+/// state. While hidden the engine does zero DOM work (on_frame
+/// no-ops); on re-show the next step restores the viewport — bottom
+/// follow if it was sticking, else the saved scroll top.
+pub fn set_main_hidden(hidden: bool) {
+    with_pile(|cell| {
+        let st = cell.borrow();
+        let Some(st) = st.as_ref() else { return };
+        let mut st = st.borrow_mut();
+        if st.main_hidden == hidden {
+            return;
+        }
+        if hidden {
+            if let Some(t) = &st.transcript {
+                st.saved_scroll = t.scroll_top() as f64;
+                st.hidden_stuck = st.stick_to_bottom;
+            }
+            st.main_hidden = true;
+        } else {
+            st.main_hidden = false;
+            st.restore_pending = true;
+            // One re-measure step after the DOM re-lays #main out
+            // (the rAF callback fires after paint, so the element is
+            // measurable and the restore block in step_full is safe).
+            schedule_step_locked(&mut st);
+        }
+    });
 }
 
 // ── entry points ───────────────────────────────────────────────────
@@ -686,6 +738,7 @@ pub fn init(state: AppState) {
             touch_anchor_y: None,
             touch_active: false,
             passive_clamp: false,
+            glide_until: 0.0,
             last_streaming: false,
             finalize_t: 0.0,
             prev_dist: 0.0,
@@ -706,6 +759,13 @@ pub fn init(state: AppState) {
             earlier_anchor: None,
             stick_to_bottom: true,
             stall_reported: false,
+            // M6: full-layout (dispatch view) hides #main with
+            // display:none — the engine no-ops while hidden and
+            // restores the viewport on re-show.
+            main_hidden: false,
+            saved_scroll: 0.0,
+            hidden_stuck: false,
+            restore_pending: false,
             deal_dbg_hist: Vec::new(),
             last_step_t: 0.0,
             last_user_scroll_t: 0.0,
@@ -956,7 +1016,7 @@ fn register_debug_hook(w: &web_sys::Window) {
                         .map(|t| t.scroll_height() as f64 - t.scroll_top() as f64 - t.client_height() as f64)
                         .unwrap_or(-1.0);
                     format!(
-                        "init=1 flat={} steps={} step_idle_ms={:.0} fold_applied={} compact={}/{} events={} cards={} pile_face={} pile_open={} kb_open={} summary={} park_bottom={} stick={} input_up={} reading={} touch_active={} last_range={:.0} dist={:.0} prev_dist={:.0} passive_clamp={} last_streaming={} stall_reported={} active={:?} view={:?} last_panic={} prepend_shift={:.1} prepend_scroll_before={:.0} stick_hist=[{}] dbg=[{}]",
+                        "init=1 flat={} steps={} step_idle_ms={:.0} fold_applied={} compact={}/{} events={} cards={} pile_face={} pile_open={} kb_open={} summary={} park_bottom={} stick={} input_up={} reading={} touch_active={} last_range={:.0} dist={:.0} prev_dist={:.0} passive_clamp={} glide={} last_streaming={} stall_reported={} active={:?} view={:?} last_panic={} prepend_shift={:.1} prepend_scroll_before={:.0} stick_hist=[{}] dbg=[{}]",
                         st.flat,
                         st.steps,
                         (perf_now_ms() - st.last_step_t).max(0.0),
@@ -978,6 +1038,7 @@ fn register_debug_hook(w: &web_sys::Window) {
                         dist,
                         st.prev_dist,
                         st.passive_clamp,
+                        perf_now_ms() < st.glide_until,
                         st.last_streaming,
                         st.stall_reported,
                         st.state.active_session.get_untracked().as_deref(),
@@ -1135,6 +1196,7 @@ pub fn on_history_loaded() {
         st.finalize_t = 0.0; // v0.5.38: no live round in the new session
         st.prev_dist = 0.0;
         st.reading = false; // v0.5.34: landing at the bottom — not reading
+        st.glide_until = 0.0; // v0.5.43: no glide in the fresh session
         // v0.5.6: quick "enter session" transition — a one-shot fade +
         // 6 px rise on the whole transcript (style.css
         // `.transcript-in`, ~180 ms; the early webui's simple, fast
@@ -1179,6 +1241,12 @@ fn on_frame() {
         let Some(st) = st.as_ref() else { return };
         let mut st = st.borrow_mut();
         st.step_scheduled = false;
+        // M6: #main is display:none (full layout) — zero DOM work
+        // while hidden; the step is re-scheduled when the layout
+        // re-shows #main (set_main_hidden).
+        if st.main_hidden {
+            return;
+        }
         step_full(&mut st);
     });
 }
@@ -1227,6 +1295,7 @@ fn step_full(st: &mut PileState) {
         st.passive_clamp = false;
         st.last_streaming = false;
         st.prev_dist = 0.0;
+        st.glide_until = 0.0; // v0.5.43: no glide in the fresh session
         st.last_active = active.clone();
         st.fold_applied = false;
         // Spring / commit bookkeeping belongs to the previous
@@ -1237,6 +1306,35 @@ fn step_full(st: &mut PileState) {
         release_shrink(st);
         set_spacer_height(st, 0.0);
         return;
+    }
+
+    // M6: one-shot viewport restore after #main returns from
+    // display:none (the "full" layout dispatch view). While hidden no
+    // step runs, so `last_active` still names the session that was
+    // active when the view hid. If that is still the active session,
+    // put the viewport back where the user left it: re-stick to the
+    // bottom if we were following the live feed, else restore the
+    // saved scroll top (clamped to the current content height, since
+    // new events may have grown the transcript while we were hidden).
+    // If the session CHANGED while hidden, skip — step_scrolls'
+    // session-change branch parks the new session at its bottom.
+    if st.restore_pending {
+        st.restore_pending = false;
+        if st.last_active.as_ref() == active.as_ref() {
+            if let Some(t) = &st.transcript {
+                if st.hidden_stuck {
+                    note_stick(st, true, "layout-rearm:stick");
+                    park_to_bottom(st, true);
+                } else {
+                    let max = t.scroll_height() - t.client_height();
+                    let target = (st.saved_scroll as i32).min(max.max(0));
+                    t.set_scroll_top(target);
+                    st.last_stop = t.scroll_top() as f64;
+                    st.last_range = t.scroll_height() as f64 - t.client_height() as f64;
+                    note_stick(st, false, "layout-rearm:restore");
+                }
+            }
+        }
     }
 
     // v0.5.38: mark a streaming finalization BEFORE sync_stick runs, so
@@ -1882,6 +1980,11 @@ fn record_wheel_input(delta_y: f64, ctrl: bool) {
             return;
         }
         st.last_input_t = perf_now_ms();
+        // v0.5.43: user input re-owns the viewport — any programmatic
+        // chip-glide window ends here (the browser already cancels the
+        // smooth scroll when the user wheels); from this event on,
+        // normal input-intent bookkeeping applies on the next step.
+        st.glide_until = 0.0;
         if delta_y < 0.0 {
             st.input_up = true;
             // v0.5.35: release the follow synchronously so a pending
@@ -1917,6 +2020,7 @@ fn record_touch_start(e: &web_sys::TouchEvent) {
             let mut st = rc.borrow_mut();
             st.touch_anchor_y = None;
             st.touch_active = false;
+            st.glide_until = 0.0; // v0.5.43: user re-owns the viewport
         });
         return;
     }
@@ -1928,6 +2032,7 @@ fn record_touch_start(e: &web_sys::TouchEvent) {
         };
         let mut st = rc.borrow_mut();
         st.touch_active = true;
+        st.glide_until = 0.0; // v0.5.43: user re-owns the viewport
         if let Some(y) = y {
             st.touch_anchor_y = Some(y);
         }
@@ -2061,7 +2166,23 @@ fn sync_stick(st: &mut PileState) {
     let delta = s_top - st.last_stop;
     st.last_stop = s_top;
     let d = range - s_top; // distance to the transcript bottom
-    let recent_input = perf_now_ms() - st.last_input_t < 300.0;
+    let now_ms = perf_now_ms();
+    let recent_input = now_ms - st.last_input_t < 300.0;
+
+    // v0.5.43: while a programmatic chip-glide (nav_to_round's one-shot
+    // smooth scroll; `glide_until` in the future) is in flight the
+    // viewport is ENGINE-OWNED: its upward delta is the glide, not user
+    // motion, so the input-intent bookkeeping below must not run.
+    // Unguarded, the glide's first frame misfired `rearm:passive-clamp`
+    // (the glide starts at the live edge, so `prev_dist <=
+    // LIVE_EDGE_TIGHT` held) and the settle pull then yanked the
+    // viewport back to the bottom mid-glide — the "round-chip click
+    // does nothing while pinned" bug. Any user wheel / touch input
+    // clears `glide_until` (record_wheel_input / record_touch_start),
+    // so this only ever suspends an UNATTENDED glide. The position
+    // base syncs (last_stop above, last_range below) stay outside the
+    // guard: they are bookkeeping, not intent.
+    if now_ms >= st.glide_until {
 
     // v0.5.36: the reading latch is derived from POSITION, not a sticky
     // intent. Being back within the follow band (d <= 80) means the user
@@ -2190,6 +2311,7 @@ fn sync_stick(st: &mut PileState) {
             st.passive_clamp = true;
         }
     }
+    } // v0.5.43: end of the glide-window guard (input-intent suspended)
     st.last_range = range;
 }
 
@@ -2380,6 +2502,30 @@ pub fn nav_to_round(i: usize) {
         let is_last = i + 1 == rounds.len();
         st.passive_clamp = false;
         note_stick(&mut st, is_last, if is_last { "rearm:chip-last" } else { "release:chip" });
+        // v0.5.43: own the viewport for the glide. The smooth scroll's
+        // upward delta would otherwise read as a "passive bottom clamp"
+        // in sync_stick one frame later — `rearm:passive-clamp` + the
+        // settle pull then yanked the viewport back to the live edge,
+        // which is why a round-chip click did nothing while pinned
+        // (the user had to scroll up first, releasing the follow, for
+        // the same click to work). While `glide_until` is in the
+        // future, sync_stick suspends its input-intent bookkeeping;
+        // any user wheel / touch input ends the window early.
+        st.glide_until = perf_now_ms() + 500.0;
+        // A non-last chip lands us MID-transcript — that is reading
+        // history, not following the live edge. Latch the reading flag:
+        // it keeps the grew-park in step_scrolls off (a reader is
+        // never yanked) and self-clears once the viewport rests within
+        // the bottom band when the user returns to the live edge.
+        if !is_last {
+            st.reading = true;
+        }
+        // Resync the sticky delta base to the current position so the
+        // glide's programmatic motion is not read as user motion on the
+        // next step (mirrors the post-glide timeout resync, just
+        // sooner, so the in-glide frames stay quiet).
+        st.last_stop = tr.scroll_top() as f64;
+        st.last_range = tr.scroll_height() as f64 - tr.client_height() as f64;
         // One-shot smooth glide: the engine's steady state is inline
         // `scroll-behavior:auto`; override it for this scroll, then
         // restore it so per-frame pin writes stay instant.
@@ -2402,6 +2548,7 @@ pub fn nav_to_round(i: usize) {
                     s.last_round_events_len = s.state.events.get_untracked().len();
                     s.last_range = t2.scroll_height() as f64 - t2.client_height() as f64;
                     s.passive_clamp = false;
+                    s.glide_until = 0.0; // v0.5.43: glide window is over
                 }
             });
         });

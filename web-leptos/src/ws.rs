@@ -3,8 +3,11 @@
 
 use std::cell::RefCell;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as B64;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
+use serde_json::json;
 use serde_json::Value;
 use web_sys::{CloseEvent, MessageEvent, WebSocket};
 use wasm_bindgen::closure::Closure;
@@ -12,6 +15,56 @@ use wasm_bindgen::JsCast;
 
 use crate::markdown::normalize_event;
 use crate::model::AppState;
+
+thread_local! {
+    /// M11: live sinks for terminal output, keyed by terminal id (one
+    /// xterm writer per open terminal tab). `TermMount` registers its
+    /// sink on mount and clears it on unmount; `term_out` frames carry
+    /// the terminal id and are routed to the matching sink.
+    static TERM_WRITE: RefCell<Option<std::collections::HashMap<u32, Box<dyn FnMut(Vec<u8>)>>>> =
+        const { RefCell::new(None) };
+}
+
+/// M11: register the xterm writer for terminal `id` (mount of one tab).
+/// Re-registering the same id replaces the previous sink.
+pub fn set_term_writer(id: u32, f: impl FnMut(Vec<u8>) + 'static) {
+    TERM_WRITE.with(|c| c.borrow_mut().get_or_insert_with(std::collections::HashMap::new).insert(id, Box::new(f)));
+}
+
+/// M11: clear the sink for terminal `id` (tab unmount / session switch).
+pub fn clear_term_writer(id: u32) {
+    TERM_WRITE.with(|c| {
+        if let Some(m) = c.borrow_mut().as_mut() {
+            m.remove(&id);
+        }
+    });
+}
+
+/// M11: clear every terminal sink (session switch tears down all ptys).
+pub fn clear_all_term_writers() {
+    TERM_WRITE.with(|c| {
+        if let Some(m) = c.borrow_mut().as_mut() {
+            m.clear();
+        }
+    });
+}
+
+/// M11: route decoded pty output to the sink registered for `id`
+/// (a no-op when that terminal's view is not mounted).
+fn deliver_term_out(id: u32, bytes: Vec<u8>) {
+    TERM_WRITE.with(|c| {
+        if let Some(m) = c.borrow_mut().as_mut() {
+            if let Some(w) = m.get_mut(&id) {
+                w(bytes);
+            }
+        }
+    });
+}
+
+/// M9: base64-encode a keystroke string for a `term_input` frame.
+pub fn b64_encode(s: &str) -> String {
+    B64.encode(s.as_bytes())
+}
 
 thread_local! {
     /// The live socket for the active session; replaced (and closed) on
@@ -127,6 +180,11 @@ pub fn connect(state: &AppState, session: &str) {
     // connection; a queued flush then finds empty buffers and no-ops,
     // so it can never append into the new session's live card.
     drop_pending_deltas();
+    // M11: a fresh connection owns fresh (no) terminals — the previous
+    // socket's ptys were torn down with it. Reset every terminal's
+    // liveness state and detach every xterm writer sink.
+    state.term_state.set(std::collections::HashMap::new());
+    clear_all_term_writers();
 
     let w = match web_sys::window() {
         Some(w) => w,
@@ -165,6 +223,9 @@ pub fn connect(state: &AppState, session: &str) {
     // v0.5.30: "output" sidebar rank — bumped only when a loop
     // COMPLETES (the running=false branch of "loop_status").
     let output_rank = state.output_rank;
+    // M11: per-terminal liveness (lamp + exit overlay), keyed by the
+    // terminal tab id the server echoes back in term_status frames.
+    let term_state = state.term_state;
     let session_name = session.to_string();
     let hist_oldest_line = state.hist_oldest_line;
     let hist_has_more = state.hist_has_more;
@@ -201,6 +262,7 @@ pub fn connect(state: &AppState, session: &str) {
         let earlier_loaded = earlier_loaded;
         let earlier_failed = earlier_failed;
         let ev_gen = ev_gen;
+        let term_state = term_state;
         let flush = flush;
         Closure::wrap(Box::new(move |e: MessageEvent| {
             let data = match e.data().as_string() {
@@ -575,6 +637,32 @@ pub fn connect(state: &AppState, session: &str) {
                             schedule_delta_flush(&flush);
                         }
                     }
+                    // M11: pty master output (base64) → the xterm writer
+                    // registered for this terminal id (a no-op when that
+                    // terminal's view is not mounted).
+                    "term_out" => {
+                        let id = item.get("id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                        if let Some(data) = item.get("data").and_then(|v| v.as_str()) {
+                            if let Ok(bytes) = B64.decode(data) {
+                                deliver_term_out(id, bytes);
+                            }
+                        }
+                    }
+                    // M11: shell spawn/close status, keyed by terminal id
+                    // — drives that tab's running lamp and exit overlay.
+                    "term_status" => {
+                        let id = item.get("id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                        let running = item.get("running").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let error = item.get("error").and_then(|v| v.as_str()).map(String::from);
+                        term_state.update(|m| {
+                            let ts = m.entry(id).or_default();
+                            ts.running = running;
+                            if running {
+                                ts.started = true;
+                            }
+                            ts.error = error;
+                        });
+                    }
                     _ => {}
                 }
             }
@@ -692,6 +780,44 @@ pub fn load_earlier(state: &AppState) {
             st.earlier_failed.set(true);
         }
     });
+}
+
+// ── M9/M11: terminal frames (the pty lives in the server's WS session) ─
+
+/// M11: open a new PTY (id-tagged, so multiple terminals coexist on one
+/// connection). The server spawns the user's shell in the session's
+/// workdir and answers with a `term_status` frame carrying the same id.
+pub fn term_open(id: u32, cols: u32, rows: u32) {
+    send_command(
+        "",
+        &json!({ "kind": "term_open", "id": id, "cols": cols, "rows": rows }),
+    );
+}
+
+/// M11: send raw keystrokes (already a UTF-8 string from xterm's
+/// `onData`), tagged with the terminal id. Base64-escaped so arbitrary
+/// bytes survive the WS text frame.
+pub fn term_input(id: u32, data: &str) {
+    send_command(
+        "",
+        &json!({ "kind": "term_input", "id": id, "data": b64_encode(data) }),
+    );
+}
+
+/// M11: tell the server to resize a pty (xterm's `onResize` fires after a
+/// window/panel resize), tagged with the terminal id.
+pub fn term_resize(id: u32, cols: u32, rows: u32) {
+    send_command(
+        "",
+        &json!({ "kind": "term_resize", "id": id, "cols": cols, "rows": rows }),
+    );
+}
+
+/// M11: ask the server to kill ONE pty's process group (tab close /
+/// session switch). The other open terminals on the connection are
+/// untouched.
+pub fn term_close(id: u32) {
+    send_command("", &json!({ "kind": "term_close", "id": id }));
 }
 
 /// Rebuild the legacy ctx bookkeeping from a (partial or full) event

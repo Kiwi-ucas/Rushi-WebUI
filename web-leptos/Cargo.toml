@@ -17,6 +17,8 @@ console_error_panic_hook = "0.1"
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
+# M9: base64 for terminal I/O WS frames (keystrokes / pty output).
+base64 = "0.22"
 js-sys = "0.3"
 gloo-timers = { version = "0.3", features = ["futures"] }
 gloo-net = { version = "0.6", features = ["http"] }

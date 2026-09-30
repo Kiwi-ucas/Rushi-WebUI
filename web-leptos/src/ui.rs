@@ -8,7 +8,11 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 
 use crate::api;
-use crate::model::{compute_rounds, GoalView, AppState, SessionInfo, ordered_sessions};
+use crate::model::{
+    AppState, GoalView, SessionInfo, DirEntry, compute_rounds,
+    dispatch_group_label, dispatch_groups, ordered_sessions,
+    RpTab, RpTabKind,
+};
 use crate::timeutil;
 use crate::ws;
 use crate::WEBUI_VERSION;
@@ -37,21 +41,66 @@ fn after_dispatch(f: impl FnOnce() + 'static) {
 /// Context budget (tokens) shown by the context bar (port of ctxBudget).
 pub const CTX_BUDGET: u64 = 262_144;
 
-// ── sidebar collapse (persisted) ──────────────────────────────────
-pub fn read_collapsed() -> bool {
-    web_sys::window()
+// ── three-state layout (M6, persisted) ───────────────────────────
+/// Layout modes: "main" (no sidebar — full main view), "split"
+/// (240 px sidebar + main), "full" (sidebar expanded to full screen:
+/// the multi-session / multi-project dispatch view).
+///
+/// Migrates the legacy binary `rushi-sidebar-collapsed` key: a stored
+/// "1" maps to "main"; anything else falls through to "split".
+pub fn read_layout_mode() -> String {
+    let stored = web_sys::window()
+        .and_then(|w| w.local_storage().ok())
+        .flatten()
+        .and_then(|s| s.get_item("rushi-layout").ok())
+        .flatten();
+    if let Some(v) = stored {
+        match v.as_str() {
+            "main" | "split" | "full" => return v,
+            _ => {} // unknown value — fall through to legacy migration
+        }
+    }
+    let legacy = web_sys::window()
         .and_then(|w| w.local_storage().ok())
         .flatten()
         .and_then(|s| s.get_item("rushi-sidebar-collapsed").ok())
-        .flatten()
-        .as_deref()
-        == Some("1")
+        .flatten();
+    if legacy.as_deref() == Some("1") {
+        "main".to_string()
+    } else {
+        "split".to_string()
+    }
 }
 
-fn set_collapsed(collapsed: bool) {
+fn set_layout_mode(mode: &str) {
     if let Some(s) = web_sys::window().and_then(|w| w.local_storage().ok()).flatten() {
-        let _ = s.set_item("rushi-sidebar-collapsed", if collapsed { "1" } else { "0" });
+        let _ = s.set_item("rushi-layout", mode);
     }
+}
+
+// ── M8: right tool panel (persisted open state; M11: tabs are
+//    connection-scoped, so no per-tab persistence) ─────────────────
+
+pub fn read_rp_open() -> bool {
+    let v = web_sys::window()
+        .and_then(|w| w.local_storage().ok())
+        .flatten()
+        .and_then(|s| s.get_item("rushi-rp-open").ok())
+        .flatten();
+    v.as_deref() == Some("1")
+}
+
+fn set_rp_open_stored(open: bool) {
+    if let Some(s) = web_sys::window().and_then(|w| w.local_storage().ok()).flatten() {
+        let _ = s.set_item("rushi-rp-open", if open { "1" } else { "0" });
+    }
+}
+
+/// M8: the right-panel toggle (`#rp-toggle` in the context bar).
+pub fn toggle_rp(state: AppState) {
+    let open = !state.rp_open.get();
+    state.rp_open.set(open);
+    set_rp_open_stored(open);
 }
 
 // ── theme (v0.5.22: 3-state auto / light / dark, persisted) ────────
@@ -130,6 +179,37 @@ pub fn theme_init(state: AppState) {
         let f: &js_sys::Function = cb.as_js_value().unchecked_ref();
         let _ = mql.add_listener_with_opt_callback(Some(f));
         cb.forget();
+    }
+}
+
+/// v0.5.44: fixed 16×16 SVG icons for the theme toggle. Replaces the
+/// U+25D0/U+2600/U+263E text glyphs, whose font-dependent metrics made
+/// the icon jump in size/baseline between auto/light/dark. All three
+/// shapes are drawn on the same 24-unit grid, sized by CSS, and the
+/// button box is uniform — cycling the mode no longer changes the
+/// button's size or position.
+fn theme_icon(mode: &str) -> AnyView {
+    match mode {
+        "light" => view! {
+            <svg class="tt-ic" viewBox="0 0 24 24" aria-hidden="true">
+                <circle class="ln" cx="12" cy="12" r="5" />
+                <path class="ln" d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42" />
+            </svg>
+        }
+        .into_any(),
+        "dark" => view! {
+            <svg class="tt-ic" viewBox="0 0 24 24" aria-hidden="true">
+                <path class="fl" d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
+            </svg>
+        }
+        .into_any(),
+        _ => view! {
+            <svg class="tt-ic" viewBox="0 0 24 24" aria-hidden="true">
+                <circle class="ln" cx="12" cy="12" r="9" />
+                <path class="fl" d="M12 3a9 9 0 0 0 0 18Z" />
+            </svg>
+        }
+        .into_any(),
     }
 }
 
@@ -256,6 +336,7 @@ pub fn select_session(state: AppState, name: &str) {
     state.loop_cmd_sess.set(None);
     state.menu_session.set(None);
     state.clear_live();
+    reset_panel_session(state);
 
     let s2 = state;
     let name2 = name.to_string();
@@ -279,6 +360,32 @@ pub fn select_session(state: AppState, name: &str) {
     });
 }
 
+/// M11: the right-panel tab model is connection-scoped — a session
+/// switch (or deletion of the active session) tears down every open
+/// tab. The server killed the previous socket's ptys on disconnect, so
+/// close all terminal tabs' ptys explicitly (a no-op for already-dead
+/// ids), detach every xterm writer, and reset to a bare Files home tab.
+fn reset_panel_session(state: AppState) {
+    for t in state.rp_tabs.get().iter().filter(|t| t.kind == RpTabKind::Term) {
+        ws::term_close(t.id);
+    }
+    ws::clear_all_term_writers();
+    state.rp_tabs.set(vec![RpTab {
+        id: 0,
+        kind: RpTabKind::Files,
+        path: String::new(),
+        label: "Files".to_string(),
+    }]);
+    state.rp_active.set(0);
+    state.rp_next_id.set(1);
+    state.rp_term_seq.set(1);
+    state.rp_expanded.update(|s| s.clear());
+    state.rp_children.set(std::collections::HashMap::new());
+    state.rp_preview_map.set(std::collections::HashMap::new());
+    state.rp_err_map.set(std::collections::HashMap::new());
+    state.term_state.set(std::collections::HashMap::new());
+}
+
 pub fn delete_session(state: AppState, name: &str) {
     let name_owned = name.to_string();
     let s2 = state;
@@ -293,6 +400,7 @@ pub fn delete_session(state: AppState, name: &str) {
                     s2.rounds_ctxk.set(Vec::new());
                     s2.goal.set(None);
                     s2.clear_live();
+                    reset_panel_session(s2);
                     ws::close_current();
                     s2.ws_status.set("disconnected".to_string());
                 }
@@ -363,6 +471,194 @@ pub fn stop_loop(state: AppState) {
         });
     }
     state.loop_running.set(false);
+}
+
+/// M7: dispatch-view quick action — start/stop the loop of ANY
+/// session (not just the active one) over REST. The server's
+/// loop_status frames update the per-session lamps; if the target is
+/// the active session, mirror the local send-button flag too.
+pub fn dispatch_loop_action(state: AppState, name: &str, start: bool) {
+    let active = state.active_session.get();
+    if active.as_deref() == Some(name) {
+        state.loop_running.set(start);
+    }
+    let name_owned = name.to_string();
+    spawn_local(async move {
+        let r = if start {
+            api::start_loop(&name_owned).await
+        } else {
+            api::stop_loop(&name_owned).await
+        };
+        if let Err(e) = r {
+            if let Some(w) = web_sys::window() {
+                let _ = w.alert_with_message(&format!(
+                    "{} loop for {} failed: {e}",
+                    if start { "start" } else { "stop" },
+                    name_owned
+                ));
+            }
+        }
+    });
+}
+
+/// M7: the last-modified time for dispatch cards (same 0-based HH:MM:SS
+/// label as the flat sidebar list; "no events" when never written).
+fn dispatch_time_label(ts: Option<f64>) -> String {
+    ts.map(|t| {
+        let d = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(t * 1000.0));
+        format!("{:02}:{:02}:{:02}", d.get_hours(), d.get_minutes(), d.get_seconds())
+    })
+    .unwrap_or_else(|| "no events".to_string())
+}
+
+/// M7: one project group in the dispatch view (layout "full"): a header
+/// line (project directory, full path in the title, card count) plus one
+/// card per session. The group's membership/order is baked into the For
+/// key (see Sidebar), so the group re-renders when a session joins,
+/// leaves, or reorders within the project.
+fn dispatch_group_block(
+    state: AppState,
+    group_key: String,
+    group_sessions: Vec<SessionInfo>,
+) -> impl IntoView {
+    let label = dispatch_group_label(&group_key);
+    let count = group_sessions.len();
+    view! {
+        <div class="dispatch-group">
+            <div class="dispatch-group-head" title={group_key.clone()}>
+                { label.clone() }
+                <span class="dispatch-group-count">{ count }</span>
+            </div>
+            <For
+                each=move || group_sessions.clone()
+                key=|s: &SessionInfo| s.name.clone()
+                children=move |s| dispatch_card(state, s.clone())
+            />
+        </div>
+    }
+}
+
+/// M7: a single session card in the dispatch view: name + last-output
+/// time on the top line, and a start/stop toggle plus the session menu
+/// on the action line. Clicking the card enters the session and returns
+/// to the "split" layout.
+fn dispatch_card(state: AppState, s: SessionInfo) -> impl IntoView {
+    let name = s.name.clone();
+    let ts = s.last_modified;
+
+    let active = state.active_session;
+    let loop_running = state.loop_running;
+    let looping_set = state.looping_sessions;
+    let done_set = state.loop_done_unviewed;
+    let menu_session = state.menu_session;
+    let menu_pos = state.menu_pos;
+    let layout = state.layout_mode;
+
+    // One owned clone per `move` handler (same idiom as the flat
+    // list): each handler owns its copy and only ever *borrows* it,
+    // keeping every `on:` handler an `Fn` closure.
+    let name_cls = name.clone();
+    let name_click = name.clone();
+    let name_qa_cls = name.clone(); // quick-action button class
+    let name_qa_lbl = name.clone(); // quick-action button label
+    let name_qa_ck = name.clone(); // quick-action button click
+    let name_menu = name.clone();
+    let name_view = name.clone();
+    let name_title = name.clone();
+
+    let card_cls = move || {
+        let n = name_cls.as_str();
+        let active_now = active.get().as_deref() == Some(n);
+        let looping_now = looping_set.get().contains(n)
+            || (active_now && loop_running.get());
+        let done_now = done_set.get().contains(n);
+        let mut c = String::from("dispatch-card");
+        if active_now {
+            c.push_str(" active");
+        }
+        if looping_now {
+            c.push_str(" running");
+        }
+        if done_now && !looping_now {
+            c.push_str(" done");
+        }
+        c
+    };
+
+    // The quick action is a single toggle button: "▶ start" while this
+    // session's loop is stopped, "■ stop" while it runs. For the
+    // active session the live flag is `loop_running`; all others use
+    // the server-driven `looping_sessions` set.
+    let qa_cls = move || {
+        let n = name_qa_cls.as_str();
+        let running = looping_set.get().contains(n)
+            || (active.get().as_deref() == Some(n) && loop_running.get());
+        if running {
+            "qa qa-stop".to_string()
+        } else {
+            "qa qa-go".to_string()
+        }
+    };
+    let qa_label = move || {
+        let n = name_qa_lbl.as_str();
+        let running = looping_set.get().contains(n)
+            || (active.get().as_deref() == Some(n) && loop_running.get());
+        if running {
+            "\u{25A0}  stop".to_string()
+        } else {
+            "\u{25B6}  start".to_string()
+        }
+    };
+
+    view! {
+        <div
+            class=card_cls
+            on:click=move |_| {
+                // M7: entering a session from the dispatch view returns
+                // to the split layout.
+                select_session(state, &name_click);
+                menu_session.set(None);
+                if layout.get() == "full" {
+                    layout.set("split".to_string());
+                    set_layout_mode("split");
+                }
+            }
+        >
+            <div class="dc-top">
+                <span class="dc-name" title={name_title}>{ name_view }</span>
+                <span class="dc-time">{ dispatch_time_label(ts) }</span>
+            </div>
+            <div class="dc-actions">
+                <button
+                    class=qa_cls
+                    title="start / stop this session's loop"
+                    on:click=move |e: MouseEvent| {
+                        e.stop_propagation();
+                        let n = name_qa_ck.as_str();
+                        let running = looping_set.get().contains(n)
+                            || (active.get().as_deref() == Some(n) && loop_running.get());
+                        dispatch_loop_action(state, &name_qa_ck, !running);
+                    }
+                >
+                    { qa_label }
+                </button>
+                <button
+                    class="sess-more"
+                    title="session actions"
+                    on:click=move |e: MouseEvent| {
+                        e.stop_propagation();
+                        menu_pos.set((
+                            e.client_x() as f64,
+                            e.client_y() as f64,
+                        ));
+                        menu_session.set(Some(name_menu.clone()));
+                    }
+                >
+                    { "\u{2026}" }
+                </button>
+            </div>
+        </div>
+    }
 }
 
 pub async fn do_send(state: AppState, content: String, queue: String) {
@@ -448,7 +744,7 @@ pub fn Sidebar(state: AppState) -> impl IntoView {
     let active = state.active_session;
     let loop_running = state.loop_running;
     let ws_status = state.ws_status;
-    let collapsed = state.sidebar_collapsed;
+    let layout = state.layout_mode;
 
     // The menu state lives in AppState so the ported document-level
     // click/Escape handlers (pile::init) can close it.
@@ -476,23 +772,18 @@ pub fn Sidebar(state: AppState) -> impl IntoView {
 
     // v0.5.22: theme cycle button (auto → light → dark → auto).
     let theme_mode = state.theme_mode;
-    let theme_icon = move || match theme_mode.get().as_str() {
-        "light" => "\u{2600}".to_string(),
-        "dark" => "\u{263e}".to_string(),
-        _ => "\u{25d0}".to_string(),
-    };
     let theme_title = move || match theme_mode.get().as_str() {
         "light" => "theme: light — click for dark".to_string(),
         "dark" => "theme: dark — click for auto".to_string(),
         _ => "theme: auto (follows system) — click for light".to_string(),
     };
 
-    let sidebar_cls = move || {
-        if collapsed.get() { "collapsed".to_string() } else { String::new() }
-    };
+    // M6: layout is driven entirely by the `#app.layout-*` class
+    // (lib.rs); the aside itself carries no state class.
+    // (`layout` is bound at the top of this function.)
 
     view! {
-        <aside id="sidebar" class=sidebar_cls>
+        <aside id="sidebar">
             <div id="sidebar-inner">
                 <div class="sb-header">
                     <h1>
@@ -518,19 +809,51 @@ pub fn Sidebar(state: AppState) -> impl IntoView {
                                 theme_apply(state);
                             }
                         >
-                            { theme_icon }
+                            { move || theme_icon(theme_mode.get().as_str()) }
                         </button>
-                        <button
-                            id="sidebar-toggle"
-                            title="collapse sidebar"
-                            on:click=move |_| {
-                                let v = !collapsed.get();
-                                collapsed.set(v);
-                                set_collapsed(v);
-                            }
-                        >
-                            { "\u{2039}" }
-                        </button>
+                        // M6: the sidebar is visible in "split" and "full"
+                        // (hidden in "main", where the ContextBar's » button
+                        // brings it back). The collapse chevron is state-
+                        // dependent: from "split" it hides the sidebar
+                        // (→ "main"); from "full" it returns to "split".
+                        <Show when=move || layout.get() != "main" fallback=|| ()>
+                            <button
+                                id="sidebar-toggle"
+                                title=move || {
+                                    if layout.get() == "full" {
+                                        "back to split view".to_string()
+                                    } else {
+                                        "hide sidebar".to_string()
+                                    }
+                                }
+                                on:click=move |_| {
+                                    let next = if layout.get() == "full" {
+                                        "split"
+                                    } else {
+                                        "main"
+                                    };
+                                    layout.set(next.to_string());
+                                    set_layout_mode(next);
+                                }
+                            >
+                                { "\u{2039}" }
+                            </button>
+                        </Show>
+                        // M6: the expand chevron (symmetric to the collapse
+                        // one) grows the sidebar to the full-screen
+                        // dispatch view. Only offered from "split".
+                        <Show when=move || layout.get() == "split" fallback=|| ()>
+                            <button
+                                id="sidebar-expand"
+                                title="expand sidebar to full screen"
+                                on:click=move |_| {
+                                    layout.set("full".to_string());
+                                    set_layout_mode("full");
+                                }
+                            >
+                                { "\u{203A}" }
+                            </button>
+                        </Show>
                     </div>
                 </div>
                 <div id="session-actions">
@@ -631,6 +954,43 @@ pub fn Sidebar(state: AppState) -> impl IntoView {
                         drop_target.set(None);
                     }
                 >
+                    // M7: the dispatch view (layout "full") — sessions
+                    // grouped by project (cwd), each card carrying
+                    // start/stop quick actions. The flat list below stays
+                    // the split/main rendering.
+                    <Show
+                        when=move || layout.get() == "full"
+                        fallback=|| ()
+                    >
+                        <For
+                            each=move || {
+                                let s = sessions.get();
+                                let m = sort_mode.get();
+                                let o = custom_order.get();
+                                let r = output_rank.get();
+                                dispatch_groups(&s, &m, &o, &r)
+                            }
+                            // key includes the member order so any
+                            // reordering within a project re-renders the
+                            // group.
+                            key=|g: &(String, Vec<SessionInfo>)| {
+                                let mut k = g.0.clone();
+                                k.push_str("::");
+                                for item in &g.1 {
+                                    k.push_str(&item.name);
+                                    k.push(',');
+                                }
+                                k
+                            }
+                            children=move |g| {
+                                dispatch_group_block(state, g.0.clone(), g.1.clone())
+                            }
+                        />
+                    </Show>
+                    <Show
+                        when=move || layout.get() != "full"
+                        fallback=|| ()
+                    >
                     <For
                         each=move || {
                             let s = sessions.get();
@@ -801,6 +1161,7 @@ pub fn Sidebar(state: AppState) -> impl IntoView {
                             }
                         }
                     />
+                    </Show>
                 </div>
                 <GoalPanel state=state />
                 <div id="status-bar">
@@ -989,7 +1350,7 @@ pub fn ContextBar(state: AppState) -> impl IntoView {
     let ctx_used = state.ctx_used;
     let view_round = state.view_round;
     let events = state.events;
-    let collapsed = state.sidebar_collapsed;
+    let layout = state.layout_mode;
 
     let fill_style = move || {
         let used = ctx_used.get();
@@ -1020,13 +1381,13 @@ pub fn ContextBar(state: AppState) -> impl IntoView {
     view! {
         <div id="context-bar">
             <div id="ctx-row">
-                <Show when=move || collapsed.get() fallback=|| ()>
+                <Show when=move || layout.get() == "main" fallback=|| ()>
                     <button
                         id="sidebar-open"
                         title="expand sidebar"
                         on:click=move |_| {
-                            collapsed.set(false);
-                            set_collapsed(false);
+                            layout.set("split".to_string());
+                            set_layout_mode("split");
                         }
                     >
                         { "\u{00bb}" }
@@ -1038,6 +1399,22 @@ pub fn ContextBar(state: AppState) -> impl IntoView {
                 </div>
                 <span id="ctx-pct">{ ctx_pct }</span>
                 <span id="ctx-k">{ ctx_k }</span>
+                // M8: right tool panel toggle (Files tree / preview /
+                // terminal). Right edge of the context bar, symmetric to
+                // the sidebar's own edge buttons.
+                <button
+                    id="rp-toggle"
+                    title=move || {
+                        if state.rp_open.get() {
+                            "close the right panel".to_string()
+                        } else {
+                            "open the right panel".to_string()
+                        }
+                    }
+                    on:click=move |_| toggle_rp(state)
+                >
+                    { move || if state.rp_open.get() { "▣" } else { "▢" } }
+                </button>
             </div>
             <div id="ctx-rounds">
                 { move || rounds_view(events, view_round, state) }
@@ -1458,6 +1835,29 @@ fn qsel_opt(
     }
 }
 
+/// v0.5.44: fixed 16×16 play/stop icons for #btn-send. Replaces the
+/// U+25B6/U+25A0 text glyphs, whose font-dependent metrics left the
+/// mark off-centre in the button. Both shapes are drawn centred on the
+/// 24-unit grid and sized/filled by CSS (`#btn-send svg` / `.fl`), so
+/// the mark sits exactly in the button's centre.
+fn send_stop_icon(running: bool) -> AnyView {
+    if running {
+        view! {
+            <svg class="send-ic" viewBox="0 0 24 24" aria-hidden="true">
+                <path class="fl" d="M6 6h12v12H6z" />
+            </svg>
+        }
+        .into_any()
+    } else {
+        view! {
+            <svg class="send-ic" viewBox="0 0 24 24" aria-hidden="true">
+                <path class="fl" d="M8 5v14l11-7z" />
+            </svg>
+        }
+        .into_any()
+    }
+}
+
 #[component]
 pub fn InputModule(state: AppState) -> impl IntoView {
     let msg = RwSignal::new(String::new());
@@ -1567,10 +1967,661 @@ pub fn InputModule(state: AppState) -> impl IntoView {
                         });
                     }
                 >
-                    { move || if loop_running.get() { "\u{25A0}" } else { "\u{25B6}" } }
+                    { move || send_stop_icon(loop_running.get()) }
                 </button>
             </div>
         </div>
+    }
+}
+
+// ── M8/M11: right tool panel — Files tree + browser-style multi-tab ──
+
+/// M8: true when `name` ends with an image extension (the preview pane
+/// renders an <img> via the raw endpoint instead of a text read, which
+/// returns 415 for binary files).
+fn is_image_ext(name: &str) -> bool {
+    let ext = name.rsplit('.').next().map(|s| s.to_ascii_lowercase());
+    matches!(
+        ext.as_deref(),
+        Some("png")
+            | Some("jpg")
+            | Some("jpeg")
+            | Some("gif")
+            | Some("webp")
+            | Some("svg")
+            | Some("ico")
+            | Some("bmp")
+    )
+}
+
+/// M8/M11: 14×14 folder icon for the Files home tab (inline SVG so the
+/// glyph is stable across fonts; strokes inherit `currentColor`).
+fn tab_icon_files() -> impl IntoView {
+    view! {
+        <svg class="rp-tab-ic" viewBox="0 0 16 16" aria_hidden="true">
+            <path class="ln" d="M2 4a1 1 0 0 1 1-1h4l1.5 2H13a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1z" />
+        </svg>
+    }
+}
+
+/// M11: 14×14 document icon for a File tab.
+fn tab_icon_file() -> impl IntoView {
+    view! {
+        <svg class="rp-tab-ic" viewBox="0 0 16 16" aria_hidden="true">
+            <path class="ln" d="M4 2h5l3 3v9H4z" />
+            <path class="ln" d="M9 2v3h3" />
+        </svg>
+    }
+}
+
+/// M8/M11: 14×14 terminal-prompt icon for terminal tabs.
+fn tab_icon_term() -> impl IntoView {
+    view! {
+        <svg class="rp-tab-ic" viewBox="0 0 16 16" aria_hidden="true">
+            <rect class="ln" x="1.5" y="3" width="13" height="10" rx="2" />
+            <path class="ln" d="M4.5 6.5 7 9l-2.5 2.5" />
+            <path class="ln" d="M9.5 11.5H12" />
+        </svg>
+    }
+}
+
+/// M8/M11: extension label for the preview name chip ("PNG", "RS", …),
+/// falling back to "FILE" for extension-less names.
+fn ext_label(name: &str) -> String {
+    name.rsplit('.')
+        .next()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_uppercase())
+        .unwrap_or_else(|| "FILE".to_string())
+}
+
+/// M11: human byte size for the preview size hint ("4.2 KB").
+fn fmt_bytes(n: u64) -> String {
+    if n < 1024 {
+        format!("{n} B")
+    } else if n < 1024 * 1024 {
+        format!("{:.1} KB", n as f64 / 1024.0)
+    } else {
+        format!("{:.1} MB", n as f64 / 1024.0 / 1024.0)
+    }
+}
+
+/// M11: hard cap on concurrently open terminal tabs. The server enforces
+/// the same cap on the per-connection pty pool.
+const MAX_TERM_TABS: u32 = 4;
+
+/// M11: a File tab already open for this workdir-relative path? (tree
+/// "selected" mark + open-file reuse).
+fn has_file_tab(state: AppState, rel: &str) -> bool {
+    state
+        .rp_tabs
+        .get()
+        .iter()
+        .any(|t| t.kind == RpTabKind::File && t.path == rel)
+}
+
+/// M8: lazily fetch one directory's listing and cache it in
+/// `rp_children`. A stale response (the user switched session in the
+/// meantime) must not pollute the current view, so the write is guarded
+/// by a session check. Failures surface in the Files home tab's error
+/// slot (`rp_err_map[0]`).
+fn ensure_dir_loaded(state: AppState, rel: &str) {
+    let sess = match state.active_session.get() {
+        Some(s) => s,
+        None => return,
+    };
+    let rel_owned = rel.to_string();
+    spawn_local(async move {
+        match api::list_dir(&sess, &rel_owned).await {
+            Ok(dl) => {
+                if state.active_session.get() == Some(sess.clone()) {
+                    state
+                        .rp_children
+                        .update(|m| { m.insert(rel_owned.clone(), dl.entries); });
+                }
+                if rel_owned.is_empty() {
+                    // A successful root re-list clears the home-tab error.
+                    state.rp_err_map.update(|m| {
+                        m.remove(&0u32);
+                    });
+                }
+            }
+            Err(e) => {
+                state
+                    .rp_err_map
+                    .update(|m| { m.insert(0, format!("cannot list {rel_owned}: {e}")); });
+            }
+        }
+    });
+}
+
+/// M8: toggle a directory expanded/collapsed; fetch on first expand.
+fn toggle_dir(state: AppState, rel: &str) {
+    let expanded = state.rp_expanded;
+    let opening = !expanded.get().contains(rel);
+    expanded.update(|s| {
+        if opening {
+            s.insert(rel.to_string());
+        } else {
+            s.remove(rel);
+        }
+    });
+    if opening && !state.rp_children.get().contains_key(rel) {
+        ensure_dir_loaded(state, rel);
+    }
+}
+
+/// M11: open a file in the panel. If a tab already has it, just focus
+/// that tab; otherwise allocate a fresh tab id, push it, focus it, and
+/// fetch the preview into `rp_preview_map[id]` (read errors land in
+/// `rp_err_map[id]`, images are an exception — their preview pane renders
+/// the raw <img> instead).
+fn open_file(state: AppState, rel: &str) {
+    let rel_owned = rel.to_string();
+    if let Some(id) = state
+        .rp_tabs
+        .get()
+        .iter()
+        .find(|t| t.kind == RpTabKind::File && t.path == rel_owned)
+        .map(|t| t.id)
+    {
+        state.rp_active.set(id);
+        return;
+    }
+    let sess = match state.active_session.get() {
+        Some(s) => s,
+        None => return,
+    };
+    let id = state.rp_next_id.get();
+    state.rp_next_id.update(|n| *n += 1);
+    let label = rel_owned
+        .rsplit('/')
+        .next()
+        .unwrap_or(rel_owned.as_str())
+        .to_string();
+    state.rp_tabs.update(|tabs| {
+        tabs.push(RpTab {
+            id,
+            kind: RpTabKind::File,
+            path: rel_owned.clone(),
+            label,
+        });
+    });
+    state.rp_active.set(id);
+    let rp_preview_map = state.rp_preview_map;
+    let rp_err_map = state.rp_err_map;
+    spawn_local(async move {
+        match api::read_file(&sess, &rel_owned).await {
+            Ok(pv) => {
+                if state.active_session.get() == Some(sess.clone()) {
+                    rp_preview_map.update(|m| { m.insert(id, Some(pv)); });
+                }
+            }
+            Err(e) => {
+                // Images fail the text read (binary → 415); the preview
+                // pane renders the raw <img> for image extensions, so
+                // only non-images surface an error here.
+                if !is_image_ext(&rel_owned) {
+                    rp_err_map.update(|m| { m.insert(id, e); });
+                }
+            }
+        }
+    });
+}
+
+/// M11: open a new terminal tab (up to MAX_TERM_TABS; the server enforces
+/// the same cap on its pty pool). The tab id doubles as the server pty
+/// id, so each tab owns exactly one shell.
+fn new_terminal(state: AppState) {
+    if state.active_session.get().is_none() {
+        return;
+    }
+    let term_count = state
+        .rp_tabs
+        .get()
+        .iter()
+        .filter(|t| t.kind == RpTabKind::Term)
+        .count() as u32;
+    if term_count >= MAX_TERM_TABS {
+        // Surface the limit in the panel's error slot (the Files tab),
+        // auto-cleared after a few seconds.
+        state.rp_err_map.update(|m| {
+            m.insert(0, "terminal limit reached (4 open)".to_string());
+        });
+        let errmap = state.rp_err_map;
+        spawn_local(async move {
+            gloo_timers::future::TimeoutFuture::new(4000).await;
+            errmap.update(|m| {
+                if m.get(&0u32).is_some_and(|e| e.starts_with("terminal limit")) {
+                    m.remove(&0u32);
+                }
+            });
+        });
+        return;
+    }
+    let id = state.rp_next_id.get();
+    state.rp_next_id.update(|n| *n += 1);
+    let seq = state.rp_term_seq.get();
+    state.rp_term_seq.update(|n| *n += 1);
+    let label = format!("Term {seq}");
+    state.rp_tabs.update(|tabs| {
+        tabs.push(RpTab {
+            id,
+            kind: RpTabKind::Term,
+            path: String::new(),
+            label,
+        });
+    });
+    state
+        .term_state
+        .update(|m| {
+            m.entry(id).or_default();
+        });
+    state.rp_active.set(id);
+}
+
+/// M11: close one tab. Terminal tabs close their pty on the server
+/// (`term_close{id}` — the connection stays open, the other tabs'
+/// shells keep running). File tabs just drop their cached preview/error.
+/// The Files home tab (id 0) is permanent. After closing the active tab,
+/// focus moves to the previous tab (or the home tab).
+fn close_tab(state: AppState, id: u32) {
+    if id == 0 {
+        return; // the Files home tab is permanent
+    }
+    let kind = match state.rp_tabs.get().iter().find(|t| t.id == id) {
+        Some(t) => t.kind,
+        None => return,
+    };
+    if kind == RpTabKind::Term {
+        ws::term_close(id);
+        ws::clear_term_writer(id);
+        state.term_state.update(|m| { m.remove(&id); });
+    }
+    state.rp_preview_map.update(|m| { m.remove(&id); });
+    state.rp_err_map.update(|m| { m.remove(&id); });
+    let tabs = state.rp_tabs.get();
+    let idx = tabs.iter().position(|t| t.id == id).unwrap_or(0);
+    let prev = tabs.iter().take(idx).last().map(|t| t.id).unwrap_or(0);
+    state.rp_tabs.update(|ts| ts.retain(|t| t.id != id));
+    if state.rp_active.get() == id {
+        state.rp_active.set(prev);
+    }
+}
+
+/// M8/M11: one tree node. A directory shows a caret + its (lazily
+/// fetched) children when expanded; a file opens its own tab. The
+/// "selected" mark = a File tab is open for this path. `parent_rel` is
+/// the workdir-relative path of the containing directory ("" = root).
+fn tree_node(state: AppState, e: DirEntry, parent_rel: String, depth: u32) -> impl IntoView {
+    let name = e.name.clone();
+    let is_dir = e.is_dir;
+    let expanded = state.rp_expanded;
+    let rel = if parent_rel.is_empty() {
+        name.clone()
+    } else {
+        format!("{parent_rel}/{name}")
+    };
+    // One owned clone per `move` handler (M7 idiom): each view! closure
+    // captures its own copy, since a single String can't be moved into
+    // two closures.
+    let rel_cls = rel.clone();
+    let rel_caret = rel.clone();
+    let rel_name = rel.clone();
+    let rel_when = rel.clone();
+    view! {
+        <div
+            class=move || {
+                let mut c = String::from("rp-node");
+                if is_dir && expanded.get().contains(&rel_cls) {
+                    c.push_str(" open");
+                }
+                // M11: "selected" = a File tab is open for this path.
+                if has_file_tab(state, &rel_cls) {
+                    c.push_str(" sel");
+                }
+                c
+            }
+        >
+            <button
+                class=move || if is_dir { "rp-caret" } else { "rp-caret leaf" }
+                title=rel_caret.clone()
+                on:click=move |_| {
+                    if is_dir {
+                        toggle_dir(state, &rel_caret);
+                    }
+                }
+            >
+                { if is_dir { "\u{25b8}" } else { "\u{b7}" } }
+            </button>
+            <span
+                class="rp-node-name"
+                title=rel_name.clone()
+                on:click=move |_| {
+                    if is_dir {
+                        toggle_dir(state, &rel_name);
+                    } else {
+                        open_file(state, &rel_name);
+                    }
+                }
+            >
+                { name.clone() }
+            </span>
+            <Show
+                when=move || is_dir && expanded.get().contains(&rel_when)
+                fallback=|| ()
+            >
+                { tree_level(state, rel.clone(), depth + 1) }
+            </Show>
+        </div>
+    }
+}
+
+/// M8: the children of one directory level. Entries come from the
+/// lazily-filled `rp_children` cache ("" = the workdir root), so the
+/// level renders nothing until its listing arrives.
+fn tree_level(state: AppState, rel: String, depth: u32) -> AnyView {
+    // One owned clone per `move` closure (the Memo's read closure and
+    // the For's children closure), since a single String can't be moved
+    // into both.
+    let rel_memo = rel.clone();
+    let rel_child = rel.clone();
+    let entries = Memo::new(move |_prev: Option<&Vec<DirEntry>>| {
+        let map = state.rp_children.get();
+        map.get(&rel_memo).cloned().unwrap_or_default()
+    });
+    view! {
+        <For
+            each=move || entries.get()
+            key=|e: &DirEntry| e.name.clone()
+            children=move |e| tree_node(state, e, rel_child.clone(), depth)
+        />
+    }
+    .into_any()
+}
+
+/// M11: the Files home tab (id 0) — the working directory's lazy tree,
+/// a small cwd hint header, and the panel's error slot. File previews
+/// live in their own tabs, so the home tab is tree-only and fills the
+/// whole pane.
+fn files_tab(state: AppState) -> impl IntoView {
+    // Fetch the workdir root listing on mount / session change. The
+    // guard makes it a no-op once the root is cached, so the effect
+    // that re-runs when the cache fills in does not loop.
+    Effect::new(move || {
+        let sess = state.active_session.get();
+        if sess.is_none() {
+            return;
+        }
+        let cached = state.rp_children.get().contains_key("");
+        if !cached {
+            ensure_dir_loaded(state, "");
+        }
+    });
+
+    let active = state.active_session;
+    let sessions = state.sessions;
+    let rp_err_map = state.rp_err_map;
+
+    view! {
+        <div class="rp-files">
+            <div class="rp-tree-meta">
+                <span class="rp-tree-cwd">
+                    { move || {
+                        let cwd = active
+                            .get()
+                            .as_ref()
+                            .and_then(|n| {
+                                sessions
+                                    .get()
+                                    .iter()
+                                    .find(|s| s.name == *n)
+                                    .and_then(|s| s.cwd.clone())
+                            })
+                            .unwrap_or_default();
+                        cwd.rsplit('/')
+                            .next()
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or("workdir")
+                            .to_string()
+                    } }
+                </span>
+            </div>
+            <div class="rp-tree">
+                { move || {
+                    if active.get().is_none() {
+                        view! { <div class="rp-empty">{ "select a session" }</div> }.into_any()
+                    } else if state.rp_children.get().contains_key("") {
+                        tree_level(state, String::new(), 0)
+                    } else {
+                        view! { <div class="rp-empty rp-loading">{ "loading…" }</div> }.into_any()
+                    }
+                } }
+            </div>
+            { move || {
+                match rp_err_map.get().get(&0u32).cloned() {
+                    Some(e) => view! { <div class="rp-err">{ e }</div> }.into_any(),
+                    None => view! { <div class="rp-empty rp-loading">{ "" }</div> }.into_any(),
+                }
+            } }
+        </div>
+    }
+}
+
+/// M11: the preview pane of one File tab — a sunken card with a name
+/// pill, extension chip, size hint, and the content (pre/code for
+/// text, an <img> for image extensions, an error card for read
+/// failures).
+fn file_tab_view(state: AppState, tab: RpTab) -> impl IntoView {
+    let id = tab.id;
+    let rel = tab.path;
+    let label = tab.label;
+    let rp_preview_map = state.rp_preview_map;
+    let rp_err_map = state.rp_err_map;
+    let active = state.active_session;
+
+    view! {
+        <div class="rp-preview">
+            <div class="rp-preview-bar">
+                <span class="rp-preview-name" title={ label.clone() }>
+                    { label.clone() }
+                </span>
+                <span class="rp-ext">{ ext_label(&rel) }</span>
+                <span class="rp-trunc">
+                    { move || {
+                        rp_preview_map
+                            .get()
+                            .get(&id)
+                            .and_then(|p| p.as_ref())
+                            .is_some_and(|p| p.truncated)
+                            .then(|| "… truncated".to_string())
+                            .unwrap_or_default()
+                    } }
+                </span>
+                <span class="rp-size">
+                    { move || {
+                        rp_preview_map
+                            .get()
+                            .get(&id)
+                            .and_then(|p| p.as_ref())
+                            .map(|p| fmt_bytes(p.size))
+                            .unwrap_or_default()
+                    } }
+                </span>
+            </div>
+            { move || {
+                let pv = rp_preview_map.get().get(&id).cloned().flatten();
+                let err = rp_err_map.get().get(&id).cloned();
+                if is_image_ext(&rel) {
+                    let act = active;
+                    let src_s = rel.clone();
+                    let alt_s = rel.clone();
+                    view! {
+                        <div class="rp-img-wrap">
+                            <img
+                                class="rp-img"
+                                src=move || {
+                                    let sess = act.get().unwrap_or_default();
+                                    api::raw_url(&sess, &src_s)
+                                }
+                                alt=move || alt_s.clone()
+                            />
+                        </div>
+                    }
+                    .into_any()
+                } else if let Some(p) = pv {
+                    view! {
+                        <pre class="rp-code"><code>{ p.content }</code></pre>
+                    }
+                    .into_any()
+                } else if let Some(e) = err {
+                    view! {
+                        <div class="rp-err">{ e }</div>
+                    }
+                    .into_any()
+                } else {
+                    view! {
+                        <div class="rp-empty rp-loading">{ "loading…" }</div>
+                    }
+                    .into_any()
+                }
+            } }
+        </div>
+    }
+}
+
+/// M11: the body pane of one right-panel tab. All open tabs stay mounted
+/// (terminal shells keep running while their tab is hidden); CSS makes
+/// only the active pane visible — via `visibility` (not `display`) so
+/// hidden panes keep their size and xterm's scrollback + pty dims
+/// survive tab switches.
+fn tab_pane(state: AppState, tab: RpTab) -> AnyView {
+    let t_id = tab.id;
+    let content: AnyView = match tab.kind {
+        RpTabKind::Files => files_tab(state).into_any(),
+        RpTabKind::File => file_tab_view(state, tab.clone()).into_any(),
+        RpTabKind::Term => crate::terminal::TerminalView(
+            crate::terminal::TerminalViewProps {
+                state,
+                term_id: t_id,
+            },
+        )
+        .into_any(),
+    };
+    view! {
+        <div
+            class=move || {
+                let mut c = String::from("rp-pane");
+                if state.rp_active.get() == t_id {
+                    c.push_str(" active");
+                }
+                c
+            }
+        >
+            { content }
+        </div>
+    }
+    .into_any()
+}
+
+/// M8/M11: the right tool panel — a fixed 420 px column in #app
+/// (sibling of #main, so #main shrinks to make room). Browser-style
+/// multi-tab: a persistent "Files" home tab (id 0, not closable) owns
+/// the directory tree; every opened file or terminal becomes its own
+/// closable tab; the "+" button spawns a new terminal (max 4, mirroring
+/// the server's pty cap). Hidden in the "full" dispatch layout (that
+/// view owns the whole window) and when the context-bar toggle is off.
+#[component]
+pub fn RightPanel(state: AppState) -> impl IntoView {
+    let tabs = state.rp_tabs;
+    let active_id = state.rp_active;
+    let active_session = state.active_session;
+
+    view! {
+        <aside id="right-panel">
+            <div class="rp-tabbar">
+                <div class="rp-tabs">
+                    <For
+                        each=move || tabs.get()
+                        key=|t: &RpTab| t.id.to_string()
+                        children=move |tab| {
+                            let t_id = tab.id;
+                            let t_kind = tab.kind;
+                            let t_label = tab.label.clone();
+                            let closable = tab.id != 0;
+                            view! {
+                                <div
+                                    class=move || {
+                                        let mut c = String::from("rp-tab-item");
+                                        if active_id.get() == t_id {
+                                            c.push_str(" active");
+                                        }
+                                        c
+                                    }
+                                >
+                                    <button
+                                        class="rp-tab-main"
+                                        title=t_label.clone()
+                                        on:click=move |_| {
+                                            state.rp_active.set(t_id);
+                                        }
+                                    >
+                                        {
+                                            let icon: AnyView = match t_kind {
+                                                RpTabKind::Files => tab_icon_files().into_any(),
+                                                RpTabKind::File => tab_icon_file().into_any(),
+                                                RpTabKind::Term => tab_icon_term().into_any(),
+                                            };
+                                            icon
+                                        }
+                                        <span class="rp-tab-label">{ t_label.clone() }</span>
+                                    </button>
+                                    {
+                                        move || {
+                                            if closable {
+                                                Some(view! {
+                                                    <button
+                                                        class="rp-tab-x"
+                                                        title="close tab"
+                                                        on:click=move |_| close_tab(state, t_id)
+                                                    >
+                                                        { "\u{00d7}" }
+                                                    </button>
+                                                })
+                                            } else {
+                                                None
+                                            }
+                                        }
+                                    }
+                                </div>
+                            }
+                        }
+                    />
+                </div>
+                <button
+                    class="rp-tab-new"
+                    title="new terminal (max 4 open)"
+                    disabled=move || active_session.get().is_none()
+                    on:click=move |_| new_terminal(state)
+                >
+                    { "+" }
+                </button>
+                <button
+                    id="rp-close"
+                    title="close the panel"
+                    on:click=move |_| toggle_rp(state)
+                >
+                    { "\u{00d7}" }
+                </button>
+            </div>
+            <div class="rp-body">
+                <For
+                    each=move || tabs.get()
+                    key=|t: &RpTab| t.id.to_string()
+                    children=move |tab| tab_pane(state, tab)
+                />
+            </div>
+        </aside>
     }
 }
 

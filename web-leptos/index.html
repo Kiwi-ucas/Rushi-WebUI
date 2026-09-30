@@ -21,6 +21,13 @@
       })();
     </script>
     <link data-trunk rel="css" href="style.css" />
+    <!-- M9: xterm.js (vendored UMD, exposes `window.Terminal`) + its
+         css. Marked data-trunk so Trunk hashes + SRI-stamps them into
+         dist/ (xterm-<hash>.js|css), where the rust-embed backend
+         serves them. Loaded before the WASM bundle mounts so the
+         terminal tab can build on the global. -->
+    <link data-trunk rel="css" href="vendor/xterm/xterm.css" />
+    <script data-trunk rel="js" src="vendor/xterm/xterm.js"></script>
     <!-- v0.5.33: rust 1.96 emits saturating-float-to-int (i32.trunc_sat_f64)
          + bulk-memory ops; wasm-opt (binaryen ≤ version_123, trunk's
          pinned tool) cannot validate them. Pass the feature gates so a

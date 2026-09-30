@@ -169,3 +169,69 @@ pub async fn post_message(
         Ok(())
     }
 }
+
+// ── M8: right-panel Files endpoints (cwd-escape guarded server-side) ──
+
+fn files_qparam(key: &str, val: &str) -> String {
+    format!("{key}={}", js_sys::encode_uri_component(val))
+}
+
+fn files_error(status: u16, text: &str) -> String {
+    match status {
+        403 => format!("forbidden: {text}"),
+        404 => format!("not found: {text}"),
+        413 => format!("too large: {text}"),
+        415 => format!("unsupported: {text}"),
+        _ => format!("HTTP {status}: {text}"),
+    }
+}
+
+/// M8: one directory of the active session's workdir for the Files
+/// tree. `path` is workdir-relative ("" = the workdir root).
+pub async fn list_dir(session: &str, path: &str) -> Result<crate::model::DirList, String> {
+    let url = format!(
+        "/api/files?{}",
+        if path.is_empty() {
+            files_qparam("session", session)
+        } else {
+            format!("{}&{}", files_qparam("session", session), files_qparam("path", path))
+        }
+    );
+    let res = Request::get(&url).send().await.map_err(|e| e.to_string())?;
+    if res.status() >= 400 {
+        let body = res.text().await.unwrap_or_default();
+        return Err(files_error(res.status(), &body));
+    }
+    let text = res.text().await.map_err(|e| e.to_string())?;
+    serde_json::from_str(&text).map_err(|e| e.to_string())
+}
+
+/// M8: text/code content for the preview pane (512 KiB cap, first
+/// chunk of larger files with `truncated: true`; binary → Err).
+pub async fn read_file(
+    session: &str,
+    path: &str,
+) -> Result<crate::model::FilePreview, String> {
+    let url = format!(
+        "/api/file?{}&{}",
+        files_qparam("session", session),
+        files_qparam("path", path)
+    );
+    let res = Request::get(&url).send().await.map_err(|e| e.to_string())?;
+    if res.status() >= 400 {
+        let body = res.text().await.unwrap_or_default();
+        return Err(files_error(res.status(), &body));
+    }
+    let text = res.text().await.map_err(|e| e.to_string())?;
+    serde_json::from_str(&text).map_err(|e| e.to_string())
+}
+
+/// M8: the `<img src>` for an image preview — the server streams the
+/// raw bytes with the right Content-Type.
+pub fn raw_url(session: &str, path: &str) -> String {
+    format!(
+        "/api/raw?{}&{}",
+        files_qparam("session", session),
+        files_qparam("path", path)
+    )
+}

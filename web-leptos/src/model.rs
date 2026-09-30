@@ -14,6 +14,131 @@ pub struct SessionInfo {
     /// `.created` marker or first-event ts; None for old servers).
     #[serde(default)]
     pub created: Option<u64>,
+    /// M7: the session's working directory (its `.cwd` marker), if the
+    /// server reports one. The dispatch view groups sessions by this
+    /// (project); None groups under "no project".
+    #[serde(default)]
+    pub cwd: Option<String>,
+}
+
+/// M7: project groups for the dispatch view (layout "full") — the
+/// ordered session list split by working directory. Sessions without
+/// a `.cwd` marker (or old servers that never report one) share the
+/// "(no project)" bucket. Group order = first appearance of each
+/// group in the given session ordering, so the ordering mode still
+/// governs which project sits on top.
+pub fn dispatch_groups(
+    sessions: &[SessionInfo],
+    mode: &str,
+    custom_order: &[String],
+    rank: &std::collections::HashMap<String, f64>,
+) -> Vec<(String, Vec<SessionInfo>)> {
+    let ordered = ordered_sessions(sessions, mode, custom_order, rank);
+    let mut groups: Vec<(String, Vec<SessionInfo>)> = Vec::new();
+    let mut idx: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for s in ordered {
+        let key = s
+            .cwd
+            .clone()
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| "(no project)".to_string());
+        let i = *idx.entry(key.clone()).or_insert_with(|| {
+            groups.push((key.clone(), Vec::new()));
+            groups.len() - 1
+        });
+        groups[i].1.push(s.clone());
+    }
+    groups
+}
+
+/// The short label for a dispatch group header: the last path
+/// component of the project directory ("no project" as-is).
+pub fn dispatch_group_label(key: &str) -> String {
+    if key == "(no project)" {
+        return key.to_string();
+    }
+    key.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(key)
+        .to_string()
+}
+
+// ── M8: right tool panel (Files tree + preview) ─────────────────────
+
+/// M8: one entry in a Files-tree directory listing (`GET /api/files`).
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct DirEntry {
+    pub name: String,
+    pub is_dir: bool,
+    #[serde(default)]
+    pub size: Option<u64>,
+}
+
+/// M8: server response for `GET /api/files` — one directory's listing.
+#[derive(Clone, Debug, Deserialize)]
+pub struct DirList {
+    /// The session's working directory (absolute). Part of the wire
+    /// contract; the tree currently keys off `entries` only.
+    #[allow(dead_code)]
+    pub cwd: String,
+    /// The request's relative path ("" = root). Wire contract.
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub path: String,
+    pub entries: Vec<DirEntry>,
+}
+
+/// M8: server response for `GET /api/file` (text/code preview payload).
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct FilePreview {
+    pub path: String,
+    pub content: String,
+    pub size: u64,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+// ── M11: browser-style multi-tab right panel ────────────────────────
+/// The kind of one right-panel tab.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RpTabKind {
+    /// The persistent home tab: the Files tree (not closable, id 0).
+    Files,
+    /// A text/code/image preview of one file (closable).
+    File,
+    /// A live terminal (closable → `term_close`).
+    Term,
+}
+
+/// One open right-panel tab. The `Files` home tab has `id == 0`, an
+/// empty `path` and the label "Files". File tabs carry the workdir-
+/// relative `path`; terminal tabs carry an empty `path` and the label
+/// "Term N". Terminal tab ids double as the server's pty ids, so a tab
+/// closing maps 1:1 onto `term_close{id}`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RpTab {
+    pub id: u32,
+    pub kind: RpTabKind,
+    /// Workdir-relative path (File tabs only; empty otherwise).
+    pub path: String,
+    /// Display label ("Files" / file name / "Term N").
+    pub label: String,
+}
+
+/// Per-terminal-tab liveness, keyed by the terminal tab id. Drives the
+/// status-bar lamp and the "shell exited — restart" overlay.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TermState {
+    /// Last `term_status{id, running}` for this terminal.
+    pub running: bool,
+    /// Whether the server ever reported this terminal running — so the
+    /// exit overlay only appears after a shell has actually started and
+    /// then died (never on first paint / spawn failure).
+    pub started: bool,
+    /// A spawn/limit error from `term_status{id, running:false, error}`.
+    pub error: Option<String>,
 }
 
 /// v0.5.30: the sidebar's session order for the three modes. The
@@ -190,8 +315,9 @@ pub struct AppState {
     pub goal: RwSignal<Option<GoalView>>,
     /// None = live view; Some(i) = show only round i (0-based).
     pub view_round: RwSignal<Option<usize>>,
-    /// Sidebar collapse, persisted per browser.
-    pub sidebar_collapsed: RwSignal<bool>,
+    /// M6: layout mode "main" | "split" | "full", persisted per browser.
+    /// "main" hides the sidebar, "full" is the full-screen dispatch view.
+    pub layout_mode: RwSignal<String>,
     /// Open session-row context menu: which session (None = closed).
     /// Shared so the document-level click/Escape close handlers (ported
     /// from the legacy document listeners) can reach it.
@@ -286,6 +412,37 @@ pub struct AppState {
     /// v0.5.38: which session `loop_cmd` belongs to (guard so the
     /// refresh only re-fetches on a session change, not every poll).
     pub loop_cmd_sess: RwSignal<Option<String>>,
+    /// M8: right tool panel open/closed (persisted as "rushi-rp-open").
+    /// The panel is a session-scoped inspector: Files tree + preview.
+    pub rp_open: RwSignal<bool>,
+    /// M11: the open right-panel tabs (browser-style). The Files home
+    /// tab (id 0) is always present; file/terminal tabs are created on
+    /// demand (open a file / new terminal) and closed via the tab
+    /// button. A terminal tab's `id` doubles as the server pty id.
+    pub rp_tabs: RwSignal<Vec<RpTab>>,
+    /// M11: the active right-panel tab id (default 0 = Files home).
+    pub rp_active: RwSignal<u32>,
+    /// M11: monotonically increasing id handed out to new tabs.
+    pub rp_next_id: RwSignal<u32>,
+    /// M11: next "Term N" label number for new terminal tabs.
+    pub rp_term_seq: RwSignal<u32>,
+    /// M8: expanded directories in the Files tree, as workdir-relative
+    /// paths ("": the workdir root; "src" / "src/lib.rs"'s parent …).
+    pub rp_expanded: RwSignal<std::collections::HashSet<String>>,
+    /// M8: lazily fetched directory listings: workdir-relative dir path
+    /// ("" = root) → its entries. Populated on demand by the tree.
+    pub rp_children: RwSignal<std::collections::HashMap<String, Vec<DirEntry>>>,
+    /// M11: per-tab file preview payload, keyed by the FILE tab's id
+    /// (`None` = still loading / not fetched yet; absent = not open).
+    pub rp_preview_map: RwSignal<std::collections::HashMap<u32, Option<FilePreview>>>,
+    /// M11: per-tab error line (preview / tree load failures, "no
+    /// session", …), keyed by the tab's id. Empty = nothing to say.
+    pub rp_err_map: RwSignal<std::collections::HashMap<u32, String>>,
+    /// M11: per-terminal-tab liveness (lamp + exit overlay), keyed by
+    /// the terminal tab id (== the server pty id). A running=false
+    /// after the shell used to run drives that tab's "exited — restart"
+    /// overlay.
+    pub term_state: RwSignal<std::collections::HashMap<u32, TermState>>,
 }
 
 // v0.5.23: module-level handle to the live AppState (set once at app
@@ -312,7 +469,7 @@ impl AppState {
             ctx_used: RwSignal::new(0),
             goal: RwSignal::new(None),
             view_round: RwSignal::new(None),
-            sidebar_collapsed: RwSignal::new(false),
+            layout_mode: RwSignal::new("split".to_string()),
             menu_session: RwSignal::new(None),
             menu_pos: RwSignal::new((0.0, 0.0)),
             rounds_ctxk: RwSignal::new(Vec::new()),
@@ -337,6 +494,23 @@ impl AppState {
             drop_target: RwSignal::new(None),
             loop_cmd: RwSignal::new(String::new()),
             loop_cmd_sess: RwSignal::new(None),
+            rp_open: RwSignal::new(false),
+            // M11: start with just the Files home tab; tab ids are
+            // connection-scoped (a session switch resets the panel).
+            rp_tabs: RwSignal::new(vec![RpTab {
+                id: 0,
+                kind: RpTabKind::Files,
+                path: String::new(),
+                label: "Files".to_string(),
+            }]),
+            rp_active: RwSignal::new(0),
+            rp_next_id: RwSignal::new(1),
+            rp_term_seq: RwSignal::new(1),
+            rp_expanded: RwSignal::new(std::collections::HashSet::new()),
+            rp_children: RwSignal::new(std::collections::HashMap::new()),
+            rp_preview_map: RwSignal::new(std::collections::HashMap::new()),
+            rp_err_map: RwSignal::new(std::collections::HashMap::new()),
+            term_state: RwSignal::new(std::collections::HashMap::new()),
         }
     }
 

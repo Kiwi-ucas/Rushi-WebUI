@@ -21,6 +21,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 urlencoding = "2"
 chrono = "0.4"
+# M9: the session terminal (right-panel terminal tab): a PTY per open
+# terminal, spawned in the session's working directory.
+portable-pty = "0.8"
+# base64-encoding of pty I/O in the terminal WS frames
+# (WS text frames carry arbitrary pty bytes).
+base64 = "0.22"
 
 
 [profile.release]

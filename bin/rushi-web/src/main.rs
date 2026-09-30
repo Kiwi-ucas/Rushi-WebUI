@@ -14,11 +14,14 @@ use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
 
 mod config;
+mod files;
 mod goal;
 mod process;
 mod sessions;
+mod term;
 
 use config::WebConfig;
+use files::{list_files, raw_file, read_file};
 use process::LoopManager;
 use sessions::SessionManager;
 
@@ -391,12 +394,31 @@ async fn ws_session(socket: WebSocket, st: AppState, session: String) {
     // loop process for the session starts or dies.
     let mut loop_rx = st.loops.subscribe();
 
+    // M9/M11: session terminals (PTY). Up to TERM_CAP live ptys per
+    // connection — one per open terminal tab, keyed by the client's
+    // terminal id. Each pty is owned by THIS connection: when the
+    // socket ends, every shell's process group is torn down (Term's
+    // Drop). `term_tx` stays held for the life of the connection so
+    // the `term_rx` arm below never observes a spurious "channel
+    // closed" mid-session; only a real EOF from a pty reader drains it.
+    // The channel carries (term_id, Some(bytes)) output chunks and
+    // (term_id, None) EOF markers (the shell for that id exited).
+    const TERM_CAP: u32 = 4;
+    struct TermSlot {
+        term: term::Term,
+        reader: std::thread::JoinHandle<()>,
+    }
+    let mut terms: std::collections::HashMap<u32, TermSlot> =
+        std::collections::HashMap::new();
+    let (term_tx, mut term_rx) =
+        tokio::sync::mpsc::channel::<(u32, Option<Vec<u8>>)>((TERM_CAP as usize) * 64);
+
     // 3. Inbound commands from the client:
     //    {"kind":"message","content":"...","queue":"steer|follow"}
     //    {"kind":"approval","id":"...","decision":"approve|deny"}
     //    {"kind":"rewind","target_seq":N,"mode":"before|on"}
     //    {"kind":"start"}  /  {"kind":"stop"}
-    let mut socket_dead = false;
+    let socket_dead = false;
     while !socket_dead {
         tokio::select! {
             line = line_rx.recv() => match line {
@@ -423,8 +445,7 @@ async fn ws_session(socket: WebSocket, st: AppState, session: String) {
                 None => break, // stream watcher finished
             },
             ev = loop_rx.recv() => match ev {
-                Ok(e) => {
-                    // v0.5.13: forward loop events for EVERY session,
+                Ok(e) => {                    // v0.5.13: forward loop events for EVERY session,
                     // tagged with the session name — each client's
                     // sidebar needs the loop state of sessions it is
                     // not viewing (breathing lamps, green done bars).
@@ -450,6 +471,47 @@ async fn ws_session(socket: WebSocket, st: AppState, session: String) {
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
             },
+            chunk = term_rx.recv() => {
+                // M9/M11: pty master output, tagged with the terminal
+                // id. A (id, None) chunk is the reader's EOF marker —
+                // the shell for that id exited naturally: drop the slot
+                // (Term::Drop kills the group; the child is already
+                // dead) and report running:false so the client's exit
+                // overlay can offer a restart.
+                match chunk {
+                    Some((id, Some(bytes))) => {
+                        // A stray chunk for a terminal that was already
+                        // closed/removed (the reader thread outlived the
+                        // close by one chunk) is dropped.
+                        if !terms.contains_key(&id) {
+                            continue;
+                        }
+                        let frame = serde_json::json!([{
+                            "kind": "term_out",
+                            "id": id,
+                            "data": term::b64encode(&bytes),
+                        }]);
+                        if sock_tx.send(Message::text(frame.to_string())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some((id, None)) => {
+                        if let Some(mut slot) = terms.remove(&id) {
+                            slot.term.close();
+                            let _ = slot.reader.join();
+                        }
+                        let frame = serde_json::json!([{
+                            "kind": "term_status",
+                            "id": id,
+                            "running": false,
+                        }]);
+                        if sock_tx.send(Message::text(frame.to_string())).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => {} // the base sender is dropped; the loop ends
+                }
+            }
             msg = sock_rx.next() => match msg {
                 Some(Ok(Message::Text(b))) => {
                     let text = b.to_string();
@@ -531,6 +593,112 @@ async fn ws_session(socket: WebSocket, st: AppState, session: String) {
                             "stop" => {
                                 let _ = st.loops.stop(&session).await;
                             }
+                            // ── M9/M11: terminal frames (multi-pty, id-tagged) ──
+                            "term_open" => {
+                                let id = item.get("id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                                let cols = item.get("cols").and_then(|v| v.as_u64()).unwrap_or(80) as u32;
+                                let rows = item.get("rows").and_then(|v| v.as_u64()).unwrap_or(24) as u32;
+                                // Replace an existing slot with this id
+                                // (restart after a shell exit): kill the old
+                                // shell's group and drain its reader first.
+                                if let Some(mut old) = terms.remove(&id) {
+                                    old.term.close();
+                                    let _ = old.reader.join();
+                                }
+                                // Cap: at most TERM_CAP live ptys per connection.
+                                if !terms.contains_key(&id) && terms.len() >= TERM_CAP as usize {
+                                    let frame = serde_json::json!([{
+                                        "kind": "term_status",
+                                        "id": id,
+                                        "running": false,
+                                        "error": format!("terminal limit ({}) reached", TERM_CAP),
+                                    }]);
+                                    let _ = sock_tx.send(Message::text(frame.to_string())).await;
+                                } else {
+                                    match files::session_workdir(&st, &session) {
+                                        Some(wd) => match term::open_term(&wd, cols, rows) {
+                                            Ok((t, reader)) => {
+                                                let tx = term_tx.clone();
+                                                let handle = std::thread::spawn(move || {
+                                                    let mut r = reader;
+                                                    let mut buf = [0u8; 4096];
+                                                    use std::io::Read as _;
+                                                    loop {
+                                                        match r.read(&mut buf) {
+                                                            Ok(0) => {
+                                                                // EOF: the shell exited.
+                                                                // Notify the
+                                                                // select loop so
+                                                                // it can drop
+                                                                // the slot and
+                                                                // report
+                                                                // running=false.
+                                                                let _ = tx.blocking_send((id, None));
+                                                                break;
+                                                            }
+                                                            Ok(n) => {
+                                                                let _ = tx.blocking_send((id, Some(buf[..n].to_vec())));
+                                                            }
+                                                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                                                            Err(_) => break,
+                                                        }
+                                                    }
+                                                });
+                                                terms.insert(id, TermSlot { term: t, reader: handle });
+                                                let frame = serde_json::json!([{"kind":"term_status","id":id,"running":true}]);
+                                                let _ = sock_tx.send(Message::text(frame.to_string())).await;
+                                            }
+                                            Err(e) => {
+                                                let frame = serde_json::json!([{
+                                                    "kind": "term_status",
+                                                    "id": id,
+                                                    "running": false,
+                                                    "error": format!("term_open failed: {e}"),
+                                                }]);
+                                                let _ = sock_tx.send(Message::text(frame.to_string())).await;
+                                            }
+                                        },
+                                        None => {
+                                            let frame = serde_json::json!([{
+                                                "kind": "term_status",
+                                                "id": id,
+                                                "running": false,
+                                                "error": "term_open: no working directory for this session",
+                                            }]);
+                                            let _ = sock_tx.send(Message::text(frame.to_string())).await;
+                                        }
+                                    }
+                                }
+                            }
+                            "term_input" => {
+                                let id = item.get("id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                                let data = item.get("data").and_then(|v| v.as_str()).unwrap_or("");
+                                if let Ok(bytes) = term::b64decode(data) {
+                                    if let Some(slot) = terms.get_mut(&id) {
+                                        slot.term.write_input(&bytes);
+                                    }
+                                }
+                            }
+                            "term_resize" => {
+                                let id = item.get("id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                                let cols = item.get("cols").and_then(|v| v.as_u64()).unwrap_or(80) as u32;
+                                let rows = item.get("rows").and_then(|v| v.as_u64()).unwrap_or(24) as u32;
+                                if let Some(slot) = terms.get_mut(&id) {
+                                    slot.term.resize(cols, rows);
+                                }
+                            }
+                            "term_close" => {
+                                let id = item.get("id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                                if let Some(mut slot) = terms.remove(&id) {
+                                    slot.term.close();
+                                    // Drain the old reader so its (now-dead
+                                    // shell's) output cannot race other
+                                    // terminals; then signal the client.
+                                    let _ = slot.reader.join();
+                                }
+                                let frame = serde_json::json!([{"kind":"term_status","id":id,"running":false}]);
+                                let _ = sock_tx.send(Message::text(frame.to_string())).await;
+                            }
                             _ => {}
                         }
                     }
@@ -542,6 +710,13 @@ async fn ws_session(socket: WebSocket, st: AppState, session: String) {
                 _ => break,
             },
         }
+    }
+
+    // M9/M11: tear down EVERY open terminal with the connection — kill
+    // each shell's process group, then drain and stop its reader thread.
+    for (_, mut slot) in terms.drain() {
+        slot.term.close();
+        let _ = slot.reader.join();
     }
 
     watcher.abort();
@@ -686,6 +861,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/health", get(health))
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/browse", get(browse_dirs))
+        // M8: workspace files for the right panel (cwd-escape guarded).
+        .route("/api/files", get(list_files))
+        .route("/api/file", get(read_file))
+        .route("/api/raw", get(raw_file))
         .route("/api/default-cwd", get(get_default_cwd))
         .route("/api/sessions/{id}/events", get(get_events))
         .route("/api/sessions/{id}/messages", post(post_message))

@@ -85,11 +85,22 @@ impl SessionManager {
                     Some(secs.as_secs())
                 });
 
+            // M7: the session's working directory (`.cwd` marker), read
+            // as a plain string — the dispatch view groups by project.
+            // A missing/stale marker is fine (None), unlike cwd() which
+            // also validates the dir still exists.
+            let cwd = fs::read_to_string(dir.join(".cwd"))
+                .await
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+
             out.push(SessionInfo {
                 name,
                 has_events: exists,
                 last_modified,
                 created: Self::created_ts(&dir, &ev_path).await,
+                cwd,
             });
         }
 
@@ -293,21 +304,11 @@ impl SessionManager {
         Ok(())
     }
 
-    /// Path to a session's working-directory marker file.
-    fn cwd_path(&self, id: &str) -> PathBuf {
+    /// Path to a session's working-directory marker file (used by the
+    /// M8 files endpoints and M9 terminal to resolve workdir-relative
+    /// paths).
+    pub fn cwd_path(&self, id: &str) -> PathBuf {
         self.session_dir(id).join(".cwd")
-    }
-
-    /// The session's configured working directory (from `.cwd`), if it
-    /// is set and still an existing directory.
-    pub async fn cwd(&self, id: &str) -> Option<PathBuf> {
-        let text = fs::read_to_string(self.cwd_path(id)).await.ok()?;
-        let p = PathBuf::from(text.trim());
-        if p.is_dir() {
-            Some(p)
-        } else {
-            None
-        }
     }
 
     /// Create a session and optionally record its working directory.
@@ -429,6 +430,11 @@ pub struct SessionInfo {
     /// marker, or the first event's `ts` for sessions created before
     /// the marker existed. Drives the client's "by creation" ordering.
     pub created: Option<u64>,
+    /// M7: the session's working directory (`.cwd` marker), if set.
+    /// Exposed so the client's dispatch view can group sessions by
+    /// project. `None` when the marker is absent or empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }
 
 /// Tail `path` for new lines and forward them over `tx`.

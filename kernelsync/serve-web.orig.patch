@@ -1,0 +1,339 @@
+diff --git a/bin/rushi/src/main.rs b/bin/rushi/src/main.rs
+index 8f4ec87..a2a6d44 100644
+--- a/bin/rushi/src/main.rs
++++ b/bin/rushi/src/main.rs
+@@ -81,6 +81,14 @@ enum Command {
+         #[arg(long)]
+         list: bool,
+     },
++    /// Launch the WebUI front-end (`rushi-web`), if one is installed.
++    ///
++    /// Resolution order for the web binary mirrors the TUI:
++    /// `[web].binary` in the config (relative to the config dir),
++    /// side-by-side `rushi-web` next to this executable, then
++    /// `rushi-web` on `PATH`. The server inherits this process's
++    /// environment (tool/hook `PATH` entries, `LLAMA_API_KEY`, ...).
++    Serve,
+ }
+ 
+ fn main() {
+@@ -142,6 +150,36 @@ fn main() {
+                 docs::print_docs(section.as_deref());
+             }
+         }
++
++        Command::Serve => {
++            let web_bin = resolve_web_binary(&config_path);
++            let mut child = std::process::Command::new(&web_bin);
++
++            // Forward the kernel's sessions root and loop command so the
++            // web server spawns the same loop the TUI would.
++            if let Some(root) = config_sessions_root(&config_path) {
++                child.arg("--sessions-root").arg(root);
++            }
++            // Forward optional [web] host/port overrides.
++            if let Some(h) = config_web_key_str(&config_path, "host") {
++                child.arg("--host").arg(h);
++            }
++            if let Some(p) = config_web_key_str(&config_path, "port") {
++                child.arg("--port").arg(p);
++            }
++            let exe = std::env::current_exe()
++                .unwrap_or_else(|_| std::path::PathBuf::from("rushi"));
++            let loop_cmd = format!("{} run", exe.display());
++            child.arg("--loop-cmd").arg(loop_cmd);
++
++            let status = child
++                .status()
++                .unwrap_or_else(|e| {
++                    eprintln!("rushi serve: failed to spawn webui ({web_bin:?}): {e}");
++                    std::process::exit(1);
++                });
++            std::process::exit(status.code().unwrap_or(1));
++        }
+     }
+ }
+ 
+@@ -226,3 +264,77 @@ fn config_tui_binary(config_path: &str) -> Option<String> {
+         None
+     }
+ }
++
++/// Find the `rushi-web` binary. Resolution order mirrors
++/// [`resolve_tui_binary`]:
++/// 1. `[web].binary` in the config file (relative to the config dir).
++/// 2. Side-by-side `rushi-web` next to this executable.
++/// 3. `rushi-web` on `PATH`.
++fn resolve_web_binary(config_path: &str) -> String {
++    if let Some(p) = config_web_binary(config_path) {
++        return p;
++    }
++    if let Ok(exe) = std::env::current_exe() {
++        if let Some(dir) = exe.parent() {
++            let candidate = dir.join("rushi-web");
++            if candidate.exists() {
++                return candidate.to_string_lossy().into_owned();
++            }
++        }
++    }
++    "rushi-web".into()
++}
++
++/// Read `[web].binary` from the config file. The value is resolved
++/// relative to the config directory, mirroring [`config_tui_binary`].
++fn config_web_binary(config_path: &str) -> Option<String> {
++    let raw = std::fs::read_to_string(config_path).ok()?;
++    let cfg: toml::Value = raw.parse().ok()?;
++    let rel = cfg.get("web")?.get("binary")?.as_str()?;
++    if rel.trim().is_empty() {
++        return None;
++    }
++    let config_dir = std::path::Path::new(config_path)
++        .canonicalize()
++        .ok()
++        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
++        .unwrap_or_else(|| std::path::PathBuf::from("."));
++    let p = config_dir.join(rel);
++    if p.is_file() {
++        Some(p.to_string_lossy().into_owned())
++    } else {
++        None
++    }
++}
++
++/// Read `[paths].sessions_root` from the config file, resolved to an
++/// absolute path (relative values resolve against the config dir).
++/// Returns `None` when the key is absent or the value is empty.
++fn config_sessions_root(config_path: &str) -> Option<PathBuf> {
++    let raw = std::fs::read_to_string(config_path).ok()?;
++    let cfg: toml::Value = raw.parse().ok()?;
++    let rel = cfg.get("paths")?.get("sessions_root")?.as_str()?;
++    if rel.trim().is_empty() {
++        return None;
++    }
++    let config_dir = std::path::Path::new(config_path)
++        .canonicalize()
++        .ok()
++        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
++        .unwrap_or_else(|| std::path::PathBuf::from("."));
++    let p = config_dir.join(rel);
++    Some(if p.is_absolute() { p } else { p })
++}
++
++/// Read a string value from the `[web]` config section (e.g. `host`,
++/// `port`). Returns `None` when the key is absent or not a string.
++fn config_web_key_str(config_path: &str, key: &str) -> Option<String> {
++    let raw = std::fs::read_to_string(config_path).ok()?;
++    let cfg: toml::Value = raw.parse().ok()?;
++    let v = cfg.get("web")?.get(key)?.as_str()?;
++    if v.trim().is_empty() {
++        None
++    } else {
++        Some(v.to_string())
++    }
++}
+diff --git a/config.toml b/config.toml
+index 1531e54..7277482 100644
+--- a/config.toml
++++ b/config.toml
+@@ -1,79 +1,132 @@
+-# config.toml — generated by `rushi setup` v0.1.0 (kernel commit: dev)
+-# Uncomment any option to override the distribution default.
+-#
+-[active]
+-# model = "deepseek"
++# Working config for the local public-repo layout (rushi + public exts).
++# Fixes the broken paths in config-real.toml, which pointed at the private
++# rushi-exts checkout and the old rushi-tui-ratatui-widget-based repo name.
++# All relative paths resolve against THIS file (the kernel repo root).
++# Binaries resolve on PATH: the run-tui.sh launcher puts bin/ on PATH.
+ 
+ [model]
+-# api = "responses"
+-# max_output_tokens = 32768
+-# reasoning_effort = "xhigh"
+-# model_timeout_s = 3600
+-# Per-model overrides, one section per model, e.g.:
+-# [model.my-model]
+-# model_id = "my-model"
+-# base_url = "http://127.0.0.1:8080"
+-# api_key_env = "MODEL_API_KEY"
+-# context_tokens = 131072
+-# timeout_s = 3600
+-# reasoning_effort = "medium"
+-# vision = true   # send image tool results to the model (default false)
++api = "responses"
++max_output_tokens = 32768
++reasoning_effort = "xhigh"
++
++[model."Qwen3.8-27B-NVFP4-RTX5090-v2"]
++model_id = "Qwen3.8-27B-NVFP4-RTX5090-v2"
++base_url = "http://127.0.0.1:30000"
++api_key_env = "LLAMA_API_KEY"
++context_tokens = 262144
++vision = true
++
++[active]
++model = "Qwen3.8-27B-NVFP4-RTX5090-v2"
+ 
+ [paths]
+-# sessions_root = "sessions"
+-# native_tool_paths = ["tools/bash", "tools/edit", "tools/read", "tools/write"]
+-# extension_tool_paths = []
++sessions_root = "sessions"
++native_tool_paths = ["tools/bash", "tools/edit", "tools/read", "tools/write"]
++# Public extension tool group (goal-mode). Binaries resolve on PATH.
++extension_tool_paths = ["../rushi-goal-mode/goal-tools/"]
+ 
+ [limits]
+-# read_limit = 2000
+-# read_max_line_length = 2000
+-# read_max_bytes = 51200
+-# read_stream_min_size = 10485760
+-# write_max_bytes = 1048576
+-# tool_result_max_chars = 20000
+-# bash_max_output_bytes = 16000
+-# bash_timeout_default = 60
+-# bash_timeout_max = 300
+-# compact_enabled = true
++bash_timeout_max = 600
++compact_enabled = true
+ compact_reserve_tokens = 16384
+-# compact_keep_tokens = 20000
+-# compact_strategy = "compact"
+-# context_budget_tokens = 262144      # default: context_tokens - max_output_tokens
+-# approval_timeout_s = 300             # absent: approval waits forever
+-# compact_reasoning_effort = "low"    # absent: inherit session effort
++compact_keep_tokens = 20000
++compact_strategy = "compact"
++context_budget_tokens = 262144
+ 
+ [hooks]
+-# timeout_ms = 30000
+-# Hook registrations, one [[hooks.on]] table per entry:
++timeout_ms = 30000
++
++# Compact on context exhaustion / overflow (kernel built-in hook).
++[[hooks.on]]
++window = "exhausted.handle"
++command = "harness-hook-compact"
++
++[[hooks.on]]
++window = "overflow.resolve"
++command = "harness-hook-compact"
++args = []
++
++# Goal-continuation hooks (public rushi-goal-mode).
++[[hooks.on]]
++window = "run.idle"
++command = "harness-hook-goal-idle"
++args = []
++
++[[hooks.on]]
++window = "compact.before"
++command = "harness-hook-goal-compact"
++args = []
++
++[[hooks.on]]
++window = "tool.before"
++command = "harness-hook-goal-tools"
++args = []
++
++[[hooks.on]]
++window = "model.before"
++command = "harness-hook-goal-arm"
++args = []
++
++# Guard bare find/grep/rg misuse.
++[[hooks.on]]
++window = "tool.before"
++command = "harness-hook-no-find-grep"
++args = []
++
++# Simplified-technical-English linter (opinionated; uncomment to enable).
+ # [[hooks.on]]
+-# window  = "exhausted.handle"
+-# command = "harness-hook-compact"
+-#
++# window = "tool.before"
++# command = "harness-hook-simple-english"
+ # [[hooks.on]]
+-# window  = "overflow.resolve"
+-# command = "harness-hook-compact"
+-
+-# [loop]
+-# Opaque loop command the TUI spawns for each session
+-# (docs/tui.md section 2.3). `rushi run <session>` is the
+-# kernel turn-loop runner, resolved on PATH.
+-# command = "rushi"
+-# args = ["run"]
+-# arg_style = "append_session"
+-#
+-
+-# [system_prompt]
+-# text = "You are an expert coding assistant..."
+-#
+-# [tui]
+-# binary = "target/release/tui"   # path to the TUI binary the launcher spawns (relative to this config)
+-# color = "truecolor"              # force color level: truecolor, 256, 8, 16 (default: detect)
+-# color_scheme = "catppuccin macchiato"
+-#
+-# [tui.tool_display]
+-# preset = "opencode"
+-# preview_lines = 8
+-# bash_collapsed_lines = 5
+-# diff_collapsed_lines = 24
+-# expanded_preview_max_lines = 50
+-# diff_view = "auto"
++# window = "model.before"
++# command = "harness-hook-simple-english"
++
++[system_prompt]
++text = """You are an expert coding assistant in `rushi`, a Unix agent harness.
++You help the user by reading files, running commands, editing code,
++and writing new files.
++
++Codebase is the truth. @docs/ is the place for context documents, but they might be stale.
++Always confirm any claim against the code and written docs.
++
++Guidelines:
++- Plan first. Split the task into steps before you code.
++- Never silently decide anything on your own. Report and brief to the users what you find needs consideration and decisions.
++- Actively bookkeeping user's decisions during the session to the local repo. Looks for where the documents are saved. If there is none, ask for user's opinion on creating one.
++- Build and test after changes. Run the commands that prove the change.
++- Prefer read, edit, and write over bash for file work.
++- Use read to examine files instead of cat or sed.
++- Use offset and limit to continue reading large files.
++- Keep replies short. Show file paths clearly in your replies.
++- Report to user by straight plain statement of what is done, how it matches
++  the design spec, what behavior does your test expect.
++"""
++
++# ─── TUI-only sections ──────────────────────────────────────────────
++
++[loop]
++command = "rushi"
++args = ["run"]
++arg_style = "append_session"
++
++[tui]
++binary = "../rushi-tui/target/debug/tui"
++clipboard = "unnamed"
++ext_dirs = [
++  "../rushi-statusline/",
++  "../rushi-goal-mode/goal-ext/",
++  "../rushi-simple-english/simple-english-ext/",
++]
++
++# WebUI front-end (rushi-web, Tier-2, replaceable like the TUI).
++# `rushi serve` spawns this binary, forwarding --sessions-root and
++# --loop-cmd derived from this config.
++[web]
++binary = "../rushi-webui/target/debug/rushi-web"
++
++[tui.tool_display]
++preset = "opencode"
++highlight_engine = "tree-sitter"
++expand_mode = "click"
++anim_ms = 400
++diff_collapsed_lines = 12
