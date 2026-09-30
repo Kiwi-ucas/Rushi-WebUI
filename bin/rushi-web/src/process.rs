@@ -10,6 +10,43 @@ use tracing::{info, warn};
 
 use crate::config::WebConfig;
 
+/// Where a session's generated config lives: **beside the config it was
+/// derived from**, never in the session dir.
+///
+/// The kernel resolves `[paths]` — `native_tool_paths` and
+/// `extension_tool_paths` — against the config file's own directory
+/// (`assemble`/`parse` call `resolve_tool_entry(config_dir, entry)`).
+/// A generated config parked anywhere else silently resolves every tool
+/// path to a missing directory, so the session assembles an empty tool
+/// list, the model has nothing it may call, and it writes its tool
+/// markup into the message text instead. Keeping the file in the same
+/// directory makes every relative path mean exactly what it means in the
+/// original. The `config.session.<id>.toml` name is covered by the
+/// kernel repo's `config*.toml` ignore rule.
+fn session_config_path(cfg_pin: &Path, session: &str) -> std::path::PathBuf {
+    cfg_pin
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default()
+        .join(format!("config.session.{}.toml", safe_session_id(session)))
+}
+
+/// A session id that is safe to embed in a file name next to the kernel
+/// config. Session names are directory names already, so this only has
+/// to defend against the odd character a name could still carry.
+fn safe_session_id(session: &str) -> String {
+    session
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 /// Lifecycle event for a loop process, forwarded to the session's WS
 /// clients as a `loop_status` frame. `running` is a level, not a delta.
 #[derive(Clone, Debug)]
@@ -202,7 +239,13 @@ impl LoopManager {
                     })
                 {
                     Ok(text) => {
-                        let path = session_dir.join("config.session.toml");
+                        let path = session_config_path(&cfg_pin, session);
+                        // Sweep the v0.5.44 layout: a file left in the
+                        // session dir is inert, but it reads like the
+                        // config the loop is running.
+                        let _ = std::fs::remove_file(
+                            session_dir.join("config.session.toml"),
+                        );
                         match crate::modelcfg::write_atomic(&path, &text) {
                             Ok(()) => pinned = path,
                             Err(e) => warn!(
@@ -408,5 +451,42 @@ fn stderr_tail(path: &Path, max_bytes: usize) -> Option<String> {
         None
     } else {
         Some(text)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The kernel resolves `[paths]` tool entries against the config
+    /// file's directory, so the per-session config has to land in the
+    /// SAME directory as the config it derives from. Regression guard
+    /// for v0.5.44, where the generated file went into the session dir
+    /// and every session with a model/effort override silently ran with
+    /// an empty tool list.
+    #[test]
+    fn session_config_lands_beside_the_config_it_derives_from() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.toml");
+        let path = session_config_path(&cfg, "my session/../x");
+        assert_eq!(path.parent(), Some(dir.path()));
+        // No separator survives sanitizing: the file stays in that dir.
+        assert_eq!(
+            path.file_name().unwrap().to_str().unwrap(),
+            "config.session.my_session_.._x.toml"
+        );
+        // Same directory in, same tool paths out.
+        assert_eq!(
+            path.parent().unwrap().join("tools/bash"),
+            dir.path().join("tools/bash"),
+        );
+    }
+
+    #[test]
+    fn session_config_path_falls_back_to_the_cwd_for_a_bare_name() {
+        // No parent directory: join onto "" (i.e. the relative name),
+        // never panic.
+        let path = session_config_path(Path::new("config.toml"), "s1");
+        assert_eq!(path, Path::new("config.session.s1.toml"));
     }
 }
