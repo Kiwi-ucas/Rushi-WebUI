@@ -41,16 +41,16 @@ pub struct FilesQuery {
     pub path: Option<String>,
 }
 
-/// The session's working directory: the `.cwd` marker's directory when
-/// it still exists, else the default workdir (the sessions root's
-/// parent) — the same resolution the loop runner uses (process.rs).
-/// Shared by the M8 file endpoints and the M9 terminal (`term_open`
-/// spawns the shell here).
+/// The session's working directory: the session's cwd marker (the
+/// kernel's `cwd`, else the webui's `.cwd`) when that directory still
+/// exists, else the default workdir (the sessions root's parent) — the
+/// same resolution the loop runner uses (process.rs). Shared by the M8
+/// file endpoints and the M9 terminal (`term_open` spawns the shell
+/// here).
 pub fn session_workdir(st: &AppState, session: &str) -> Option<PathBuf> {
-    let marked = std::fs::read_to_string(st.sessions.cwd_path(session))
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+    let marked = st
+        .sessions
+        .cwd_marker(session)
         .map(PathBuf::from)
         .filter(|p| p.is_dir());
     marked.or_else(|| {

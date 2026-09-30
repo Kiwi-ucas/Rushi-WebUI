@@ -90,17 +90,18 @@ impl LoopManager {
             let mut cmd = Command::new(&cmd0);
             cmd.args(&self.cfg.loop_cmd[1..]);
             cmd.arg(session);
-            // Working directory: the session's own `.cwd` marker if the
-            // new-session dialog recorded one, else the default — the
-            // sessions root's parent (the kernel checkout), which the
-            // loop binary needs to resolve config.toml and its sibling
-            // stage binaries.
-            let session_cwd = std::fs::read_to_string(
-                self.cfg.sessions_root.join(session).join(".cwd"),
+            // Working directory: the session's cwd marker (the kernel's
+            // `cwd`, else the webui's `.cwd`) when that directory still
+            // exists, else the sessions root's parent. The kernel
+            // re-anchors the session's working directory to this
+            // process's cwd on every loop (re)start
+            // (`refresh_session_cwd`), so this launch directory is what
+            // keeps a session working inside its own project dir. The
+            // config arrives through $CONFIG below, so the loop no
+            // longer needs to start in the kernel checkout to find it.
+            let session_cwd = crate::sessions::read_cwd_marker(
+                &self.cfg.sessions_root.join(session),
             )
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
             .map(std::path::PathBuf::from)
             .filter(|p| p.is_dir());
             let cwd = session_cwd.unwrap_or_else(|| {
@@ -112,11 +113,12 @@ impl LoopManager {
             });
             cmd.current_dir(&cwd);
             // Pin the loop's config regardless of the working directory.
-            // The loop's own resolution chain is $CONFIG → --config →
-            // <exe_dir>/../config.toml → CWD/config.toml; here the webui
-            // front-end's `--config` wins, then the inherited $CONFIG,
-            // then the two fallbacks. The winner is exported to the
-            // child so a session working directory may be ANY existing
+            // The kernel's resolution chain is --config → $CONFIG →
+            // <exe_dir>/../config.toml → CWD/config.toml (v0.1.5,
+            // crates/rushi/src/paths.rs); here the webui front-end's
+            // `--config` wins, then the inherited $CONFIG, then the two
+            // fallbacks. The winner is exported to the child as $CONFIG
+            // so a session working directory may be ANY existing
             // directory. When nothing resolves, fail here with a clear
             // message instead of spawning a loop that dies at startup.
             let cfg_pin = {

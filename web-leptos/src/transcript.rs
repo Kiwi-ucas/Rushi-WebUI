@@ -527,6 +527,16 @@ fn ev_body(ev: &Value, t: &str, state: AppState, events: RwSignal<Vec<Value>>) -
                     "Compaction in progress\u{2026} ({})",
                     ev.get("reason").and_then(|v| v.as_str()).unwrap_or("")
                 ),
+                // v0.1.5 branch-summarize: a `branch_of` marker summarizes
+                // the branch abandoned at that rewind seq. It is an add-on
+                // on the active path, not a handoff boundary (no
+                // handoff.md; the text lands in branch-summary/vN.md), so
+                // it reads differently from a compaction.
+                "compaction_summary" if ev.get("branch_of").is_some() => format!(
+                    "Branch summary (abandoned branch after rewind #{}). {}",
+                    ev.get("branch_of").and_then(|v| v.as_u64()).unwrap_or(0),
+                    ev.get("summary").and_then(|v| v.as_str()).unwrap_or("")
+                ),
                 "compaction_summary" => format!(
                     "Compacted. {}",
                     ev.get("summary")

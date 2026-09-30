@@ -30,6 +30,23 @@ pub struct EventsPage {
     pub total_rounds: u64,
 }
 
+/// The session's recorded working directory, as a plain string.
+///
+/// The kernel writes `<session>/cwd` (no dot) and rewrites it on every
+/// loop (re)start from the loop process's own cwd (v0.1.5,
+/// `bin/rushi/src/run_loop.rs::refresh_session_cwd`). The webui records
+/// the intended directory under `.cwd` when it creates a session, so a
+/// session that never ran a loop carries only the dotted name. Read the
+/// kernel's marker first and fall back to ours.
+pub fn read_cwd_marker(session_dir: &Path) -> Option<String> {
+    ["cwd", ".cwd"].iter().find_map(|name| {
+        std::fs::read_to_string(session_dir.join(name))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    })
+}
+
 /// Manages session directories and their `events.jsonl` logs.
 #[derive(Clone)]
 pub struct SessionManager {
@@ -85,15 +102,11 @@ impl SessionManager {
                     Some(secs.as_secs())
                 });
 
-            // M7: the session's working directory (`.cwd` marker), read
-            // as a plain string — the dispatch view groups by project.
-            // A missing/stale marker is fine (None), unlike cwd() which
+            // M7: the session's working directory, read as a plain
+            // string — the dispatch view groups by project. A
+            // missing/stale marker is fine (None), unlike cwd() which
             // also validates the dir still exists.
-            let cwd = fs::read_to_string(dir.join(".cwd"))
-                .await
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty());
+            let cwd = read_cwd_marker(&dir);
 
             out.push(SessionInfo {
                 name,
@@ -304,11 +317,18 @@ impl SessionManager {
         Ok(())
     }
 
-    /// Path to a session's working-directory marker file (used by the
-    /// M8 files endpoints and M9 terminal to resolve workdir-relative
-    /// paths).
+    /// Path to the webui's own working-directory marker, written when a
+    /// session is created. The kernel keeps its own `cwd` marker next to
+    /// it; read the session workdir through [`read_cwd_marker`] instead
+    /// of this path.
     pub fn cwd_path(&self, id: &str) -> PathBuf {
         self.session_dir(id).join(".cwd")
+    }
+
+    /// The session's recorded working directory as a plain string:
+    /// the kernel's `cwd` marker, else the webui's `.cwd`.
+    pub fn cwd_marker(&self, id: &str) -> Option<String> {
+        read_cwd_marker(&self.session_dir(id))
     }
 
     /// Create a session and optionally record its working directory.
@@ -634,7 +654,6 @@ mod tests {
             port: 8480,
             sessions_root: root.to_path_buf(),
             loop_cmd: vec!["rushi".into(), "run".into()],
-            ext_dirs: Vec::new(),
             config_path: None,
         }))
     }
