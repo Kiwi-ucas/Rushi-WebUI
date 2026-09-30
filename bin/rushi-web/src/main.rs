@@ -16,6 +16,7 @@ use tower_http::cors::CorsLayer;
 mod config;
 mod files;
 mod goal;
+mod modelcfg;
 mod process;
 mod sessions;
 mod term;
@@ -319,6 +320,26 @@ async fn post_goal(
         Err(e) if e == "cleared" => Json(serde_json::json!({ "ok": true })).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     }
+}
+
+// ── model settings ─────────────────────────────────────────────────
+
+async fn get_model(State(st): State<AppState>) -> impl IntoResponse {
+    match modelcfg::load(&st.cfg) {
+        Ok(m) => (StatusCode::OK, Json(m)).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
+async fn post_model(State(st): State<AppState>, Json(body): Json<modelcfg::ModelSettings>) -> impl IntoResponse {
+    match modelcfg::save(&st.cfg, &body) {
+        Ok(out) => (StatusCode::OK, Json(out)).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
+async fn post_model_probe(Json(body): Json<modelcfg::ProbeRequest>) -> impl IntoResponse {
+    (StatusCode::OK, Json(modelcfg::probe(&body).await)).into_response()
 }
 
 // ── WebSocket: live event stream + in-band commands ────────────────
@@ -770,6 +791,64 @@ async fn serve_frontend(req: axum::extract::Request) -> Response {
     }
 }
 
+// ── kernel config ───────────────────────────────────────────────────
+
+/// The keys the webui consumes from the kernel `config.toml`.
+struct KernelConfig {
+    /// Absolute sessions root. A relative `[paths].sessions_root` is
+    /// resolved against the config file's own directory — the kernel
+    /// resolves it against the *loop's* cwd, and the webui spawns loops
+    /// in each session's working directory, so the webui must hand the
+    /// loop an absolute path or the two disagree about the session tree.
+    sessions_root: Option<PathBuf>,
+    host: Option<String>,
+    port: Option<u16>,
+}
+
+/// Read the kernel config the webui shares with the loops it spawns.
+/// Returns `None` when the file is missing or unreadable — the caller
+/// falls back to CLI flags and defaults.
+fn read_kernel_config(path: &std::path::Path) -> Option<KernelConfig> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let doc: toml::Value = text.parse().ok()?;
+    let config_dir = path
+        .canonicalize()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+
+    let sessions_root = doc
+        .get("paths")
+        .and_then(|p| p.get("sessions_root"))
+        .and_then(|v| v.as_str())
+        .map(PathBuf::from)
+        .map(|p| {
+            if p.is_absolute() {
+                p
+            } else {
+                config_dir
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join(p)
+            }
+        });
+
+    let web = doc.get("web");
+    let host = web
+        .and_then(|w| w.get("host"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let port = web
+        .and_then(|w| w.get("port"))
+        .and_then(|v| v.as_integer())
+        .and_then(|n| u16::try_from(n).ok());
+
+    Some(KernelConfig {
+        sessions_root,
+        host,
+        port,
+    })
+}
+
 // ── main ────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -777,11 +856,12 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     let args: Vec<String> = std::env::args().collect();
-    let mut host: &str = "127.0.0.1";
-    let mut port: u16 = 8480;
+    // CLI flags override the kernel config; whatever is left unset comes
+    // from `[paths].sessions_root` / `[web].host` / `[web].port`.
+    let mut host: Option<String> = None;
+    let mut port: Option<u16> = None;
     let mut sessions_root: Option<PathBuf> = None;
     let mut loop_cmd: Vec<String> = vec!["rushi".into(), "run".into()];
-    let mut ext_dirs: Vec<PathBuf> = Vec::new();
     let mut config_path: Option<PathBuf> = None;
 
     let mut i = 1;
@@ -790,12 +870,12 @@ async fn main() -> anyhow::Result<()> {
             "--host" => {
                 i += 1;
                 if let Some(h) = args.get(i) {
-                    host = h.as_str();
+                    host = Some(h.clone());
                 }
             }
             "--port" => {
                 i += 1;
-                port = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(8480);
+                port = args.get(i).and_then(|s| s.parse().ok());
             }
             "--sessions-root" => {
                 i += 1;
@@ -807,12 +887,6 @@ async fn main() -> anyhow::Result<()> {
                     loop_cmd = cmd.split_whitespace().map(String::from).collect();
                 }
             }
-            "--ext-dir" => {
-                i += 1;
-                if let Some(d) = args.get(i) {
-                    ext_dirs.push(PathBuf::from(d));
-                }
-            }
             "--config" => {
                 i += 1;
                 config_path = args.get(i).map(PathBuf::from);
@@ -821,14 +895,15 @@ async fn main() -> anyhow::Result<()> {
                 println!(
                     "rushi-web: WebUI front-end for the rushi harness\n\
                      \nUSAGE\n  rushi-web [OPTIONS]\n\
-                     \nOPTIONS\n  --host <HOST>          bind address (default 127.0.0.1)\n\
-                     \t  --port <PORT>          bind port (default 8480)\n\
-                     \t  --sessions-root <DIR>  session directory\n\
+                     \nOPTIONS\n  --config <FILE>        kernel config.toml (default keys below)\n\
+                     \t  --host <HOST>          bind address (config [web].host, else 127.0.0.1)\n\
+                     \t  --port <PORT>          bind port (config [web].port, else 8480)\n\
+                     \t  --sessions-root <DIR>  session directory (config [paths].sessions_root)\n\
                      \t  --loop-cmd <CMD...>    loop command (default: rushi run)\n\
-                     \t  --ext-dir <DIR>        UI-extension directory (repeatable)\n\
-                     \t  --config <FILE>        kernel config.toml to pin for spawned loops\n\
-                     \t                       (exported to them as $CONFIG; any session working\n\
-                     \t                       directory then stays a valid working directory)"
+                     \nThe webui is self-wired: it reads the kernel config you pass with\n\
+                     --config for [paths].sessions_root and [web].host/port, and pins\n\
+                     that same file to every loop it spawns as $CONFIG. CLI flags win\n\
+                     over the config file."
                 );
                 return Ok(());
             }
@@ -840,14 +915,28 @@ async fn main() -> anyhow::Result<()> {
         i += 1;
     }
 
+    // The webui's only build-time-free contract with the kernel: read the
+    // same config.toml the loop reads (docs/itches.md, 2026-09-20 — the
+    // kernel hosts no front-end launcher subcommand, so the front-end
+    // self-wires).
+    let kernel_cfg = config_path.as_deref().and_then(read_kernel_config);
+
     let cfg = Arc::new(WebConfig {
-        host: host.to_string(),
-        port,
-        sessions_root: sessions_root.unwrap_or_else(|| PathBuf::from("sessions")),
+        host: host
+            .or_else(|| kernel_cfg.as_ref().and_then(|k| k.host.clone()))
+            .unwrap_or_else(|| "127.0.0.1".to_string()),
+        port: port
+            .or_else(|| kernel_cfg.as_ref().and_then(|k| k.port))
+            .unwrap_or(8480),
+        sessions_root: sessions_root
+            .or_else(|| kernel_cfg.as_ref().and_then(|k| k.sessions_root.clone()))
+            .unwrap_or_else(|| PathBuf::from("sessions")),
         loop_cmd,
-        ext_dirs,
         config_path,
     });
+
+    // Resolved before `cfg` moves into the router state below.
+    let addr: SocketAddr = format!("{}:{}", cfg.host, cfg.port).parse()?;
 
     let sessions = Arc::new(SessionManager::new(cfg.clone()));
     let loops = Arc::new(LoopManager::new(cfg.clone()));
@@ -873,6 +962,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/sessions/{id}/approval", post(post_approval))
         .route("/api/sessions/{id}/rewind", post(post_rewind))
         .route("/api/sessions/{id}/goal", get(get_goal).post(post_goal))
+        .route("/api/model", get(get_model).post(post_model))
+        .route("/api/model/probe", post(post_model_probe))
         .route("/api/sessions/{id}/rename", post(post_rename))
         .route("/api/sessions/{id}", delete(delete_session))
         .route("/api/sessions/{id}/loop", get(get_loop))
@@ -881,7 +972,6 @@ async fn main() -> anyhow::Result<()> {
         .layer(CorsLayer::permissive())
         .with_state(state);
 
-    let addr: SocketAddr = format!("{host}:{port}").parse()?;
     tracing::info!(%addr, "rushi-web listening");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;

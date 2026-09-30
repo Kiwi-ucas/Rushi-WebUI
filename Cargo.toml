@@ -12,6 +12,13 @@ tower-http = { version = "0.6", features = ["fs", "cors"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+# Model settings panel: edits the kernel config.toml in place. toml_edit
+# (not toml) because the config is hand-maintained and comment-heavy —
+# toml_edit rewrites only the keys it touches and preserves everything
+# else byte for byte.
+toml_edit = "0.22"
+# The panel's "test connection" probe talks to the provider endpoint.
+reqwest = { version = "0.13", features = ["json"] }
 libc = "0.2"
 anyhow = "1"
 thiserror = "2"

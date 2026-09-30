@@ -30,6 +30,56 @@ pub async fn create_session(name: &str, cwd: Option<&str>) -> Result<(), String>
     }
 }
 
+// ── model settings (v0.5.42) ────────────────────────────────────────
+
+/// The server's model-config snapshot (parsed out of `config.toml`).
+pub async fn load_model() -> Result<crate::model::ModelSettingsView, String> {
+    let res = Request::get("/api/model").send().await.map_err(|e| e.to_string())?;
+    let status = res.status();
+    let text = res.text().await.map_err(|e| e.to_string())?;
+    if status >= 400 {
+        return Err(text);
+    }
+    serde_json::from_str(&text).map_err(|e| e.to_string())
+}
+
+/// Write the edited settings back. Returns the server's outcome (which
+/// changes need a loop restart) or the server's validation message.
+pub async fn save_model(view: &crate::model::ModelSettingsView) -> Result<Value, String> {
+    let payload = serde_json::to_string(view).map_err(|e| e.to_string())?;
+    let req = Request::post("/api/model")
+        .header("Content-Type", "application/json")
+        .body(payload)
+        .map_err(|e| e.to_string())?;
+    let res = req.send().await.map_err(|e| e.to_string())?;
+    let status = res.status();
+    let text = res.text().await.map_err(|e| e.to_string())?;
+    if status >= 400 {
+        return Err(text);
+    }
+    serde_json::from_str(&text).map_err(|e| e.to_string())
+}
+
+/// Probe a candidate provider endpoint without saving anything.
+pub async fn probe_model(
+    base_url: &str,
+    api_key_env: Option<&str>,
+    model_id: Option<&str>,
+) -> Result<Value, String> {
+    let payload = json!({
+        "base_url": base_url,
+        "api_key_env": api_key_env,
+        "model_id": model_id,
+    });
+    let req = Request::post("/api/model/probe")
+        .header("Content-Type", "application/json")
+        .body(payload.to_string())
+        .map_err(|e| e.to_string())?;
+    let res = req.send().await.map_err(|e| e.to_string())?;
+    let text = res.text().await.map_err(|e| e.to_string())?;
+    serde_json::from_str(&text).map_err(|e| e.to_string())
+}
+
 /// The server's default working directory (prefill for the picker).
 pub async fn default_cwd() -> Option<String> {
     let res = Request::get("/api/default-cwd").send().await.ok()?;

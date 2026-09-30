@@ -1,8 +1,77 @@
 use std::cell::RefCell;
 
 use leptos::prelude::*;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+// ── model settings (v0.5.42) ────────────────────────────────────────
+//
+// Wire mirror of `bin/rushi-web/src/modelcfg.rs`. Every field is
+// `#[serde(default)]` so a server that grows or drops a key cannot fail
+// the whole payload. Change both sides together.
+
+/// One `[model."<name>"]` entry; `None`/empty means "key absent — the
+/// kernel's default applies".
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct ModelEntry {
+    pub name: String,
+    #[serde(default)]
+    pub model_id: Option<String>,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    #[serde(default)]
+    pub context_tokens: Option<u64>,
+    #[serde(default)]
+    pub max_output_tokens: Option<u64>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub vision: Option<bool>,
+    #[serde(default)]
+    pub timeout_s: Option<u64>,
+    #[serde(default)]
+    pub estimate_chars_per_token: Option<u64>,
+    /// Read-only: keys the panel does not edit (e.g. `api`).
+    #[serde(default)]
+    pub extra_keys: Vec<String>,
+}
+
+/// The five `[model]` keys the kernel falls back to.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct Globals {
+    #[serde(default)]
+    pub max_output_tokens: Option<u64>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub model_timeout_s: Option<u64>,
+    #[serde(default)]
+    pub estimate_chars_per_token: Option<u64>,
+    #[serde(default)]
+    pub vision: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ModelSettingsView {
+    #[serde(default)]
+    pub active: String,
+    #[serde(default)]
+    pub entries: Vec<ModelEntry>,
+    #[serde(default)]
+    pub globals: Globals,
+    #[serde(default)]
+    pub config_path: String,
+    #[serde(default)]
+    pub mirror_path: Option<String>,
+    #[serde(default)]
+    pub key_env_present: std::collections::HashMap<String, bool>,
+    #[serde(default)]
+    pub effective: Option<Value>,
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
 
 /// One session row in the sidebar (port of JS `loadSessions`).
 #[derive(Clone, Debug, Deserialize)]
@@ -443,6 +512,19 @@ pub struct AppState {
     /// after the shell used to run drives that tab's "exited — restart"
     /// overlay.
     pub term_state: RwSignal<std::collections::HashMap<u32, TermState>>,
+    /// v0.5.42: model settings panel visibility.
+    pub model_open: RwSignal<bool>,
+    /// The server's model snapshot (GET /api/model).
+    pub model_view: RwSignal<Option<ModelSettingsView>>,
+    /// Panel error line (load / save failure).
+    pub model_err: RwSignal<Option<String>>,
+    /// Last save outcome — the banner that says what applied and what
+    /// needs a loop restart.
+    pub model_saved: RwSignal<Option<Value>>,
+    /// Save in flight (disables the buttons).
+    pub model_busy: RwSignal<bool>,
+    /// Probe results keyed by entry name (the "test connection" line).
+    pub model_probe: RwSignal<std::collections::HashMap<String, Value>>,
 }
 
 // v0.5.23: module-level handle to the live AppState (set once at app
@@ -511,6 +593,12 @@ impl AppState {
             rp_preview_map: RwSignal::new(std::collections::HashMap::new()),
             rp_err_map: RwSignal::new(std::collections::HashMap::new()),
             term_state: RwSignal::new(std::collections::HashMap::new()),
+            model_open: RwSignal::new(false),
+            model_view: RwSignal::new(None),
+            model_err: RwSignal::new(None),
+            model_saved: RwSignal::new(None),
+            model_busy: RwSignal::new(false),
+            model_probe: RwSignal::new(std::collections::HashMap::new()),
         }
     }
 

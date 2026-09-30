@@ -17,8 +17,6 @@ pub struct WebConfig {
     /// Command to spawn for the agent loop (e.g. `["rushi", "run"]`).
     /// The session name is appended as the last argument.
     pub loop_cmd: Vec<String>,
-    /// Directories to scan for UI-extension manifests (`ext.toml`).
-    pub ext_dirs: Vec<PathBuf>,
     /// Explicit path to the kernel `config.toml` (from `--config`).
     /// Forwarded to spawned loops as the `CONFIG` env var so the loop
     /// resolves its config regardless of the session working directory.

@@ -24,7 +24,7 @@ use crate::WEBUI_VERSION;
 /// unmount can land mid-dispatch — the detached element's listeners then
 /// fire on freed wasm closures and throw "closure invoked after being
 /// dropped". A macrotask runs only after the dispatch is done.
-fn after_dispatch(f: impl FnOnce() + 'static) {
+pub(crate) fn after_dispatch(f: impl FnOnce() + 'static) {
     if let Some(w) = web_sys::window() {
         let cb = Closure::once(f);
         let f: &js_sys::Function = cb.as_js_value().unchecked_ref();
@@ -211,6 +211,20 @@ fn theme_icon(mode: &str) -> AnyView {
         }
         .into_any(),
     }
+}
+
+/// v0.5.42: the model-settings button icon (sliders), same 16×16
+/// stroke style as the theme icons.
+fn model_settings_icon() -> AnyView {
+    view! {
+        <svg class="tt-ic" viewBox="0 0 24 24" aria-hidden="true">
+            <path class="ln" d="M4 6h16M4 12h16M4 18h16" />
+            <circle class="fl" cx="9" cy="6" r="2" />
+            <circle class="fl" cx="15" cy="12" r="2" />
+            <circle class="fl" cx="7" cy="18" r="2" />
+        </svg>
+    }
+    .into_any()
 }
 
 // ── sidebar ordering (v0.5.30: created / output / custom) ─────────
@@ -794,6 +808,16 @@ pub fn Sidebar(state: AppState) -> impl IntoView {
                         <span class="sb-version">{ WEBUI_VERSION }</span>
                     </h1>
                     <div class="sb-actions">
+                        // v0.5.42: model settings (provider entries,
+                        // active model, global defaults) — same global,
+                        // non-session-scoped slot as the theme button.
+                        <button
+                            id="model-settings"
+                            title="model settings"
+                            on:click=move |_| state.model_open.set(true)
+                        >
+                            { model_settings_icon() }
+                        </button>
                         <button
                             id="theme-toggle"
                             title=theme_title
@@ -1586,6 +1610,12 @@ fn status_strip_chips(events: &[serde_json::Value]) -> AnyView {
     let mut extras: Vec<String> = latest
         .keys()
         .filter(|k| !order.iter().any(|o| *o == k.as_str()))
+        // v0.1.5 writes one `hook.<window>.chain` marker per hook run
+        // (a verbose per-step JSON trace). It is routine, so it stays
+        // out of the strip; `.error` / `.unknown_fields` are kept
+        // because they mean a hook is failing or still speaking the
+        // legacy envelope.
+        .filter(|k| !k.ends_with(".chain"))
         .cloned()
         .collect();
     extras.sort();

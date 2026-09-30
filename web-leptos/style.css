@@ -262,11 +262,14 @@ button { font-weight: 700; }
      centred content) so they sit on the same baseline/size;
    - icons are 16×16 SVG shapes centred by flex, drawn on one 24-unit
      grid, so all theme states look identical in size & position. */
-#theme-toggle, #sidebar-toggle, #sidebar-expand { display: inline-flex; align-items: center; justify-content: center; height: 26px; min-width: 30px; box-sizing: border-box; }
-#theme-toggle { padding: 0; }
-#theme-toggle svg { display: block; width: 16px; height: 16px; }
-#theme-toggle .ln { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
-#theme-toggle .fl, #btn-send .fl { fill: currentColor; }
+#theme-toggle, #sidebar-toggle, #sidebar-expand, #model-settings { display: inline-flex; align-items: center; justify-content: center; height: 26px; min-width: 30px; box-sizing: border-box; }
+#theme-toggle, #model-settings { padding: 0; }
+#theme-toggle svg, #model-settings svg { display: block; width: 16px; height: 16px; }
+#theme-toggle .ln, #model-settings .ln { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+#theme-toggle .fl, #model-settings .fl, #btn-send .fl { fill: currentColor; }
+#model-settings { background: var(--bg-elev); border: none; border-radius: 4px; color: var(--text-muted); cursor: pointer; box-shadow: var(--shadow); }
+#model-settings:hover { box-shadow: var(--shadow-hover); color: var(--text); }
+#model-settings:active { transform: translateY(1px); box-shadow: var(--shadow-pressed); }
 #btn-send svg { display: block; width: 16px; height: 16px; }
 #sidebar-open { display: none; background: var(--bg-elev); border: none; border-radius: 4px; color: var(--text); padding: 2px 8px; cursor: pointer; font-size: 13px; box-shadow: var(--shadow); }
 #sidebar-open:hover { box-shadow: var(--shadow-hover); }
@@ -846,6 +849,38 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
 .dc-title { font-size: 17px; font-weight: 800; color: var(--text); margin-bottom: 6px; }
 .dc-body { font-size: 14px; color: var(--text); line-height: 1.5; }
 .ns-danger { background: var(--danger); color: var(--on-danger); }
+
+/* v0.5.42: model settings panel (reuses the .ns-* form/button idioms) */
+#ms-backdrop { position: fixed; inset: 0; background: rgba(var(--shadow-tint), 0.30); backdrop-filter: blur(2px); z-index: 300; display: flex; align-items: center; justify-content: center; }
+#ms-dialog { width: min(920px, calc(100vw - 48px)); max-height: calc(100vh - 64px); overflow-y: auto; background: var(--bg); border-radius: 14px; box-shadow: var(--shadow-hover); border: 1px solid var(--border); padding: 20px; display: flex; flex-direction: column; gap: 4px; }
+.ms-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 4px; }
+.ms-path { font-size: 11px; color: var(--text-muted); font-family: "SF Mono", Consolas, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ms-cols { display: flex; gap: 16px; align-items: flex-start; }
+.ms-list { width: 260px; flex: 0 0 260px; display: flex; flex-direction: column; gap: 4px; }
+.ms-row { display: grid; grid-template-columns: 10px 1fr; grid-template-rows: auto auto; column-gap: 6px; padding: 7px 9px; border-radius: 8px; background: var(--bg-elev); border: 1px solid var(--border); cursor: pointer; box-shadow: var(--groove); }
+.ms-row:hover { box-shadow: var(--shadow); }
+.ms-row.ms-sel { border-color: var(--accent); box-shadow: var(--shadow); }
+.ms-dot { grid-row: 1 / span 2; align-self: center; width: 8px; height: 8px; border-radius: 50%; background: var(--border); }
+.ms-dot.on { background: var(--accent); }
+.ms-name { font-size: 13px; font-weight: 700; color: var(--text); overflow: hidden; text-overflow: ellipsis; }
+.ms-sub { font-size: 11px; color: var(--text-muted); font-family: "SF Mono", Consolas, monospace; overflow: hidden; text-overflow: ellipsis; }
+.ms-add { margin-top: 4px; background: var(--bg-elev); color: var(--text); font-size: 12px; padding: 7px 10px; }
+.ms-form { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
+.ms-key-hint { font-size: 11px; color: var(--text-muted); margin-top: -4px; }
+.ms-seg { display: flex; flex-wrap: wrap; gap: 4px; margin: 2px 0 4px; }
+.ms-seg button { border: 1px solid var(--border); background: var(--bg-elev); color: var(--text-muted); border-radius: 6px; padding: 4px 9px; font-size: 12px; cursor: pointer; box-shadow: var(--groove); }
+.ms-seg button.on { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
+.ms-check { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text); margin-top: 8px; }
+.ms-extra { font-size: 11px; color: var(--text-muted); margin-top: 6px; font-family: "SF Mono", Consolas, monospace; }
+.ms-actions { display: flex; gap: 8px; margin-top: 12px; }
+.ms-test { margin-top: 8px; font-size: 12px; color: var(--text); }
+.ms-test.ms-ok { color: var(--accent); }
+.ms-test.ms-fail { color: var(--danger); }
+.ms-detail { font-family: "SF Mono", Consolas, monospace; font-size: 11px; color: var(--text-muted); white-space: pre-wrap; margin-top: 2px; }
+.ms-active, .ms-globals { border-top: 1px solid var(--border); margin-top: 14px; padding-top: 6px; }
+.ms-banner { margin-top: 12px; padding: 9px 12px; border-radius: 8px; background: var(--bg-elev); border: 1px solid var(--border); color: var(--text); font-size: 12px; white-space: pre-wrap; box-shadow: var(--groove); }
+.ms-notes { margin-top: 8px; font-size: 11px; color: var(--text-muted); white-space: pre-wrap; }
+.ms-effective { margin-top: 6px; font-size: 11px; color: var(--text-muted); font-family: "SF Mono", Consolas, monospace; }
 
 /* explicit type scale for .md content: without font-size/weight rules the
    headings fall back to UA defaults (h1=2em, h2=1.5em, h3≈1.17em on the

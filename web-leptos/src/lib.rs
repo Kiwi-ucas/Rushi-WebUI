@@ -3,6 +3,7 @@
 mod api;
 mod markdown;
 mod model;
+mod ms;
 mod pile;
 mod terminal;
 mod timeutil;
@@ -242,6 +243,7 @@ fn App() -> impl IntoView {
             </Show>
             <ui::NewSessionDialog state=state />
             <ui::DeleteConfirmDialog state=state />
+            <ms::ModelSettingsDialog state=state />
         </div>
     }
 }
