@@ -122,12 +122,6 @@ pub async fn set_model_key(name: &str, value: Option<&str>) -> Result<(), String
     Ok(())
 }
 
-/// v0.5.44: the configured model entry names (options for the card popup).
-pub async fn load_model_names() -> Result<Vec<String>, String> {
-    let v = load_model().await?;
-    Ok(v.entries.into_iter().map(|e| e.name).collect())
-}
-
 /// The server's default working directory (prefill for the picker).
 pub async fn default_cwd() -> Option<String> {
     let res = Request::get("/api/default-cwd").send().await.ok()?;

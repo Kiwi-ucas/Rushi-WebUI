@@ -537,6 +537,10 @@ pub struct AppState {
     /// session card's model popup. Refreshed at mount and after a panel
     /// save.
     pub model_names: RwSignal<Vec<String>>,
+    /// v0.5.46: entry name -> `context_tokens`, the budget the context bar
+    /// reports for the active session's model. One `/api/model` fetch
+    /// feeds this together with `model_names`.
+    pub model_ctx: RwSignal<std::collections::BTreeMap<String, u64>>,
 }
 
 // v0.5.23: module-level handle to the live AppState (set once at app
@@ -612,7 +616,23 @@ impl AppState {
             model_busy: RwSignal::new(false),
             model_probe: RwSignal::new(std::collections::HashMap::new()),
             model_names: RwSignal::new(Vec::new()),
+            model_ctx: RwSignal::new(std::collections::BTreeMap::new()),
         }
+    }
+
+    /// v0.5.46: publish a `/api/model` snapshot into the app state — the
+    /// entry names behind the session-card popup and each entry's context
+    /// budget behind the context bar. Called at mount (lib.rs) and after
+    /// every settings-panel save/reload (ms.rs).
+    pub fn set_model_settings(&self, v: &ModelSettingsView) {
+        self.model_names
+            .set(v.entries.iter().map(|e| e.name.clone()).collect());
+        self.model_ctx.set(
+            v.entries
+                .iter()
+                .filter_map(|e| e.context_tokens.map(|c| (e.name.clone(), c)))
+                .collect(),
+        );
     }
 
     /// v0.5.30: seed the "output" rank for sessions we have not stamped

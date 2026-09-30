@@ -73,13 +73,15 @@ fn App() -> impl IntoView {
         });
     }
 
-    // v0.5.44: the model entry names behind the session-card popup. Read
-    // once at mount; the settings panel refreshes the list after a save.
+    // v0.5.44: the model entry names behind the session-card popup;
+    // v0.5.46: plus each entry's context budget, which the context bar
+    // reports for the active session's model. Read once at mount; the
+    // settings panel refreshes both after a save.
     {
         let st = state;
         spawn_local(async move {
-            if let Ok(names) = api::load_model_names().await {
-                st.model_names.set(names);
+            if let Ok(v) = api::load_model().await {
+                st.set_model_settings(&v);
             }
         });
     }

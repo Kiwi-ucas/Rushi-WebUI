@@ -80,6 +80,11 @@ struct FetchedModel {
 #[derive(Clone, Debug, Default, PartialEq)]
 struct ModelDraft {
     name: String,
+    /// v0.5.46: the entry name as loaded from the config (empty for a new
+    /// model). A rename is `orig_name != name`; `to_payload` carries
+    /// `[active] model` along so renaming the ACTIVE entry does not leave
+    /// the pointer dangling (issue #5).
+    orig_name: String,
     model_id: String,
     context_tokens: String,
     max_output_tokens: String,
@@ -144,6 +149,7 @@ impl ModelDraft {
     fn from_entry(e: &ModelEntry) -> Self {
         Self {
             name: e.name.clone(),
+            orig_name: e.name.clone(),
             model_id: s(&e.model_id),
             context_tokens: n(&e.context_tokens),
             max_output_tokens: n(&e.max_output_tokens),
@@ -213,13 +219,28 @@ impl Draft {
     }
 
     fn to_payload(&self, view: &ModelSettingsView) -> ModelSettingsView {
-        let entries = self
+        let entries: Vec<ModelEntry> = self
             .providers
             .iter()
             .flat_map(|p| p.models.iter().map(|m| m.to_entry(p)))
             .collect();
+        // v0.5.46: `[active] model` is a plain pointer at an entry name,
+        // and the panel round-trips it untouched. Renaming the entry it
+        // points at would leave it dangling and the server would refuse
+        // the save ("active model ... is not one of the entries", issue
+        // #5) — so carry the pointer across renames here.
+        let active = if self.active.is_empty() || entries.iter().any(|e| e.name == self.active) {
+            self.active.clone()
+        } else {
+            self.providers
+                .iter()
+                .flat_map(|p| p.models.iter())
+                .find(|m| m.orig_name == self.active && !m.name.trim().is_empty())
+                .map(|m| m.name.trim().to_string())
+                .unwrap_or_else(|| self.active.clone())
+        };
         ModelSettingsView {
-            active: self.active.clone(),
+            active,
             entries,
             globals: self.globals.clone(),
             config_path: view.config_path.clone(),
@@ -321,9 +342,9 @@ pub fn ModelSettingsDialog(state: AppState) -> impl IntoView {
                 Ok(v) => {
                     draft.set(Draft::from_view(&v));
                     sel.set(0);
-                    state
-                        .model_names
-                        .set(v.entries.iter().map(|e| e.name.clone()).collect());
+                    // v0.5.46: publish names + context budgets (the card
+                    // popup and the context bar read them).
+                    state.set_model_settings(&v);
                     view.set(Some(v));
                     probe_cards(None);
                 }
@@ -353,9 +374,7 @@ pub fn ModelSettingsDialog(state: AppState) -> impl IntoView {
                 Ok(out) => {
                     saved.set(Some(out));
                     if let Ok(fresh) = api::load_model().await {
-                        state
-                            .model_names
-                            .set(fresh.entries.iter().map(|e| e.name.clone()).collect());
+                        state.set_model_settings(&fresh);
                         draft.set(Draft::from_view(&fresh));
                         view.set(Some(fresh));
                     }
@@ -394,6 +413,7 @@ pub fn ModelSettingsDialog(state: AppState) -> impl IntoView {
                     });
                     key_msg.set(Some(format!("saved for {name}")));
                     if let Ok(v) = api::load_model().await {
+                        state.set_model_settings(&v);
                         view.set(Some(v));
                     }
                     probe_cards(None);
@@ -420,6 +440,7 @@ pub fn ModelSettingsDialog(state: AppState) -> impl IntoView {
                 Ok(()) => {
                     key_msg.set(Some(format!("cleared {name}")));
                     if let Ok(v) = api::load_model().await {
+                        state.set_model_settings(&v);
                         view.set(Some(v));
                     }
                     probe_cards(None);
@@ -616,15 +637,6 @@ pub fn ModelSettingsDialog(state: AppState) -> impl IntoView {
                                             ></span>
                                             <span class="ms-name">{ label }</span>
                                             <span class="ms-sub">{ sub }</span>
-                                            <button
-                                                class="ms-mini"
-                                                title="test this provider again"
-                                                disabled=move || pending()
-                                                on:click=move |e: MouseEvent| {
-                                                    e.stop_propagation();
-                                                    probe_cards(Some(ci));
-                                                }
-                                            >{ "\u{21bb}" }</button>
                                         </div>
                                     }
                                 })
@@ -662,6 +674,17 @@ pub fn ModelSettingsDialog(state: AppState) -> impl IntoView {
                                 let k = move || card_key(&card_of());
                                 let fbusy = move || {
                                     fetching.get().get(&k()).copied().unwrap_or(false)
+                                };
+                                // v0.5.46: the reachability probe for the
+                                // SELECTED card (the rail's own re-test
+                                // button moved down here, between
+                                // "Fetch models" and "Delete provider").
+                                let tbusy = move || {
+                                    probes
+                                        .get()
+                                        .get(&k())
+                                        .and_then(|v| v.get("pending").and_then(|p| p.as_bool()))
+                                        .unwrap_or(false)
                                 };
                                 view! {
                                                 <TextRow
@@ -986,6 +1009,12 @@ pub fn ModelSettingsDialog(state: AppState) -> impl IntoView {
                                                         disabled=move || fbusy()
                                                         on:click=move |_| fetch_models(ci)
                                                     >{ move || if fbusy() { "Fetching…" } else { "Fetch models" } }</button>
+                                                    <button
+                                                        class="ns-btn"
+                                                        title="probe this provider again (the dot in the rail shows the result)"
+                                                        disabled=move || tbusy()
+                                                        on:click=move |_| probe_cards(Some(ci))
+                                                    >{ move || if tbusy() { "Testing…" } else { "Test again" } }</button>
                                                     <button
                                                         class="ns-btn ns-danger"
                                                         disabled=move || draft.get().providers.len() <= 1

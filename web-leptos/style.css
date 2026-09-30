@@ -876,9 +876,10 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
 .ms-cols { display: flex; gap: 16px; align-items: flex-start; }
 .ms-list { width: 260px; flex: 0 0 260px; display: flex; flex-direction: column; gap: 4px; }
 /* v0.5.47: the left rail is the provider list again — a row per provider
-   carrying its reachability dot, its name and its endpoint. Third column
-   holds the re-test button (spanning both text rows). */
-.ms-row { display: grid; grid-template-columns: 10px 1fr auto; grid-template-rows: auto auto; column-gap: 6px; padding: 7px 9px; border-radius: 8px; background: var(--bg-elev); border: 1px solid var(--border); cursor: pointer; box-shadow: var(--groove); }
+   carrying its reachability dot, its name and its endpoint. v0.5.46: the
+   re-test button moved into the form's action row, so the rail is two
+   columns again. */
+.ms-row { display: grid; grid-template-columns: 10px 1fr; grid-template-rows: auto auto; column-gap: 6px; padding: 7px 9px; border-radius: 8px; background: var(--bg-elev); border: 1px solid var(--border); cursor: pointer; box-shadow: var(--groove); }
 .ms-row:hover { box-shadow: var(--shadow); }
 .ms-row.ms-sel { border-color: var(--accent); box-shadow: var(--shadow); }
 .ms-row .ms-mini { grid-row: 1 / span 2; align-self: center; }
@@ -918,7 +919,10 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
 .ms-models { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
 .ms-model { border-radius: 8px; background: var(--bg); border: 1px solid var(--border); padding: 6px 8px; box-shadow: var(--groove); }
 .ms-model-row { display: flex; align-items: center; gap: 6px; }
-.ms-model-id { flex: 1 1 auto; min-width: 0; padding: 6px 10px; font-size: 13px; font-family: "SF Mono", Consolas, monospace; }
+/* v0.5.46: the model-name row is an .ns-input like base_url etc. — its
+   own font-size/family made the name read in a different typeface than
+   the fields around it. Only the box is tightened for the row. */
+.ms-model-id { flex: 1 1 auto; min-width: 0; padding: 6px 10px; }
 /* v0.5.47: a column, so each label/input pair gets its own line — as a
    plain block the inline <label>/<input> ran together on one row. */
 .ms-model-details { margin-top: 4px; display: flex; flex-direction: column; }

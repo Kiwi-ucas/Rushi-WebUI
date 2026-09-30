@@ -38,8 +38,32 @@ pub(crate) fn after_dispatch(f: impl FnOnce() + 'static) {
     }
 }
 
-/// Context budget (tokens) shown by the context bar (port of ctxBudget).
-pub const CTX_BUDGET: u64 = 262_144;
+/// v0.5.46: does this click come from inside `sel` (that element or a
+/// descendant)? Cards use it to ignore clicks that belong to their own
+/// popups: a popup that closes inside its click handler is unmounted
+/// mid-dispatch and can no longer stop the event (issue #7).
+fn click_inside(e: &MouseEvent, sel: &str) -> bool {
+    e.target()
+        .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+        .and_then(|el| el.closest(sel).ok().flatten())
+        .is_some()
+}
+
+/// Context budget (tokens) shown by the context bar when the session's
+/// model entry carries no `context_tokens` — the kernel's own default
+/// (`crates/rushi/src/model_settings.rs`, DEFAULT_CONTEXT_TOKENS).
+pub const CTX_BUDGET_FALLBACK: u64 = 262_144;
+
+/// Format a token count the way the context bar reads it: `262144` →
+/// "262K", `1048576` → "1M", `1500000` → "1.5M".
+pub fn format_ctx(n: u64) -> String {
+    if n >= 1_000_000 {
+        let m = format!("{:.1}", n as f64 / 1_000_000.0);
+        format!("{}M", m.trim_end_matches(".0"))
+    } else {
+        format!("{}K", n / 1000)
+    }
+}
 
 // ── three-state layout (M6, persisted) ───────────────────────────
 /// Layout modes: "main" (no sidebar — full main view), "split"
@@ -245,11 +269,28 @@ fn SessionModelChip(
     // clip an absolutely positioned panel.
     let pos = RwSignal::new((0.0_f64, 0.0_f64));
     let names = state.model_names;
+    let sessions = state.sessions;
     // Signals, not plain Strings: a `move` closure nested in the `view!`
     // body would otherwise move them out of the view closure, which must
     // stay `Fn`.
-    let current = RwSignal::new(model.unwrap_or_default());
     let session_name = RwSignal::new(name);
+    // v0.5.46: the label reads back from the session list instead of the
+    // mount-time prop (issue #6). The popup reloads `state.sessions`
+    // after a change, so the chip follows the new entry without a page
+    // reload; the prop is only the seed for a row the list lacks yet.
+    let initial = model.unwrap_or_default();
+    let current = Signal::derive(move || {
+        let n = session_name.get();
+        let picked = sessions
+            .get()
+            .into_iter()
+            .find(|s| s.name == n)
+            .and_then(|s| s.model);
+        match picked {
+            Some(m) if !m.is_empty() => m,
+            _ => initial.clone(),
+        }
+    });
     let label = move || {
         let c = current.get();
         if c.is_empty() {
@@ -332,7 +373,15 @@ fn SessionModelChip(
                                                     st.sessions.set(list);
                                                 }
                                             });
-                                            open.set(false);
+                                            // v0.5.46: close on the next
+                                            // macrotask. Closing inside the
+                                            // handler unmounts the panel
+                                            // mid-dispatch, which drops the
+                                            // panel's own stop_propagation
+                                            // listener — the click then
+                                            // reaches the session card and
+                                            // switches sessions (issue #7).
+                                            after_dispatch(move || open.set(false));
                                         }
                                     >
                                         <span class="qsel-tick">{ "\u{2713}" }</span>
@@ -342,33 +391,6 @@ fn SessionModelChip(
                                 .into_any()
                             })
                             .collect();
-                        {
-                            let session = session_base.clone();
-                            let st = state;
-                            let sel = cur.is_empty();
-                            opts.push(
-                                view! {
-                                    <button
-                                        class="qsel-opt"
-                                        aria-selected=sel
-                                        on:click=move |_| {
-                                            let session = session.clone();
-                                            spawn_local(async move {
-                                                let _ = api::set_session_model(&session, None).await;
-                                                if let Ok(list) = api::load_sessions().await {
-                                                    st.sessions.set(list);
-                                                }
-                                            });
-                                            open.set(false);
-                                        }
-                                    >
-                                        <span class="qsel-tick">{ "\u{2713}" }</span>
-                                        { "follow global" }
-                                    </button>
-                                }
-                                .into_any(),
-                            );
-                        }
                         opts
                     } }
                 </div>
@@ -1247,7 +1269,14 @@ pub fn Sidebar(state: AppState) -> impl IntoView {
                                             "false".to_string()
                                         }
                                     }
-                                    on:click=move |_| {
+                                    on:click=move |e: MouseEvent| {
+                                        // v0.5.46: the model chip, its
+                                        // popup and its backdrop own their
+                                        // clicks — a click of theirs must
+                                        // never switch sessions (issue #7).
+                                        if click_inside(&e, ".sess-model") {
+                                            return;
+                                        }
                                         select_session(state, &click_name);
                                         menu_session.set(None);
                                     }
@@ -1543,9 +1572,36 @@ pub fn ContextBar(state: AppState) -> impl IntoView {
     let events = state.events;
     let layout = state.layout_mode;
 
+    // v0.5.46: the budget is the ACTIVE session's model entry, not a
+    // hard-coded 262k — a 1M-context entry reads "1M". The server
+    // resolves each session's model (own choice -> last used -> config
+    // active), so the name is always there; a name with no matching
+    // entry (renamed away, deleted) falls back to the kernel's default.
+    let budget = move || {
+        let Some(sess) = state.active_session.get() else {
+            return CTX_BUDGET_FALLBACK;
+        };
+        let name = state
+            .sessions
+            .get()
+            .into_iter()
+            .find(|s| s.name == sess)
+            .and_then(|s| s.model)
+            .unwrap_or_default();
+        if name.is_empty() {
+            return CTX_BUDGET_FALLBACK;
+        }
+        state
+            .model_ctx
+            .get()
+            .get(&name)
+            .copied()
+            .unwrap_or(CTX_BUDGET_FALLBACK)
+    };
+
     let fill_style = move || {
         let used = ctx_used.get();
-        let pct = (used as f64 / CTX_BUDGET as f64 * 100.0).min(100.0);
+        let pct = (used as f64 / budget() as f64 * 100.0).min(100.0);
         let color = if pct > 90.0 {
             "var(--danger)"
         } else if pct > 70.0 {
@@ -1557,17 +1613,11 @@ pub fn ContextBar(state: AppState) -> impl IntoView {
     };
 
     let ctx_pct = move || {
-        let pct = (ctx_used.get() as f64 / CTX_BUDGET as f64 * 100.0).min(100.0);
+        let pct = (ctx_used.get() as f64 / budget() as f64 * 100.0).min(100.0);
         format!("{pct:.1}%")
     };
 
-    let ctx_k = move || {
-        format!(
-            "~{}K / {}K",
-            (ctx_used.get() / 1000),
-            (CTX_BUDGET / 1000)
-        )
-    };
+    let ctx_k = move || format!("~{} / {}", format_ctx(ctx_used.get()), format_ctx(budget()));
 
     view! {
         <div id="context-bar">
