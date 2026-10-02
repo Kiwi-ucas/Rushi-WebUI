@@ -364,7 +364,8 @@ pub struct RewindNode {
     pub ts: String,
     #[serde(default)]
     pub summary: String,
-    /// Non-`ext_status` events folded into this round (the agent's work).
+    /// The round's span (its own `user_message` up to the next one) minus
+    /// the `ext_status` bookkeeping events — i.e. the round's work.
     #[serde(default)]
     pub events: u64,
     /// "active" (on the active path) | "abandoned" (a masked fork).
@@ -537,6 +538,111 @@ pub struct RewindTree {
     /// "your last rewind did not take effect" (D-C).
     #[serde(default)]
     pub tail_ignored: Option<IgnoredMarker>,
+    /// Style B's geometry (`docs/rewind-plugin-plan.md` section 10) — the
+    /// straight main line and the lanes the branches fork into. Style A
+    /// ignores it.
+    #[serde(default)]
+    pub flow: RewindFlow,
+}
+
+/// Style B (the flow view): the whole picture, in logical units.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct RewindFlow {
+    #[serde(default)]
+    pub nodes: Vec<FlowNode>,
+    #[serde(default)]
+    pub edges: Vec<FlowEdge>,
+    #[serde(default)]
+    pub branches: Vec<FlowBranch>,
+    /// The grid's width in columns (`max x + 1`).
+    #[serde(default)]
+    pub cols: u64,
+    /// The grid's half-height (`max |lane|`); 0 for a straight line.
+    #[serde(default)]
+    pub lanes: i32,
+    /// The straight line's length in nodes.
+    #[serde(default)]
+    pub main_len: u64,
+}
+
+/// Style B: one round's place in the picture, plus what the detail panel
+/// shows for it (the same values its [`RewindNode`] carries).
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct FlowNode {
+    pub seq: u64,
+    #[serde(default)]
+    pub round: u64,
+    /// The column: one step per round down the tree.
+    #[serde(default)]
+    pub x: u64,
+    /// 0 on the main line, -1/+1/-2/+2… forking up/down.
+    #[serde(default)]
+    pub lane: i32,
+    /// Sits on the longest chain, i.e. the straight line.
+    #[serde(default)]
+    pub main: bool,
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub current: bool,
+    #[serde(default)]
+    pub retracted: bool,
+    #[serde(default)]
+    pub events: u64,
+    #[serde(default)]
+    pub ts: String,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub restore: Restore,
+}
+
+/// Style B: one parent→child connector; `lane`/`main` describe the child.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct FlowEdge {
+    pub from: u64,
+    pub to: u64,
+    #[serde(default)]
+    pub lane: i32,
+    #[serde(default)]
+    pub main: bool,
+}
+
+/// Style B: a chain segment — the nodes sharing one lane from `from_x` to
+/// `to_x` inclusive (the columns it occupies).
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct FlowBranch {
+    #[serde(default)]
+    pub root: u64,
+    #[serde(default)]
+    pub lane: i32,
+    #[serde(default)]
+    pub parent_lane: i32,
+    #[serde(default)]
+    pub from_x: u64,
+    #[serde(default)]
+    pub to_x: u64,
+}
+
+/// Style B, B2: one round in full — the *verbatim* user message (the tree
+/// only carries a 60-char preview), fetched when a node is selected.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct RewindDetail {
+    pub seq: u64,
+    #[serde(default)]
+    pub round: u64,
+    #[serde(default)]
+    pub ts: String,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub events: u64,
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub current: bool,
+    #[serde(default)]
+    pub retracted: bool,
 }
 
 impl RewindTree {
@@ -906,6 +1012,16 @@ pub struct AppState {
     /// Rewind plugin: bumped when a `user_message` / `rewind` event arrives
     /// (the only structure-changing event types) so the tree refetches.
     pub rewind_gen: RwSignal<u64>,
+    /// Style B: which History style is showing — `"tree"` (style A, the
+    /// default, D2) or `"flow"`. Persisted as `rushi-rw-view`; the plugin
+    /// owns it, like every other display-only preference.
+    pub rw_view: RwSignal<String>,
+    /// Style B: the selected round's log line (`None` = nothing selected).
+    /// Clicking a node in the flow view only sets this — the Rewind button
+    /// in the detail panel is the only trigger there (the user's rule).
+    pub rw_selected: RwSignal<Option<u64>>,
+    /// Style B: the selected round in full (B2), fetched on selection.
+    pub rw_detail: RwSignal<Option<RewindDetail>>,
     /// v0.5.57: display aliases for the session groups, keyed by the session's
     /// **working path** (`cwd`). The group head shows the path's basename or,
     /// when the user renamed it, this label — a display-only preference
@@ -996,6 +1112,9 @@ impl AppState {
             rewind_tree: RwSignal::new(None),
             rewind_pending: RwSignal::new(None),
             rewind_gen: RwSignal::new(0),
+            rw_view: RwSignal::new("tree".to_string()),
+            rw_selected: RwSignal::new(None),
+            rw_detail: RwSignal::new(None),
             project_labels: RwSignal::new(std::collections::HashMap::new()),
             group_edit: RwSignal::new(None),
         }

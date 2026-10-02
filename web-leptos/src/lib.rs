@@ -65,6 +65,11 @@ fn App() -> impl IntoView {
     // path's basename, and the path itself is never modified.
     state.project_labels.set(ui::read_project_labels());
 
+    // v0.5.65 (Style B): which History style is showing. The list style is
+    // the default (D2) — the new "flow" style is opt-in from the top bar,
+    // and the choice survives a reload like every other display preference.
+    state.rw_view.set(crate::rewind::read_view_mode());
+
     // v0.5.38: keep the loop-cmd chip's `loop_cmd` signal fresh from
     // the loaded event window. The WS history frame only carries the
     // last HIST_PAGE events, but a freshly sent command is always the
@@ -268,6 +273,9 @@ fn App() -> impl IntoView {
     // the sidebar panel both read `state.rewind_tree`); keyed on the active
     // session + the structure-generation counter.
     crate::rewind::register_tree_effect(state);
+            // Style B (the flow view): which style is showing, what is
+            // selected, and the selected round's full text (B2).
+            crate::rewind::register_flow_effects(state);
 
     view! {
         <div id="app" class=app_class>

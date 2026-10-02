@@ -804,7 +804,7 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
    drop/rim. Arrows are gone (::-webkit-scrollbar-button). Firefox gets
    the equivalent: scrollbar-width: thin (no arrow buttons) +
    scrollbar-color with the same two tokens. */
-#transcript, #msg-input, .ev-result, .ev-args, #session-list, #sidebar-inner, #status-strip, .ev-tool-args pre, .ev-content pre, #ns-dialog, .ns-browser, #ms-dialog, .ms-fetched, .sess-model-panel, .rp-tree, .rp-code, .rp-img-wrap, .rp-tabbar, .term-host .xterm .xterm-viewport, #goal-body .goal-text, .essence-groups, #hist-tree, #hist-rail, .rewind-list { scrollbar-width: thin; scrollbar-color: var(--scroll-thumb) var(--scroll-track); }
+#transcript, #msg-input, .ev-result, .ev-args, #session-list, #sidebar-inner, #status-strip, .ev-tool-args pre, .ev-content pre, #ns-dialog, .ns-browser, #ms-dialog, .ms-fetched, .sess-model-panel, .rp-tree, .rp-code, .rp-img-wrap, .rp-tabbar, .term-host .xterm .xterm-viewport, #goal-body .goal-text, .essence-groups, #hist-tree, #hist-rail, .rewind-list, .fd-text { scrollbar-width: thin; scrollbar-color: var(--scroll-thumb) var(--scroll-track); }
 /* v0.5.47: FIX — the pseudo-element must be repeated on EVERY selector.
    v0.5.46 wrote each rule as one flat list with :::-webkit-scrollbar(-button/
    -track/-thumb) on the LAST item only; a flat list does not distribute a
@@ -813,10 +813,10 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
    #transcript / #msg-input / #status-strip / #ns-dialog / #ms-dialog, the
    :::-webkit-scrollbar rule pinned them to 10x10px, and the -thumb rule
    painted them --scroll-thumb with a 999px radius. Never write it flat. */
-#transcript::-webkit-scrollbar, #msg-input::-webkit-scrollbar, .ev-result::-webkit-scrollbar, .ev-args::-webkit-scrollbar, #session-list::-webkit-scrollbar, #sidebar-inner::-webkit-scrollbar, #status-strip::-webkit-scrollbar, .ev-tool-args pre::-webkit-scrollbar, .ev-content pre::-webkit-scrollbar, #ns-dialog::-webkit-scrollbar, .ns-browser::-webkit-scrollbar, #ms-dialog::-webkit-scrollbar, .ms-fetched::-webkit-scrollbar, .sess-model-panel::-webkit-scrollbar, .rp-tree::-webkit-scrollbar, .rp-code::-webkit-scrollbar, .rp-img-wrap::-webkit-scrollbar, .rp-tabbar::-webkit-scrollbar, .term-host .xterm .xterm-viewport::-webkit-scrollbar, #goal-body .goal-text::-webkit-scrollbar, .essence-groups::-webkit-scrollbar, #hist-tree::-webkit-scrollbar, #hist-rail::-webkit-scrollbar, .rewind-list::-webkit-scrollbar { width: 10px; height: 10px; background: var(--scroll-track); }
-#transcript::-webkit-scrollbar-button, #msg-input::-webkit-scrollbar-button, .ev-result::-webkit-scrollbar-button, .ev-args::-webkit-scrollbar-button, #session-list::-webkit-scrollbar-button, #sidebar-inner::-webkit-scrollbar-button, #status-strip::-webkit-scrollbar-button, .ev-tool-args pre::-webkit-scrollbar-button, .ev-content pre::-webkit-scrollbar-button, #ns-dialog::-webkit-scrollbar-button, .ns-browser::-webkit-scrollbar-button, #ms-dialog::-webkit-scrollbar-button, .ms-fetched::-webkit-scrollbar-button, .sess-model-panel::-webkit-scrollbar-button, .rp-tree::-webkit-scrollbar-button, .rp-code::-webkit-scrollbar-button, .rp-img-wrap::-webkit-scrollbar-button, .rp-tabbar::-webkit-scrollbar-button, .term-host .xterm .xterm-viewport::-webkit-scrollbar-button, #goal-body .goal-text::-webkit-scrollbar-button, .essence-groups::-webkit-scrollbar-button, #hist-tree::-webkit-scrollbar-button, #hist-rail::-webkit-scrollbar-button, .rewind-list::-webkit-scrollbar-button { display: none; width: 0; height: 0; background: transparent; border: none; }
-#transcript::-webkit-scrollbar-track, #msg-input::-webkit-scrollbar-track, .ev-result::-webkit-scrollbar-track, .ev-args::-webkit-scrollbar-track, #session-list::-webkit-scrollbar-track, #sidebar-inner::-webkit-scrollbar-track, #status-strip::-webkit-scrollbar-track, .ev-tool-args pre::-webkit-scrollbar-track, .ev-content pre::-webkit-scrollbar-track, #ns-dialog::-webkit-scrollbar-track, .ns-browser::-webkit-scrollbar-track, #ms-dialog::-webkit-scrollbar-track, .ms-fetched::-webkit-scrollbar-track, .sess-model-panel::-webkit-scrollbar-track, .rp-tree::-webkit-scrollbar-track, .rp-code::-webkit-scrollbar-track, .rp-img-wrap::-webkit-scrollbar-track, .rp-tabbar::-webkit-scrollbar-track, .term-host .xterm .xterm-viewport::-webkit-scrollbar-track, #goal-body .goal-text::-webkit-scrollbar-track, .essence-groups::-webkit-scrollbar-track, #hist-tree::-webkit-scrollbar-track, #hist-rail::-webkit-scrollbar-track, .rewind-list::-webkit-scrollbar-track { background: var(--scroll-track); box-shadow: var(--scroll-groove); }
-#transcript::-webkit-scrollbar-thumb, #msg-input::-webkit-scrollbar-thumb, .ev-result::-webkit-scrollbar-thumb, .ev-args::-webkit-scrollbar-thumb, #session-list::-webkit-scrollbar-thumb, #sidebar-inner::-webkit-scrollbar-thumb, #status-strip::-webkit-scrollbar-thumb, .ev-tool-args pre::-webkit-scrollbar-thumb, .ev-content pre::-webkit-scrollbar-thumb, #ns-dialog::-webkit-scrollbar-thumb, .ns-browser::-webkit-scrollbar-thumb, #ms-dialog::-webkit-scrollbar-thumb, .ms-fetched::-webkit-scrollbar-thumb, .sess-model-panel::-webkit-scrollbar-thumb, .rp-tree::-webkit-scrollbar-thumb, .rp-code::-webkit-scrollbar-thumb, .rp-img-wrap::-webkit-scrollbar-thumb, .rp-tabbar::-webkit-scrollbar-thumb, .term-host .xterm .xterm-viewport::-webkit-scrollbar-thumb, #goal-body .goal-text::-webkit-scrollbar-thumb, .essence-groups::-webkit-scrollbar-thumb, #hist-tree::-webkit-scrollbar-thumb, #hist-rail::-webkit-scrollbar-thumb, .rewind-list::-webkit-scrollbar-thumb { background: var(--scroll-thumb); border: 2px solid transparent; background-clip: padding-box; border-radius: 999px; margin: 2px 0; box-shadow: var(--scroll-relief); }
+#transcript::-webkit-scrollbar, #msg-input::-webkit-scrollbar, .ev-result::-webkit-scrollbar, .ev-args::-webkit-scrollbar, #session-list::-webkit-scrollbar, #sidebar-inner::-webkit-scrollbar, #status-strip::-webkit-scrollbar, .ev-tool-args pre::-webkit-scrollbar, .ev-content pre::-webkit-scrollbar, #ns-dialog::-webkit-scrollbar, .ns-browser::-webkit-scrollbar, #ms-dialog::-webkit-scrollbar, .ms-fetched::-webkit-scrollbar, .sess-model-panel::-webkit-scrollbar, .rp-tree::-webkit-scrollbar, .rp-code::-webkit-scrollbar, .rp-img-wrap::-webkit-scrollbar, .rp-tabbar::-webkit-scrollbar, .term-host .xterm .xterm-viewport::-webkit-scrollbar, #goal-body .goal-text::-webkit-scrollbar, .essence-groups::-webkit-scrollbar, #hist-tree::-webkit-scrollbar, #hist-rail::-webkit-scrollbar, .rewind-list::-webkit-scrollbar, .fd-text::-webkit-scrollbar { width: 10px; height: 10px; background: var(--scroll-track); }
+#transcript::-webkit-scrollbar-button, #msg-input::-webkit-scrollbar-button, .ev-result::-webkit-scrollbar-button, .ev-args::-webkit-scrollbar-button, #session-list::-webkit-scrollbar-button, #sidebar-inner::-webkit-scrollbar-button, #status-strip::-webkit-scrollbar-button, .ev-tool-args pre::-webkit-scrollbar-button, .ev-content pre::-webkit-scrollbar-button, #ns-dialog::-webkit-scrollbar-button, .ns-browser::-webkit-scrollbar-button, #ms-dialog::-webkit-scrollbar-button, .ms-fetched::-webkit-scrollbar-button, .sess-model-panel::-webkit-scrollbar-button, .rp-tree::-webkit-scrollbar-button, .rp-code::-webkit-scrollbar-button, .rp-img-wrap::-webkit-scrollbar-button, .rp-tabbar::-webkit-scrollbar-button, .term-host .xterm .xterm-viewport::-webkit-scrollbar-button, #goal-body .goal-text::-webkit-scrollbar-button, .essence-groups::-webkit-scrollbar-button, #hist-tree::-webkit-scrollbar-button, #hist-rail::-webkit-scrollbar-button, .rewind-list::-webkit-scrollbar-button, .fd-text::-webkit-scrollbar-button { display: none; width: 0; height: 0; background: transparent; border: none; }
+#transcript::-webkit-scrollbar-track, #msg-input::-webkit-scrollbar-track, .ev-result::-webkit-scrollbar-track, .ev-args::-webkit-scrollbar-track, #session-list::-webkit-scrollbar-track, #sidebar-inner::-webkit-scrollbar-track, #status-strip::-webkit-scrollbar-track, .ev-tool-args pre::-webkit-scrollbar-track, .ev-content pre::-webkit-scrollbar-track, #ns-dialog::-webkit-scrollbar-track, .ns-browser::-webkit-scrollbar-track, #ms-dialog::-webkit-scrollbar-track, .ms-fetched::-webkit-scrollbar-track, .sess-model-panel::-webkit-scrollbar-track, .rp-tree::-webkit-scrollbar-track, .rp-code::-webkit-scrollbar-track, .rp-img-wrap::-webkit-scrollbar-track, .rp-tabbar::-webkit-scrollbar-track, .term-host .xterm .xterm-viewport::-webkit-scrollbar-track, #goal-body .goal-text::-webkit-scrollbar-track, .essence-groups::-webkit-scrollbar-track, #hist-tree::-webkit-scrollbar-track, #hist-rail::-webkit-scrollbar-track, .rewind-list::-webkit-scrollbar-track, .fd-text::-webkit-scrollbar-track { background: var(--scroll-track); box-shadow: var(--scroll-groove); }
+#transcript::-webkit-scrollbar-thumb, #msg-input::-webkit-scrollbar-thumb, .ev-result::-webkit-scrollbar-thumb, .ev-args::-webkit-scrollbar-thumb, #session-list::-webkit-scrollbar-thumb, #sidebar-inner::-webkit-scrollbar-thumb, #status-strip::-webkit-scrollbar-thumb, .ev-tool-args pre::-webkit-scrollbar-thumb, .ev-content pre::-webkit-scrollbar-thumb, #ns-dialog::-webkit-scrollbar-thumb, .ns-browser::-webkit-scrollbar-thumb, #ms-dialog::-webkit-scrollbar-thumb, .ms-fetched::-webkit-scrollbar-thumb, .sess-model-panel::-webkit-scrollbar-thumb, .rp-tree::-webkit-scrollbar-thumb, .rp-code::-webkit-scrollbar-thumb, .rp-img-wrap::-webkit-scrollbar-thumb, .rp-tabbar::-webkit-scrollbar-thumb, .term-host .xterm .xterm-viewport::-webkit-scrollbar-thumb, #goal-body .goal-text::-webkit-scrollbar-thumb, .essence-groups::-webkit-scrollbar-thumb, #hist-tree::-webkit-scrollbar-thumb, #hist-rail::-webkit-scrollbar-thumb, .rewind-list::-webkit-scrollbar-thumb, .fd-text::-webkit-scrollbar-thumb { background: var(--scroll-thumb); border: 2px solid transparent; background-clip: padding-box; border-radius: 999px; margin: 2px 0; box-shadow: var(--scroll-relief); }
 
 /* v0.5.16b: the loop-in-progress marker, in the gap between the last
    card and the input box. Three-ring "breathing" in this theme's
@@ -1758,6 +1758,124 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
 .ev-quickbtn:hover { opacity: 1; color: var(--text); box-shadow: var(--groove); }
 .ev-quickbtn:disabled { opacity: .2; cursor: default; }
 .ev-quickbtn:disabled:hover { color: var(--text-muted); box-shadow: none; opacity: .2; }
+
+/* ── v0.5.65 Rewind Style B — the "flow" view (plan section 10) ──────
+   The History view's second style: opt-in from the top bar (D2), its
+   right-hand side split 1 : 2 (D3) into the round's *detail panel* over
+   the *flow scene*. The scene draws the longest chain as one horizontal
+   `. - . - .` line with every other branch forking a lane above or below
+   it — the geometry is the server projection's `(x, lane)` (B1), only the
+   pixels are here. The live path is lit (D1), the current round ringed,
+   the selection ringed differently, and the dots carry a native tooltip
+   (D6; the panel is the text surface). The column pitch is a clamp() of
+   the panel's own width, so three rounds fill it and 117 rounds stay
+   readable and get panned (D4). No scrollbar at all: the wheel drives the
+   offset, the empty space drags (D7). */
+
+/* the `[ list | flow ]` switch in the top bar */
+#hist-style { flex: 0 0 auto; display: flex; gap: 2px; padding: 2px; border-radius: 9px; background: var(--bg-elev); box-shadow: var(--groove); }
+.hs-opt { border: none; background: transparent; color: var(--text-muted); font-size: 11px; font-weight: 700; letter-spacing: .4px; padding: 5px 10px; border-radius: 7px; cursor: pointer; transition: color .12s ease, background .12s ease, box-shadow .12s ease; }
+.hs-opt:hover { color: var(--text); }
+.hs-opt.on { color: var(--text); background: var(--bg); box-shadow: var(--shadow); }
+
+/* the split (flow only — the list style keeps the full height, D3) */
+#rw-split { flex: 1 1 auto; min-width: 0; min-height: 0; display: flex; flex-direction: column; gap: 10px; }
+#rw-detail { flex: 1 1 0; min-height: 0; display: flex; flex-direction: column; gap: 8px; border-radius: 10px; background: var(--bg-elev); box-shadow: var(--groove); padding: 10px 12px; }
+#rw-flow { flex: 2 1 0; min-height: 0; display: flex; container-type: inline-size; }
+
+/* the detail panel */
+.fd-head { flex: 0 0 auto; display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.fd-round { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; color: var(--text); }
+.fd-meta { font-size: 11px; color: var(--text-muted); }
+.fd-text { flex: 1 1 auto; min-height: 0; overflow-y: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; line-height: 1.55; color: var(--text); background: var(--bg); border-radius: 8px; box-shadow: var(--groove); padding: 8px 10px; }
+.fd-head[data-pending="true"] + .fd-text { opacity: .6; }
+.fd-foot { flex: 0 0 auto; display: flex; align-items: center; gap: 10px; }
+.fd-rewind { flex: 0 0 auto; border: none; background: var(--accent); color: var(--on-accent); font-size: 12px; font-weight: 700; padding: 7px 12px; border-radius: 9px; cursor: pointer; box-shadow: var(--shadow); transition: box-shadow .12s ease; }
+.fd-rewind:hover:not(:disabled) { box-shadow: var(--shadow-hover); }
+.fd-rewind:disabled { background: var(--bg); color: var(--text-muted); box-shadow: var(--groove); cursor: default; }
+.fd-restore { flex: 1 1 auto; min-width: 0; font-size: 11px; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rw3-badge { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .4px; color: var(--text-muted); box-shadow: var(--groove); border-radius: 6px; padding: 1px 5px; }
+.rw3-badge.here { color: var(--accent); }
+.rw3-badge.off { opacity: .8; }
+.rw3-badge.warn { color: #cc0044; }
+.rw3-badge.load { opacity: .6; }
+
+/* the scene */
+#rw-flow-scroll { flex: 1 1 auto; min-width: 0; min-height: 0; overflow-x: auto; overflow-y: hidden; border-radius: 10px; background: var(--bg-elev); box-shadow: var(--groove); scrollbar-width: none; -ms-overflow-style: none; cursor: grab; }
+#rw-flow-scroll.dragging { cursor: grabbing; }
+#rw-flow-scroll::-webkit-scrollbar { width: 0; height: 0; display: none; }
+#rw-flow-track { position: relative; min-width: 100%; width: calc(var(--cols) * var(--cell) + var(--cell)); height: 100%; --cell: clamp(26px, calc(100cqw / var(--cols) - 4px), 64px); }
+/* The lane pitch is a fraction of the scene's own height (never a fixed
+   px value), so every lane always fits: lane 0 on the middle line, ±1 the
+   first lane out, ±2 the next. One panel, one screen, no vertical scroll
+   to fight the wheel over (D4/D7). */
+.rw3-grid { position: absolute; inset: 0; --rowp: calc(50% / (var(--lanes) + 0.5)); }
+
+/* one dot per round: `top` is the lane (0 = the line, at the vertical
+   centre), `left` the column the server projection assigned it */
+.rw3-node { position: absolute; left: calc((var(--x) + 0.5) * var(--cell)); top: calc(50% + var(--lane) * var(--rowp)); transform: translate(-50%, -50%); border: none; background: transparent; padding: 0; display: flex; flex-direction: column; align-items: center; gap: 3px; cursor: pointer; }
+.rw3-dot { width: 13px; height: 13px; border-radius: 50%; background: var(--accent); box-shadow: var(--shadow); transition: box-shadow .12s ease, outline-color .12s ease; }
+.rw3-node:hover .rw3-dot { box-shadow: var(--shadow-hover); }
+.rw3-node.off .rw3-dot { background: var(--text-muted); opacity: .6; box-shadow: none; }
+.rw3-node.abandoned .rw3-dot { background: var(--text-muted); opacity: .45; box-shadow: none; }
+.rw3-node.abandoned .rw3-round { opacity: .6; text-decoration: line-through; }
+.rw3-node.current .rw3-dot { outline: 2px solid var(--accent); outline-offset: 3px; }
+.rw3-node.current .rw3-round { color: var(--accent); }
+.rw3-node.selected .rw3-dot { background: var(--accent2); outline: 2px solid var(--accent2); outline-offset: 3px; box-shadow: var(--shadow-hover); }
+.rw3-node.selected .rw3-round { color: var(--accent2); font-weight: 700; }
+.rw3-node.retracted .rw3-dot { background: transparent; border: 2px dashed var(--text-muted); }
+.rw3-node.blocked .rw3-dot { border: 2px dotted #cc0044; }
+.rw3-round { font-size: 9.5px; font-weight: 700; letter-spacing: .3px; color: var(--text-muted); }
+
+/* ── B7: the 3D branch + the light sweep (D9) ───────────────────────
+   `perspective` must sit INSIDE the scrolling element (a scroller flattens
+   its own 3D children), and the scene grid carries `preserve-3d` so the
+   ribbons — grandchildren of the perspective element — stay in that space.
+   The dots are never transformed: a label has to stay readable. */
+
+#rw-flow-track { perspective: 1400px; }
+.rw3-grid { transform-style: preserve-3d; }
+
+/* One translucent ribbon per forking branch, hinged at its fork column, so
+   a branch turns out of the line's plane as it crosses the centre of the
+   panel. `--turn` is a plain number: its own centre (`--bx`), the offset
+   (`--rw-scroll` — the one value a scroll frame writes) and the panel's
+   half width (`--halfpw`) over the falloff (`--denom`), all written by
+   `rewind::sync_scene_metrics`. */
+.rw3-ribbon { position: absolute; left: calc((var(--from) + 0.5) * var(--cell)); top: calc(50% + var(--lane) * var(--rowp)); width: calc((var(--to) - var(--from) + 0.5) * var(--cell)); height: 26px; margin-top: -13px; border-radius: 13px; transform-origin: 0 50%; pointer-events: none; opacity: .16; background: linear-gradient(90deg, var(--accent), transparent 88%); box-shadow: inset 0 1px 0 rgba(var(--shadow-rim), 0.45); --turn: clamp(-1, calc((var(--bx, 0) - var(--rw-scroll, 0) - var(--halfpw, 0)) / var(--denom, 1)), 1); transform: rotateX(calc(var(--turn) * 62deg)); }
+.rw3-ribbon.abandoned { opacity: .09; }
+.rw3-ribbon.up { box-shadow: inset 0 -1px 0 rgba(var(--shadow-rim), 0.45); }
+
+/* D9 primary: where the browser can drive it, the ribbon turns with its own
+   progress through the viewport and the proxy var is simply not read. */
+@keyframes rw-ribbon-turn { from { transform: rotateX(62deg); } 50% { transform: rotateX(0deg); } to { transform: rotateX(-62deg); } }
+@supports (animation-timeline: view(x)) {
+  .rw3-ribbon { animation: rw-ribbon-turn linear both; animation-timeline: view(x); animation-range: cover 0% cover 100%; }
+}
+
+/* D9 static: no turning at all when the user asked for less motion. */
+@media (prefers-reduced-motion: reduce) {
+  .rw3-ribbon { animation: none; transform: none; }
+}
+
+/* The light: a soft vertical band pinned to the panel (sticky in a
+   horizontally scrolling box), so the scene slides under one fixed light
+   instead of every dot carrying its own glow. Never in the way of a click. */
+.rw3-sheen { position: sticky; left: 0; top: 0; width: 100cqw; height: 100%; pointer-events: none; opacity: .07; background: linear-gradient(90deg, transparent 22%, var(--accent) 50%, transparent 78%); }
+
+/* the connectors: a `. - .` run for every step on the line, a hinge plus a
+   run for every fork — lit by the child's state (D1) */
+.rw3-seg { position: absolute; left: calc((var(--x) + 0.5) * var(--cell)); top: calc(50% + var(--lane, 0) * var(--rowp)); width: var(--cell); height: 2px; margin-top: -1px; border-radius: 2px; background: var(--accent); }
+.rw3-seg.abandoned { background: var(--text-muted); opacity: .35; }
+.rw3-seg.active { opacity: .65; }
+.rw3-elbow { position: absolute; left: calc((var(--x) + 0.5) * var(--cell)); top: calc(50% + var(--lane) * var(--rowp)); width: var(--cell); height: 2px; margin-top: -1px; border-radius: 2px; background: var(--accent); }
+.rw3-elbow.abandoned { background: var(--text-muted); opacity: .3; }
+.rw3-elbow.active { opacity: .5; }
+/* the fork's vertical: at the parent's column, from the parent's lane to
+   the branch's lane (a sibling of the run, so the % basis is the grid) */
+.rw3-hinge { position: absolute; left: calc((var(--x) + 0.5) * var(--cell)); top: calc(50% + min(var(--lane), var(--lane-from)) * var(--rowp)); width: 2px; margin-left: -1px; height: calc((max(var(--lane), var(--lane-from)) - min(var(--lane), var(--lane-from))) * var(--rowp)); border-radius: 2px; background: var(--accent); }
+.rw3-hinge.abandoned { background: var(--text-muted); opacity: .3; }
+.rw3-hinge.active { opacity: .5; }
 
 /* ── v0.5.56 time-inject plugin ────────────────────────────────────
    The sidebar `time` panel: one switch row + a status line, inside

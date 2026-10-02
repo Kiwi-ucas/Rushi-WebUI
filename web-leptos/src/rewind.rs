@@ -19,12 +19,20 @@
 //! quick button is disabled and the tree stays viewable but not clickable
 //! ([`rewind_allowed`]).
 
+use std::cell::RefCell;
+
 use leptos::prelude::*;
 use leptos::task::spawn_local;
-use web_sys::MouseEvent;
+use wasm_bindgen::closure::Closure;
+use wasm_bindgen::JsCast;
+use web_sys::{HtmlElement, MouseEvent, PointerEvent};
 
 use crate::api;
-use crate::model::{AppState, Restore, RewindNode, RewindTarget, SessionInfo};
+use std::collections::HashMap;
+
+use crate::model::{
+    AppState, FlowNode, Restore, RewindNode, RewindTarget, SessionInfo,
+};
 use crate::timeutil;
 
 /// Whether a rewind targeting `session` is allowed right now. Never while
@@ -55,7 +63,180 @@ pub fn register_tree_effect(state: AppState) {
         spawn_local(async move {
             match api::load_rewind_tree(&s).await {
                 Ok(t) => tree.set(Some(t)),
-                Err(_) => tree.set(None),
+                // A failed fetch/parse used to vanish into the "loading…"
+                // placeholder; keep the reason reachable (it is how the
+                // v0.5.65 `missing`-less payload was found).
+                Err(e) => {
+                    web_sys::console::warn_1(&format!("rewind tree ({s}): {e}").into());
+                    tree.set(None);
+                }
+            }
+        });
+    });
+}
+
+// ── Style B (the "flow" view): which style, and what is selected ───
+//
+// D2: the list style (A) stays the default; the new one is opt-in from the
+// History top bar and the choice survives a reload. D5: opening it selects
+// the round the session is at, so the detail panel is never empty. The
+// selection is client-only and lives with the rest of the plugin state
+// (`AppState::rw_selected`); clicking a node in the scene only sets it —
+// the Rewind button in the detail panel is the only trigger there.
+
+/// The localStorage key holding the History style ("tree" | "flow").
+const VIEW_KEY: &str = "rushi-rw-view";
+
+/// The persisted style: `"flow"` or `"tree"` (the default, D2). Anything
+/// unknown falls back to the list style.
+pub fn read_view_mode() -> String {
+    let stored = web_sys::window()
+        .and_then(|w| w.local_storage().ok())
+        .flatten()
+        .and_then(|s| s.get_item(VIEW_KEY).ok())
+        .flatten();
+    match stored.as_deref() {
+        Some("flow") => "flow".to_string(),
+        _ => "tree".to_string(),
+    }
+}
+
+/// Switch style and remember it (a display-only preference: no server call).
+pub fn set_view_mode(state: AppState, mode: &str) {
+    state.rw_view.set(mode.to_string());
+    if let Some(s) = web_sys::window()
+        .and_then(|w| w.local_storage().ok())
+        .flatten()
+    {
+        let _ = s.set_item(VIEW_KEY, mode);
+    }
+}
+
+/// Select a round in the flow view: the detail panel follows, and **no
+/// rewind happens** (the user's rule for the new style).
+pub fn select_node(state: AppState, seq: u64) {
+    state.rw_selected.set(Some(seq));
+}
+
+thread_local! {
+    /// The one `resize` listener Style B installs. A resize is a layout
+    /// point (not a scroll frame), so the scene re-measures itself here.
+    static SCENE_RESIZE: RefCell<Option<Closure<dyn Fn()>>> = const { RefCell::new(None) };
+}
+
+/// B7's numbers, written once per **layout** so that a scroll frame writes
+/// exactly one value.
+///
+/// Each ribbon's `--turn` is a pure CSS `calc()` over three plane numbers —
+/// its own centre (`--bx`), the offset (`--rw-scroll`, the only thing a
+/// scroll frame touches) and half the viewport plus the falloff width
+/// (`--halfpw`, `--denom`). Numbers, never lengths: CSS cannot divide a
+/// length by a length, and this way the proxy costs one `setProperty` per
+/// scroll event and never reads layout while scrolling.
+fn sync_scene_metrics() {
+    let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    let Some(scroll) = doc
+        .query_selector("#rw-flow-scroll")
+        .ok()
+        .flatten()
+        .and_then(|e| e.dyn_into::<HtmlElement>().ok())
+    else {
+        return;
+    };
+    let half = scroll.client_width() as f64 / 2.0;
+    let st = scroll.style();
+    let _ = st.set_property("--halfpw", &format!("{half}"));
+    let _ = st.set_property("--denom", &format!("{}", half * 1.1));
+    let _ = st.set_property("--rw-scroll", &format!("{}", scroll.scroll_left()));
+    let Ok(ribbons) = doc.query_selector_all(".rw3-ribbon") else {
+        return;
+    };
+    for i in 0..ribbons.length() {
+        let Some(el) = ribbons
+            .item(i)
+            .and_then(|n| n.dyn_into::<HtmlElement>().ok())
+        else {
+            continue;
+        };
+        // `offsetParent` is the scene grid, which starts at the scroller's
+        // content origin — so this is content px, the same space as
+        // `scrollLeft`.
+        let cx = el.offset_left() as f64 + el.offset_width() as f64 / 2.0;
+        let _ = el.style().set_property("--bx", &format!("{cx}"));
+    }
+}
+
+/// Style B's two effects, registered once from `lib.rs` next to
+/// [`register_tree_effect`]:
+///
+/// 1. keep a valid selection — reset on a session switch, then default to
+///    the current round (D5); a round the user picked stays picked across
+///    tree reloads (a new round arriving must not steal the panel);
+/// 2. fetch the selected round in full (B2) whenever the selection changes
+///    — and only while the flow view is showing, so style A makes no
+///    useless request.
+pub fn register_flow_effects(state: AppState) {
+    let sess = state.active_session;
+    let tree = state.rewind_tree;
+    let view = state.rw_view;
+    let selected = state.rw_selected;
+    let detail = state.rw_detail;
+
+    // B7: a new scene (or a resized panel) re-measures the ribbons. The
+    // first pass runs after the render that produced them.
+    Effect::new(move || {
+        let _ = (view.get(), tree.get(), selected.get());
+        sync_scene_metrics();
+        gloo_timers::callback::Timeout::new(0, sync_scene_metrics).forget();
+    });
+    SCENE_RESIZE.with(|slot| {
+        if slot.borrow().is_some() {
+            return;
+        }
+        let cb = Closure::<dyn Fn()>::new(sync_scene_metrics);
+        if let Some(w) = web_sys::window() {
+            let _ = w.add_event_listener_with_callback("resize", cb.as_ref().unchecked_ref());
+        }
+        *slot.borrow_mut() = Some(cb);
+    });
+
+    let last_sess: StoredValue<Option<String>> = StoredValue::new(None);
+    Effect::new(move || {
+        let s = sess.get();
+        if last_sess.get_value() != s {
+            last_sess.set_value(s);
+            selected.set(None);
+            detail.set(None);
+        }
+        if view.get() != "flow" {
+            return;
+        }
+        let Some(t) = tree.get() else { return };
+        let known = selected
+            .get()
+            .is_some_and(|seq| t.flow.nodes.iter().any(|n| n.seq == seq));
+        if !known {
+            selected.set(t.current_seq);
+        }
+    });
+
+    Effect::new(move || {
+        if view.get() != "flow" {
+            return;
+        }
+        let (Some(seq), Some(s)) = (selected.get(), sess.get()) else {
+            detail.set(None);
+            return;
+        };
+        spawn_local(async move {
+            match api::load_rewind_detail(&s, seq).await {
+                Ok(d) => detail.set(Some(d)),
+                Err(e) => {
+                    web_sys::console::warn_1(&format!("rewind round {seq} ({s}): {e}").into());
+                    detail.set(None);
+                }
             }
         });
     });
@@ -119,6 +300,7 @@ pub fn history_view(state: AppState) -> AnyView {
                         }
                     }
                 ></span>
+                { hist_style_switch(state) }
                 <button
                     id="hist-theme"
                     title=move || match theme_mode.get().as_str() {
@@ -142,7 +324,12 @@ pub fn history_view(state: AppState) -> AnyView {
             </div>
             <div id="hist-body">
                 <div id="hist-rail">{ hist_rail(state) }</div>
-                <div id="hist-tree">{ hist_tree(state) }</div>
+                <Show
+                    when=move || state.rw_view.get() == "flow"
+                    fallback=move || view! { <div id="hist-tree">{ hist_tree(state) }</div> }
+                >
+                    { flow_view(state) }
+                </Show>
             </div>
             <div id="hist-foot">{ move || hist_hint(state) }</div>
         </div>
@@ -374,6 +561,529 @@ fn node_view(state: AppState, sess: String, node: RewindNode) -> AnyView {
                 { kids.into_iter().map(|k| node_view(state, sess.clone(), k)).collect_view() }
             </div>
         </div>
+    }
+    .into_any()
+}
+
+// ── Style B: the "flow" view (plan section 10, steps B4-B8) ───────
+//
+// The History view's second style. Style A (the recursive list) is
+// untouched and stays the default (D2); this one is opt-in from the top
+// bar and remembers the choice.
+//
+// The right-hand side splits 1 : 2 (D3): the **detail panel** on top (the
+// selected round in full + the Rewind button, the only place a rewind can
+// be triggered here) and the **scene** below — the longest chain drawn as
+// a straight horizontal `. - . - .` line with every other branch forking
+// into a lane above or below it (§10.2, computed server-side).
+//
+// Two rules from the user shape the interaction: clicking a node only
+// **selects** it (no dialog, no write — `select_node`), and the current
+// round is pre-selected so the panel is never empty (D5).
+
+/// The `[ list | flow ]` switch in the History top bar. Labelled for the
+/// user ("list" is the style they know), keyed for the code (`tree`).
+fn hist_style_switch(state: AppState) -> AnyView {
+    let view = state.rw_view;
+    let opt = move |mode: &'static str, label: &'static str, hint: &'static str| {
+        let on = {
+            let view = view;
+            move || view.get() == mode
+        };
+        view! {
+            <button
+                class="hs-opt"
+                class:on=on
+                data-view=mode
+                title=hint
+                on:click=move |_| set_view_mode(state, mode)
+            >
+                { label }
+            </button>
+        }
+    };
+    view! {
+        <div id="hist-style" role="group" title="history style">
+            { opt("tree", "list", "the round list \u{2014} click a round to rewind") }
+            { opt("flow", "flow", "the flow graph \u{2014} click a round to inspect it") }
+        </div>
+    }
+    .into_any()
+}
+
+/// Style B's right-hand side: the 1:2 split (detail over scene).
+fn flow_view(state: AppState) -> AnyView {
+    view! {
+        <div id="rw-split">
+            <div id="rw-detail">{ flow_detail(state) }</div>
+            <div id="rw-flow">{ flow_scene(state) }</div>
+        </div>
+    }
+    .into_any()
+}
+
+/// The detail panel: the selected round in full (B2's route), its
+/// annotations, and the Rewind button (B8 — the only trigger in this
+/// style, and disabled under the same guard as everywhere else).
+fn flow_detail(state: AppState) -> AnyView {
+    let selected = state.rw_selected;
+    let detail = state.rw_detail;
+    let tree = state.rewind_tree;
+
+    view! {
+        <Show
+            when=move || selected.get().is_some()
+            fallback=move || view! {
+                <div class="rw-empty">{ "click a round below to inspect it" }</div>
+            }
+        >
+            { move || {
+                let Some(seq) = selected.get() else { return ().into_any() };
+                // The panel's facts come from B2's per-round route; the flow
+                // node is the fallback (and the only carrier of `restore`)
+                // while the fetch is in flight.
+                let d = detail.get().filter(|d| d.seq == seq);
+                let node = tree
+                    .get()
+                    .and_then(|t| t.flow.nodes.iter().find(|n| n.seq == seq).cloned());
+                let round = d
+                    .as_ref()
+                    .map(|d| d.round)
+                    .or_else(|| node.as_ref().map(|n| n.round))
+                    .unwrap_or_default();
+                let events = d
+                    .as_ref()
+                    .map(|d| d.events)
+                    .or_else(|| node.as_ref().map(|n| n.events))
+                    .unwrap_or_default();
+                let ts = d
+                    .as_ref()
+                    .map(|d| d.ts.clone())
+                    .or_else(|| node.as_ref().map(|n| n.ts.clone()))
+                    .unwrap_or_default();
+                let abandoned = d
+                    .as_ref()
+                    .map(|d| d.state != "active")
+                    .or_else(|| node.as_ref().map(|n| n.state != "active"))
+                    .unwrap_or(false);
+                let current = d
+                    .as_ref()
+                    .map(|d| d.current)
+                    .or_else(|| node.as_ref().map(|n| n.current))
+                    .unwrap_or(false);
+                let retracted = d
+                    .as_ref()
+                    .map(|d| d.retracted)
+                    .or_else(|| node.as_ref().map(|n| n.retracted))
+                    .unwrap_or(false);
+                let blocked = node.as_ref().is_some_and(|n| n.restore.blocked());
+                let restore = node.as_ref().map(|n| n.restore.label()).unwrap_or_default();
+                let text = d
+                    .as_ref()
+                    .map(|d| d.text.clone())
+                    .or_else(|| node.as_ref().map(|n| n.summary.clone()))
+                    .unwrap_or_default();
+                let pending = d.is_none();
+                let allowed = tree
+                    .get()
+                    .map(|t| rewind_allowed(state, &t.session))
+                    .unwrap_or(false);
+                let label = format!("round {round} \u{00b7} {}", summarize_label(&text));
+                // the closure below owns one copy; the panel shows the other
+                let restore_t = restore.clone();
+
+                let badge = |cls: &'static str, text: &'static str| {
+                    view! { <span class=cls>{ text }</span> }
+                };
+                let mut badges: Vec<AnyView> = Vec::new();
+                if current {
+                    badges.push(badge("rw3-badge here", "here").into_any());
+                }
+                if abandoned {
+                    badges.push(badge("rw3-badge off", "abandoned").into_any());
+                }
+                if retracted {
+                    badges.push(badge("rw3-badge retract", "retracted").into_any());
+                }
+                if blocked {
+                    badges.push(badge("rw3-badge warn", "not resumable").into_any());
+                }
+
+                view! {
+                    <div class="fd-head" data-pending=pending.to_string()>
+                        <span class="fd-round">{ format!("round {round}") }</span>
+                        <span class="fd-meta">
+                            { format!(
+                                "line {seq} \u{00b7} {} \u{00b7} {events} event{}",
+                                timeutil::ts_full(&ts),
+                                if events == 1 { "" } else { "s" },
+                            ) }
+                        </span>
+                        <Show when=move || pending>
+                            <span class="rw3-badge load">{ "loading\u{2026}" }</span>
+                        </Show>
+                        { badges }
+                    </div>
+                    <div class="fd-text">{ text }</div>
+                    <div class="fd-foot">
+                        <button
+                            class="fd-rewind"
+                            data-seq=seq.to_string()
+                            disabled=move || !allowed || current || blocked
+                            title=move || {
+                                if !allowed {
+                                    "rewind is disabled while the loop is running".to_string()
+                                } else if current {
+                                    "the session is already here".to_string()
+                                } else if blocked {
+                                    format!(
+                                        "this point cannot be resumed: it would strand a tool call ({restore_t})"
+                                    )
+                                } else {
+                                    format!("rewind to round {round} \u{00b7} {restore_t}")
+                                }
+                            }
+                            on:click=move |_| {
+                                if allowed && !current && !blocked {
+                                    request_rewind(state, seq, label.clone());
+                                }
+                            }
+                        >
+                            { if current { "you are here" } else { "\u{21ba} Rewind to this point" } }
+                        </button>
+                        <span class="fd-restore">{ restore }</span>
+                    </div>
+                }
+                .into_any()
+            } }
+        </Show>
+    }
+    .into_any()
+}
+
+/// The single value a scroll frame writes (B7): the offset the ribbons'
+/// `--turn` calc reads. Never `scrollLeft` itself, so nothing reads layout
+/// while scrolling, and `--halfpw`/`--denom`/`--bx` stay from the layout.
+fn mark_scroll(el: &HtmlElement) {
+    let _ = el
+        .style()
+        .set_property("--rw-scroll", &format!("{}", el.scroll_left()));
+}
+
+/// Short label for the dialog's title line ("round 3 \u{00b7} first chars\u{2026}").
+fn summarize_label(text: &str) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= 60 {
+        flat
+    } else {
+        let s: String = flat.chars().take(60).collect();
+        format!("{s}\u{2026}")
+    }
+}
+
+/// The scene: the straight main line, the branches forking off it, one
+/// clickable dot per round. The player: the server's logical `(x, lane)`
+/// paid for in px here, with the column pitch left to CSS (it auto-fits
+/// the panel down to a floor, D4).
+fn flow_scene(state: AppState) -> AnyView {
+    let tree = state.rewind_tree;
+    view! {
+        { move || {
+            let Some(t) = tree.get() else {
+                return view! { <div class="rw-empty">{ "loading\u{2026}" } </div> }.into_any();
+            };
+            if t.flow.nodes.is_empty() {
+                return view! {
+                    <div class="rw-empty">
+                        { "no rounds yet \u{2014} send a message to start the history." }
+                    </div>
+                }
+                .into_any();
+            }
+            let f = t.flow.clone();
+            let cells = f.cols.max(1).to_string();
+            let lanes = f.lanes.max(1).to_string();
+            // Where each node sits, and whether it is on the live path: the
+            // connectors are drawn from the parent's dot, and an edge is lit
+            // by the child's state (D1 — the *path* is highlighted, so the
+            // live context reads even when the current round is on a fork).
+            let at: HashMap<u64, (u64, i32, bool)> = f
+                .nodes
+                .iter()
+                .map(|n| (n.seq, (n.x, n.lane, n.state == "active")))
+                .collect();
+
+            let edges: Vec<AnyView> = f
+                .edges
+                .iter()
+                .map(|e| {
+                    let (fx, flane, _) = at.get(&e.from).copied().unwrap_or((0, 0, true));
+                    let lit = at.get(&e.to).map(|t| t.2).unwrap_or(true);
+                    let from = e.from.to_string();
+                    let to = e.to.to_string();
+                    if e.main {
+                        // the `. - .` run between two rounds on the line
+                        view! {
+                            <div
+                                class=format!(
+                                    "rw3-seg main {}",
+                                    if lit { "active" } else { "abandoned" },
+                                )
+                                data-from=from
+                                data-to=to
+                                style=format!("--x:{fx}; --lane:0")
+                            ></div>
+                        }
+                        .into_any()
+                    } else {
+                        // the fork: the run at the child's lane, plus the
+                        // hinge back to the parent's lane. A fork nested
+                        // *inside* a branch shares its lane — there is no
+                        // gap to bridge, so it gets no hinge at all.
+                        let st = format!(
+                            "--x:{fx}; --lane:{}; --lane-from:{flane}",
+                            e.lane,
+                        );
+                        let elbow = view! {
+                            <div
+                                class=format!(
+                                    "rw3-elbow {}",
+                                    if lit { "active" } else { "abandoned" },
+                                )
+                                data-from=from.clone()
+                                data-to=to.clone()
+                                style=st.clone()
+                            ></div>
+                        }
+                        .into_any();
+                        if e.lane == flane {
+                            elbow
+                        } else {
+                            view! {
+                                { elbow }
+                                <div
+                                    class=format!(
+                                        "rw3-hinge {}",
+                                        if lit { "active" } else { "abandoned" },
+                                    )
+                                    data-from=from
+                                    data-to=to
+                                    style=st
+                                ></div>
+                            }
+                            .into_any()
+                        }
+                    }
+                })
+                .collect();
+
+            // B7: one ribbon per forking branch (branch 0 of the server's
+            // list *is* the main line, which the segments already draw). A
+            // ribbon hinges at its fork column and turns as the line moves
+            // under the light; the dots above it never turn, so a label is
+            // always readable.
+            let ribbons: Vec<AnyView> = f
+                .branches
+                .iter()
+                .filter(|b| b.lane != 0)
+                .map(|b| {
+                    view! {
+                        <div
+                            class=format!(
+                                "rw3-ribbon {} {}",
+                                if b.lane < 0 { "up" } else { "down" },
+                                // a branch is drawn dim when its round is
+                                // off the live path (D1)
+                                if at.get(&b.root).map(|t| t.2).unwrap_or(true) {
+                                    "active"
+                                } else {
+                                    "abandoned"
+                                },
+                            )
+                            data-root=b.root.to_string()
+                            data-lane=b.lane.to_string()
+                            style=format!(
+                                "--from:{}; --to:{}; --lane:{}",
+                                b.from_x,
+                                b.to_x,
+                                b.lane,
+                            )
+                        ></div>
+                    }
+                    .into_any()
+                })
+                .collect();
+
+            let nodes: Vec<AnyView> = f
+                .nodes
+                .iter()
+                .map(|n| flow_node_button(state, n.clone()))
+                .collect();
+
+            // Drag the empty space to pan (D4/D7): the wheel drives the same
+            // scroll offset natively (an x-only scroller takes the vertical
+            // delta), the dots are excluded so a click is never eaten.
+            let drag = StoredValue::new((false, 0.0, 0.0));
+            let el_of = |ev: &PointerEvent| -> Option<HtmlElement> {
+                ev.current_target()?.dyn_into::<HtmlElement>().ok()
+            };
+            let on_down = move |ev: PointerEvent| {
+                let Some(el) = el_of(&ev) else { return };
+                // a drag starts after some layout, possibly: re-measure
+                sync_scene_metrics();
+                let on_node = ev
+                    .target()
+                    .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+                    .and_then(|t| t.closest(".rw3-node").ok().flatten())
+                    .is_some();
+                if on_node {
+                    return;
+                }
+                drag.set_value((true, ev.client_x() as f64, el.scroll_left() as f64));
+                let _ = el.set_pointer_capture(ev.pointer_id());
+                let _ = el.class_list().add_1("dragging");
+            };
+            let on_move = move |ev: PointerEvent| {
+                let (down, x0, sl) = drag.get_value();
+                if !down {
+                    return;
+                }
+                let Some(el) = el_of(&ev) else { return };
+                let dx = ev.client_x() as f64 - x0;
+                el.set_scroll_left((sl - dx) as i32);
+                mark_scroll(&el);
+            };
+            let on_up = move |ev: PointerEvent| {
+                if let Some(el) = el_of(&ev) {
+                    let _ = el.release_pointer_capture(ev.pointer_id());
+                    let _ = el.class_list().remove_1("dragging");
+                }
+                drag.set_value((false, 0.0, 0.0));
+            };
+            // Any scroll (this is also the fallback for a scrollbar drag we
+            // never see, a keyboard scroll, or a programmatic `scrollLeft`
+            // — the probe's H7 found the stale-var case) refreshes the same
+            // single value.
+            let on_scroll = move |ev: web_sys::Event| {
+                if let Some(el) = ev.current_target().and_then(|t| t.dyn_into::<HtmlElement>().ok())
+                {
+                    mark_scroll(&el);
+                }
+            };
+            // D7: the plain wheel drives the line too. A horizontal delta
+            // (or shift+wheel) is already this element's own scroll, so only
+            // the vertical delta is taken over — the plan's "scroll proxy",
+            // measured in pixels/lines/pages like the browser does.
+            let on_wheel = move |ev: web_sys::WheelEvent| {
+                let Some(el) = ev.current_target().and_then(|t| t.dyn_into::<HtmlElement>().ok())
+                else {
+                    return;
+                };
+                let dy = ev.delta_y()
+                    * match ev.delta_mode() {
+                        1 => 16.0,
+                        2 => el.client_height() as f64,
+                        _ => 1.0,
+                    };
+                if dy.abs() < 0.5 {
+                    return;
+                }
+                ev.prevent_default();
+                el.set_scroll_left(el.scroll_left() + dy as i32);
+                mark_scroll(&el);
+            };
+
+            view! {
+                <div
+                    id="rw-flow-scroll"
+                    on:pointerdown=on_down
+                    on:pointermove=on_move
+                    on:pointerup=on_up
+                    on:pointercancel=on_up
+                    on:wheel=on_wheel
+                    on:scroll=on_scroll
+                >
+                    <div
+                        id="rw-flow-track"
+                        style=format!("--cols:{cells}; --lanes:{lanes}")
+                    >
+                        <div class="rw3-grid">
+                            { edges }
+                            { ribbons }
+                            { nodes }
+                        </div>
+                        <div class="rw3-sheen"></div>
+                    </div>
+                </div>
+            }
+            .into_any()
+        } }
+    }
+    .into_any()
+}
+
+/// One round: a dot on the line (or on its branch). A click only **selects**
+/// it — the Rewind button in the panel is the only trigger in this style.
+fn flow_node_button(state: AppState, n: FlowNode) -> AnyView {
+    let seq = n.seq;
+    let FlowNode {
+        x,
+        lane,
+        main,
+        round,
+        current,
+        retracted,
+        summary,
+        ..
+    } = n;
+    let abandoned = n.state != "active";
+    let blocked = n.restore.blocked();
+    let selected = state.rw_selected;
+    let title = format!(
+        "round {round} \u{00b7} {summary}{}",
+        if current {
+            " \u{2014} you are here"
+        } else if abandoned {
+            " \u{2014} abandoned"
+        } else {
+            ""
+        }
+    );
+    let cls = move || {
+        let mut c = String::from("rw3-node");
+        c.push_str(if main { " main" } else { " off" });
+        if abandoned {
+            c.push_str(" abandoned");
+        }
+        if current {
+            c.push_str(" current");
+        }
+        if retracted {
+            c.push_str(" retracted");
+        }
+        if blocked {
+            c.push_str(" blocked");
+        }
+        if selected.get() == Some(seq) {
+            c.push_str(" selected");
+        }
+        c
+    };
+    view! {
+        <button
+            class=cls
+            data-seq=seq.to_string()
+            data-x=x.to_string()
+            data-lane=lane.to_string()
+            data-main=main.to_string()
+            data-current=current.to_string()
+            title=title
+            style=format!("--x:{x}; --lane:{lane}")
+            on:click=move |_| select_node(state, seq)
+        >
+            <span class="rw3-dot"></span>
+            <span class="rw3-round">{ round.to_string() }</span>
+        </button>
     }
     .into_any()
 }
