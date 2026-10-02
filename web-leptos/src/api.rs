@@ -20,6 +20,25 @@ pub async fn load_sessions() -> Result<Vec<crate::model::SessionInfo>, String> {
     serde_json::from_str(&text).map_err(|e| e.to_string())
 }
 
+/// Parse a response that may nest deeper than serde_json's default
+/// 128-level recursion limit.
+///
+/// The History tree carries one `children` array per round, so a session
+/// with a chain of ~64 rounds already reaches ~128 JSON levels (two levels
+/// per round: the array and the node). Before v0.5.65 the whole response
+/// was rejected in that case — every such session's History view sat on
+/// "loading…" forever, with the reason swallowed by `Err(_)` (the fix is
+/// paired with the console warning in `rewind::register_tree_effect`).
+/// Only this parse lifts the limit; the flat `flow` projection (B1) is
+/// what keeps Style B's own rendering non-recursive.
+fn parse_deep<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, String> {
+    let mut de = serde_json::Deserializer::from_str(text);
+    de.disable_recursion_limit();
+    let v = serde::Deserialize::deserialize(&mut de).map_err(|e| e.to_string())?;
+    de.end().map_err(|e| e.to_string())?;
+    Ok(v)
+}
+
 /// Create a session, optionally with a chosen working directory, model
 /// entry and reasoning effort (v0.5.45: the new-session form picks the
 /// model, so the model panel no longer has to expose a global default).
@@ -352,7 +371,26 @@ pub async fn load_rewind_tree(id: &str) -> Result<crate::model::RewindTree, Stri
         .await
         .map_err(|e| e.to_string())?;
     let text = res.text().await.map_err(|e| e.to_string())?;
-    serde_json::from_str(&text).map_err(|e| e.to_string())
+    parse_deep(&text)
+}
+
+/// Style B (B2): one round in full — the **verbatim** user message, for the
+/// flow view's detail panel (the tree response carries a 60-char preview
+/// only, D8). A line that is not a round's `user_message` is a 404.
+pub async fn load_rewind_detail(
+    id: &str,
+    seq: u64,
+) -> Result<crate::model::RewindDetail, String> {
+    let res = Request::get(&format!("/api/sessions/{id}/rewind/node/{seq}"))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let status = res.status();
+    let text = res.text().await.map_err(|e| e.to_string())?;
+    if status >= 400 {
+        return Err(format!("no round starts at line {seq}"));
+    }
+    parse_deep(&text)
 }
 
 /// Rewind plugin: write a `rewind` marker. `mode:"on"` keeps the target user
