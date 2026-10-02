@@ -335,3 +335,129 @@ Extra (beyond the plan text, decided during implementation):
   static summary only.
 - `#history-view`'s tree scroller is `#hist-tree` (plan §3 naming) and is
   registered in all five capsule-scrollbar rule lists (plugin rule 4).
+
+---
+
+## 10. Style B — the 3D "flow" tree (plan, in progress)
+
+**Request (user, 2026-10-03, Chinese):** keep the expanded view's current form
+and **add a second style** to it. In the new style:
+
+* the session's **main line is a horizontal `. - . - . - .` chain of nodes**;
+  a rewind **forks** off it (up or down). Ideally the branches turn in 3D as
+  the wheel scrolls ("旋流光" — a rotating light sweep), with the **longest
+  chain as the straight main line**;
+* the **node the session is currently at is highlighted**;
+* **no per-node text** in the graph (unlike Style A);
+* the right-hand main area splits **top / bottom ≈ 1 : 2** — **bottom** = the
+  clickable graph, **top** = the details of the clicked node (the user's
+  message for that round, …) **and the Rewind button**;
+* **clicking a graph node only selects it** — it must not rewind. Rewind is
+  triggered from the top panel only.
+
+Style A (the recursive round list, §9) stays byte-for-byte; this is an
+additional view, switched from the History top bar.
+
+### 10.1 Research findings that shape the design
+
+1. **The client crate cannot be unit-tested.** `cargo test -p rushi-web-ui`
+   fails to build for the host (233 errors — every `web_sys`/`wasm-bindgen`
+   use is `cfg(target_arch = "wasm32")`; only `markdown.rs`'s 7 tests ever
+   compiled). So any **logic** worth testing (which chain is the main line,
+   each node's lane/side, the edge list) must live in the **server
+   projection**, where `cargo test -p rushi-web` covers it in 0.3 s. This
+   matches the existing rule that the tree is computed server-side.
+2. **`animation-timeline: scroll()` is not safe to depend on.** Chrome/Edge
+   115+ and (per published notes) Firefox 133+ have it, but Safari's status
+   is contested in the sources (WebKit's own tracking issue is still open for
+   stable shipping). We drive the scene from a **scroll proxy + one CSS
+   custom property** (`--rw-t`, written by a single `on:scroll` handler):
+   universally supported, no per-frame JS work beyond one var write, and it
+   keeps native wheel/trackpad momentum. `animation-timeline: scroll()` stays
+   an optional `@supports` fast path later.
+3. **`preserve-3d` pitfalls (must be designed around, not discovered).** An
+   ancestor with `overflow` ≠ `visible`, `filter`, `opacity` < 1,
+   `clip-path`, `mask` or `contain: paint` **flattens** its subtree — the 3D
+   goes away silently. Therefore: the scroller (`#rw-flow-scroll`,
+   `overflow-y: auto`) may **not** be the perspective element; the
+   `perspective` element is a `position: sticky` viewport *inside* it, and
+   clipping is done by the outer panel. Node labels **counter-rotate**
+   (`rotateX(-t)`) so text stays upright/readable while the line turns.
+4. **Design language constraints** (`docs/relief-shadow-pipeline.md`): relief
+   is **directional** — no omni-directional halos. So the "light" is a
+   *directional* gradient sweep along the line, not a glow blob; the current
+   node is marked with the existing accent ring + `--shadow`, not a halo.
+   `prefers-reduced-motion: reduce` must yield a static, flat, readable view
+   (the repo honours it in 9 places).
+5. Long sessions: the main line's logical width is `rounds × STEP`, which can
+   be tens of thousands of px. v1 **auto-fits** the scene to the panel width
+   with a **minimum scale floor** and **drag-to-pan**, so `--rw-t` (wheel) is
+   never fighting a horizontal scrollbar.
+
+### 10.2 Layout algorithm (server, pure + tested)
+
+* **Main line** = the longest root→leaf chain over the *whole* tree (count of
+  nodes); ties break to the chain containing the current node, then to the
+  leftmost. The user asked for exactly this ("the longest chain is the
+  straight main line"), and it keeps the picture stable across a rewind: the
+  abandoned branch often *is* the longest, and the fresh short branch forks
+  off it.
+* Every node gets `x` = its distance along its own chain (0,1,2,…) and
+  `lane` = 0 on the main line. Off-main children are assigned alternating
+  lanes by their index among *that fork's* off-main siblings: 1st → `-1`,
+  2nd → `+1`, 3rd → `-2`, 4th → `+2`, … (`-` = up, `+` = down). A lane is
+  never shared by two chains that would overlap on the same `x` (checked in a
+  test); the client multiplies `(x, lane)` by its own pixel constants, so the
+  server owns *logical* geometry only.
+* Uniform `STEP` along x is possible because **nodes carry no text** — a node
+  is a dot; its label lives in the top panel. (This is what makes the "rotating
+  `. - . - .`" picture tractable at all.)
+* The projection adds `flow: { nodes[{seq,round,x,lane,main,side,state,
+  current,retracted,events,ts,summary}], edges[{from,to}], cols, lanes,
+  main_len }` to the **existing** `GET /api/sessions/{id}/rewind` response —
+  one fetch, one cache, one invalidation path (the WS-driven refetch already
+  exists). Style A ignores the extra key.
+
+### 10.3 Step plan
+
+| step | what | files | proof |
+|---|---|---|---|
+| **B1** | flow layout projection: `main_chain`, `layout` (x/lane/side), `edges`, `Flow` types | `bin/rushi-web/src/rewind.rs` | unit tests: longest chain wins; tie→current; alternating lanes; no lane collision; single node; empty; a rewind fork puts the abandoned branch off-line; `cols/lanes/main_len` |
+| **B2** | node detail route `GET /api/sessions/{id}/rewind/node/{seq}` → `{seq,round,ts,text,events,state,current,retracted}` (the full `user_message` content, not the 60-char summary) | same | unit tests: exact text, unknown seq → 404, retracted flag; route registered next to the tree route |
+| **B3** | client data: `RewindFlow`/`FlowNode`/`FlowEdge`/`RewindDetail` types, `api::load_rewind_detail`, state `rw_view` (localStorage `rushi-rw-view`, plugin-owned), `rw_selected`, `rw_detail`; clear `rw_selected` on session change | `web-leptos/src/model.rs`, `api.rs`, `rewind.rs` | `cargo check` (wasm) clean; `trunk build` |
+| **B4** | the style switch in `#hist-top` (`[ tree \| flow ]`, persisted) + `hist_tree` dispatches to Style A (unchanged) or `flow_view` | `web-leptos/src/rewind.rs` | probe: switch persists across reload; Style A's existing 110 checks still pass |
+| **B5** | the 1:2 split: `#rw-split` → `#rw-detail` (top, flex 1) + `#rw-flow` (bottom, flex 2); detail panel = round/time/events/state header + the user's message (pre-wrap, own scroller) + `⟲ Rewind` button + empty state | `rewind.rs`, `style.css` | probe: panel appears; selecting a node fills it; button disabled states |
+| **B6** | the scene: SVG connector plane (`. - . - .` line + forked edges + dots) with one absolutely-positioned node button per round (`data-x/y/lane/main/seq`), current-node highlight, selected-node ring, `title` tooltip; auto-fit scale (floor) + drag pan | `rewind.rs`, `style.css` | probe: geometry assertions (main-line nodes share y; a fork's node has Δy≠0), click selects and **opens no dialog** |
+| **B7** | the 3D + light sweep: `#rw-flow-scroll` (tall spacer) → sticky `#rw-flow-view` (`perspective`) → `.rw3-scene` (`preserve-3d`, `rotateX(var(--rw-t))`), counter-rotated labels, directional sheen travelling along the main line with `--rw-t`; `prefers-reduced-motion` → flat/static | `rewind.rs`, `style.css` | probe: wheel changes `--rw-t`; rotation is monotonic; reduced-motion path renders; no flattening (computed `transform-style` is `preserve-3d`) |
+| **B8** | Rewind-from-the-panel: the top button calls the existing `request_rewind` → the same confirm dialog (§9.3 copy; the dialog is the one confirm point) | `rewind.rs` | probe: button → dialog → (fixture) post; guard while the loop runs |
+| **B9** | docs + mirror: `docs/rewind-plugin.md` (the second style), this record, `rushi-rewind` sync + `install/TOUCHPOINTS.md` §3.9 + probe re-run from both homes | docs, `rushi-rewind/` | `cargo test -p rushi-web`, `trunk build`, probe from both homes |
+
+Verification per step, as always: `cargo test -p rushi-web` (server),
+wasm `cargo check` + `trunk build` (client), `e2e/rewind_probe.py` (CDP),
+`e2e/layout_probe.py` on :8480 for the shell.
+
+### 10.4 Decisions to align (recommended default in bold)
+
+* **D1 main line**: longest chain over the whole tree, ties → the chain that
+  holds the current node (then leftmost). **Confirm**, because an abandoned
+  branch can be the straight line and the current node then sits on a fork.
+* **D2 default style**: **`tree` (today's view)** — the new style is opt-in
+  via the switch; or make `flow` the default once it settles.
+* **D3 scope of the 1:2 split**: **Style B only**. Style A keeps its current
+  full-height list (ask whether Style A should later gain the same panel).
+* **D4 long sessions**: **auto-fit with a scale floor + drag-to-pan**; a
+  zoom slider / mini-map is v2.
+* **D5 initial selection**: **the current node** is pre-selected when the
+  flow view opens, so the top panel is never empty ("you are here" + its
+  message, and the Rewind button correctly disabled there).
+* **D6 node hover info**: dots only, with a **native `title` tooltip**
+  (round · summary) — no text in the graph; the panel is the text surface.
+* **D7 wheel semantics**: wheel = rotate (via the scroll proxy); horizontal
+  panning is drag (and shift+wheel), never a horizontal scrollbar.
+
+### 10.5 Non-goals (v1)
+
+No tree editing, no in-graph search/jump box, no manual zoom UI, no touch/
+pinch gestures (the webui is a desktop surface), no change to the kernel or
+to Style A's markup, and no new server-side truth: the flow layout is a
+*projection* of the same tree the kernel's `active_ranges` already proves.
