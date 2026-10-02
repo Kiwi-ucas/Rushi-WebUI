@@ -24,7 +24,7 @@
 //! `active_ranges(total, rewinds)` keeps (asserted in the tests below against
 //! a ported reference implementation, over the kernel's own fixtures).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -95,6 +95,80 @@ pub struct RewindTree {
     /// The ignored marker whose seq is the log's last rewind marker:
     /// the "your last rewind did not take effect" notice (D-C).
     pub tail_ignored: Option<IgnoredMarker>,
+    /// Style B's geometry (section 10) — a projection of the same tree;
+    /// style A ignores it.
+    pub flow: Flow,
+}
+
+/// The geometric projection behind the History view's **second style**
+/// ("flow": `docs/rewind-plugin-plan.md` section 10).
+///
+/// The conversation's **longest chain is the straight main line** (`lane`
+/// 0, one column per round — the horizontal `. - . - .` picture). Every
+/// other chain segment forks off that line into a lane above (`-1`, `-2`,
+/// …) or below (`+1`, `+2`, …) of the column it forked at, and keeps it.
+///
+/// Logical units only — no pixels: the client multiplies `x` and `lane`
+/// by its own constants. The geometry lives here, and not in the client,
+/// because the WASM crate cannot be unit-tested (section 10.1.1).
+#[derive(Debug, Clone, Serialize)]
+pub struct Flow {
+    pub nodes: Vec<FlowNode>,
+    pub edges: Vec<FlowEdge>,
+    /// One entry per chain segment, the main line included (`lane` 0), so
+    /// the client can draw — and turn — one ribbon per segment.
+    pub branches: Vec<FlowBranch>,
+    /// The grid's width in columns (`max x + 1`).
+    pub cols: u64,
+    /// The grid's half-height (`max |lane|`); `0` for a straight line.
+    pub lanes: i32,
+    /// The main line's length in nodes.
+    pub main_len: u64,
+}
+
+/// One node's place in the flow picture, with everything the detail panel
+/// shows for it (the same values the recursive [`RewindNode`] carries).
+#[derive(Debug, Clone, Serialize)]
+pub struct FlowNode {
+    pub seq: u64,
+    pub round: u64,
+    /// The column: one step per round down the tree.
+    pub x: u64,
+    /// `0` on the main line, `-1`/`+1`/`-2`/`+2`… forking up/down.
+    pub lane: i32,
+    /// Sits on the longest chain, i.e. the straight line.
+    pub main: bool,
+    pub state: String,
+    pub current: bool,
+    pub retracted: bool,
+    pub events: u64,
+    pub ts: String,
+    pub summary: String,
+    pub restore: Restore,
+}
+
+/// One parent→child connector. `lane`/`main` describe the child, which is
+/// what the client needs to draw a straight `. - .` link or a fork's elbow.
+#[derive(Debug, Clone, Serialize)]
+pub struct FlowEdge {
+    pub from: u64,
+    pub to: u64,
+    pub lane: i32,
+    pub main: bool,
+}
+
+/// A chain segment: the nodes that share one lane from `from_x` to `to_x`
+/// inclusive (the columns it occupies, so no two segments of a lane ever
+/// overlap — a test asserts it).
+#[derive(Debug, Clone, Serialize)]
+pub struct FlowBranch {
+    /// The seq of the segment's first node.
+    pub root: u64,
+    pub lane: i32,
+    /// The lane of the segment it forked off (`0` for the main line).
+    pub parent_lane: i32,
+    pub from_x: u64,
+    pub to_x: u64,
 }
 
 struct Round {
@@ -275,6 +349,7 @@ pub fn build(session: &str, events: &[Value]) -> RewindTree {
         settled: last_structural == Some("rewind") && tail_ignored.is_none(),
         ignored,
         tail_ignored,
+        flow: flow(&rounds, &active, cursor, &restores),
     }
 }
 
@@ -306,6 +381,255 @@ fn build_node(
             .iter()
             .map(|&c| build_node(c, rounds, active, current, restores))
             .collect(),
+    }
+}
+
+// ── the flow projection (Style B) ─────────────────────────────────
+
+/// Build the flow picture: the main line, the lanes, the connectors.
+/// Pure — every rule is covered by the tests at the end of this module.
+fn flow(
+    rounds: &[Round],
+    active: &[usize],
+    current: Option<usize>,
+    restores: &[Restore],
+) -> Flow {
+    let n = rounds.len();
+    if n == 0 {
+        return Flow {
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            branches: Vec::new(),
+            cols: 0,
+            lanes: 0,
+            main_len: 0,
+        };
+    }
+    let active_set: HashSet<usize> = active.iter().copied().collect();
+
+    // 1. `height[i]` = the node count of the longest chain starting at `i`
+    //    (a child always has a higher index: a round is created after its
+    //    parent, so one reverse pass suffices).
+    let mut height = vec![1u64; n];
+    let mut holds_current = vec![false; n];
+    for i in (0..n).rev() {
+        height[i] = 1 + rounds[i]
+            .children
+            .iter()
+            .map(|&c| height[c])
+            .max()
+            .unwrap_or(0);
+        holds_current[i] =
+            current == Some(i) || rounds[i].children.iter().any(|&c| holds_current[c]);
+    }
+
+    // 2. The main line: the longest root-to-leaf chain over the whole
+    //    tree; ties go to the chain holding the current round, then to the
+    //    leftmost one (section 10.2 — the user asked for exactly this).
+    //    Note the consequence: an abandoned branch can *be* the straight
+    //    line, and the current round then sits on a fork.
+    let roots: Vec<usize> = (0..n).filter(|&i| rounds[i].parent.is_none()).collect();
+    let rank = |i: usize| (height[i], holds_current[i], std::cmp::Reverse(i));
+    let mut main_set = vec![false; n];
+    let mut main_chain: Vec<usize> = Vec::new();
+    if let Some(mut cur) = roots.iter().copied().max_by_key(|&i| rank(i)) {
+        loop {
+            main_set[cur] = true;
+            main_chain.push(cur);
+            match rounds[cur]
+                .children
+                .iter()
+                .copied()
+                .max_by_key(|&c| rank(c))
+            {
+                Some(c) => cur = c,
+                None => break,
+            }
+        }
+    }
+
+    // 3. `x`: one column per step down, so a chain advances one column per
+    //    round and a fork runs parallel to the line it left. A second root
+    //    (a rewind that reached before the first round) is laid out after
+    //    the previous tree.
+    let mut x = vec![0u64; n];
+    let mut base = 0u64;
+    for &r in &roots {
+        base = layout_x(rounds, r, base, &mut x) + 1;
+    }
+
+    // 4. `lane`: 0 on the main line; a segment that forks off takes the
+    //    first free lane of the alternating sequence, biased away from the
+    //    line, and every node of that segment keeps it.
+    let primary = primary_children(rounds, &main_set, &height, &holds_current);
+    let mut extent = vec![0u64; n];
+    for i in (0..n).rev() {
+        extent[i] = match primary[i] {
+            Some(c) => x[i].max(extent[c]),
+            None => x[i],
+        };
+    }
+    let mut lane = vec![0i32; n];
+    let mut taken: HashMap<i32, Vec<(u64, u64)>> = HashMap::new();
+    let mut branches: Vec<FlowBranch> = Vec::new();
+    for &r in &roots {
+        let (from_x, to_x) = (x[r], extent[r]);
+        taken.entry(0).or_default().push((from_x, to_x));
+        branches.push(FlowBranch {
+            root: rounds[r].seq,
+            lane: 0,
+            parent_lane: 0,
+            from_x,
+            to_x,
+        });
+        place(rounds, &x, &extent, &primary, &mut lane, &mut taken, &mut branches, r, 0, 0);
+    }
+
+    // 5. The flat list (round order = log order) and the connectors.
+    let mut nodes = Vec::with_capacity(n);
+    let mut edges = Vec::new();
+    for i in 0..n {
+        nodes.push(FlowNode {
+            seq: rounds[i].seq,
+            round: (i + 1) as u64,
+            x: x[i],
+            lane: lane[i],
+            main: main_set[i],
+            state: if active_set.contains(&i) {
+                "active"
+            } else {
+                "abandoned"
+            }
+            .to_string(),
+            current: current == Some(i),
+            retracted: rounds[i].retracted,
+            events: rounds[i].events,
+            ts: rounds[i].ts.clone(),
+            summary: summarize(&rounds[i].content),
+            restore: restores[i].clone(),
+        });
+        for &c in &rounds[i].children {
+            edges.push(FlowEdge {
+                from: rounds[i].seq,
+                to: rounds[c].seq,
+                lane: lane[c],
+                main: main_set[c],
+            });
+        }
+    }
+
+    Flow {
+        cols: x.iter().copied().max().unwrap_or(0) + 1,
+        lanes: lane.iter().map(|l| l.abs()).max().unwrap_or(0),
+        main_len: main_chain.len() as u64,
+        nodes,
+        edges,
+        branches,
+    }
+}
+
+/// Place `i` and its subtree at `base`, one column per step down; returns
+/// the largest column the subtree uses.
+fn layout_x(rounds: &[Round], i: usize, base: u64, x: &mut [u64]) -> u64 {
+    x[i] = base;
+    let mut mx = base;
+    for &c in &rounds[i].children {
+        mx = mx.max(layout_x(rounds, c, base + 1, x));
+    }
+    mx
+}
+
+/// Which child keeps its parent's lane: on the main line, the main-line
+/// child; elsewhere the child that holds the current round, then the
+/// tallest, then the earliest. Every other child starts a new segment.
+fn primary_children(
+    rounds: &[Round],
+    main_set: &[bool],
+    height: &[u64],
+    holds_current: &[bool],
+) -> Vec<Option<usize>> {
+    (0..rounds.len())
+        .map(|i| {
+            if main_set[i] {
+                return rounds[i].children.iter().copied().find(|&c| main_set[c]);
+            }
+            rounds[i]
+                .children
+                .iter()
+                .copied()
+                .max_by_key(|&c| (holds_current[c], height[c], std::cmp::Reverse(c)))
+        })
+        .collect()
+}
+
+/// Walk one chain segment: `i` stays in `l`, and every other child forks
+/// into its own lane — registered beforehand, so two segments never cover
+/// the same column in the same lane.
+#[allow(clippy::too_many_arguments)]
+fn place(
+    rounds: &[Round],
+    x: &[u64],
+    extent: &[u64],
+    primary: &[Option<usize>],
+    lane: &mut [i32],
+    taken: &mut HashMap<i32, Vec<(u64, u64)>>,
+    branches: &mut Vec<FlowBranch>,
+    i: usize,
+    l: i32,
+    parent_lane: i32,
+) {
+    lane[i] = l;
+    for &c in &rounds[i].children {
+        if Some(c) == primary[i] {
+            place(rounds, x, extent, primary, lane, taken, branches, c, l, parent_lane);
+            continue;
+        }
+        let (from_x, to_x) = (x[c], extent[c]);
+        let nl = pick_lane(taken, l, from_x, to_x);
+        taken.entry(nl).or_default().push((from_x, to_x));
+        branches.push(FlowBranch {
+            root: rounds[c].seq,
+            lane: nl,
+            parent_lane: l,
+            from_x,
+            to_x,
+        });
+        place(rounds, x, extent, primary, lane, taken, branches, c, nl, l);
+    }
+}
+
+/// The first free lane for a segment covering the columns `from_x..=to_x`:
+/// alternate the sides outward from `parent_lane`, biased *away* from the
+/// main line (`|lane|` grows), so a fork inside an upper branch nests
+/// further up instead of crossing the line, and the plan's §10.2
+/// "alternating lanes" ordering (#1 up, #2 down, #3 two-up, #4 two-down)
+/// falls out of it.
+fn pick_lane(
+    taken: &HashMap<i32, Vec<(u64, u64)>>,
+    parent_lane: i32,
+    from_x: u64,
+    to_x: u64,
+) -> i32 {
+    let outward = |d: i32| -> (i32, i32) {
+        let mag = parent_lane.abs() + d;
+        if parent_lane > 0 {
+            (mag, -mag)
+        } else {
+            (-mag, mag)
+        }
+    };
+    let mut d = 1;
+    loop {
+        let (first, second) = outward(d);
+        for cand in [first, second] {
+            let free = taken
+                .get(&cand)
+                .map_or(true, |v| v.iter().all(|&(s, e)| to_x < s || e < from_x));
+            if free {
+                return cand;
+            }
+        }
+        d += 1;
     }
 }
 
@@ -1271,5 +1595,257 @@ mod tests {
             flat_restore(&tree, 3),
             Restore::Unresumable { missing: "c1".to_string() }
         );
+    }
+
+    // ── Style B: the flow projection (plan section 10) ───────────────
+
+    /// No two segments may share a lane over the same column, and no two
+    /// nodes may land on the same `(x, lane)`: the client multiplies both
+    /// by pixels, so a collision is two dots drawn on top of each other.
+    fn assert_flow_is_collision_free(tree: &RewindTree) {
+        let bs = &tree.flow.branches;
+        for (i, a) in bs.iter().enumerate() {
+            for b in bs.iter().skip(i + 1) {
+                if a.lane != b.lane {
+                    continue;
+                }
+                assert!(
+                    a.to_x < b.from_x || b.to_x < a.from_x,
+                    "lane {} carries overlapping segments {}..{} and {}..{}",
+                    a.lane,
+                    a.from_x,
+                    a.to_x,
+                    b.from_x,
+                    b.to_x
+                );
+            }
+        }
+        let mut seen = HashSet::new();
+        for n in &tree.flow.nodes {
+            assert!(
+                seen.insert((n.x, n.lane)),
+                "two nodes landed on ({}, {})",
+                n.x,
+                n.lane
+            );
+        }
+    }
+
+    /// `(seq, x, lane, main)` for every flow node, in round order.
+    fn flow_rows(tree: &RewindTree) -> Vec<(u64, u64, i32, bool)> {
+        tree.flow
+            .nodes
+            .iter()
+            .map(|n| (n.seq, n.x, n.lane, n.main))
+            .collect()
+    }
+
+    #[test]
+    fn flow_of_a_straight_line_is_a_single_lane() {
+        let tree = build("s", &[um("one"), um("two"), um("three")]);
+        assert_eq!(tree.flow.cols, 3);
+        assert_eq!(tree.flow.lanes, 0);
+        assert_eq!(tree.flow.main_len, 3);
+        assert_eq!(
+            flow_rows(&tree),
+            vec![(1, 0, 0, true), (2, 1, 0, true), (3, 2, 0, true)]
+        );
+        assert_eq!(tree.flow.edges.len(), 2);
+        assert_eq!(tree.flow.branches.len(), 1);
+        let b = &tree.flow.branches[0];
+        assert_eq!((b.root, b.lane, b.from_x, b.to_x), (1, 0, 0, 2));
+        assert_flow_is_collision_free(&tree);
+    }
+
+    #[test]
+    fn flow_of_empty_and_single_round_logs() {
+        let empty = build("s", &[]);
+        assert!(empty.flow.nodes.is_empty());
+        assert_eq!((empty.flow.cols, empty.flow.lanes, empty.flow.main_len), (0, 0, 0));
+
+        let one = build("s", &[um("only")]);
+        assert_eq!((one.flow.cols, one.flow.lanes, one.flow.main_len), (1, 0, 1));
+        assert!(one.flow.nodes[0].main && one.flow.nodes[0].current);
+        assert_flow_is_collision_free(&one);
+    }
+
+    /// A long straight log stays a straight log (the stress case: one
+    /// column per round, no lanes).
+    #[test]
+    fn flow_of_a_long_straight_log() {
+        let events: Vec<Value> = (0..200).map(|i| um(&format!("r{i}"))).collect();
+        let tree = build("s", &events);
+        assert_eq!(tree.flow.main_len, 200);
+        assert_eq!(tree.flow.cols, 200);
+        assert_eq!(tree.flow.lanes, 0);
+        assert!(tree.flow.nodes.iter().all(|n| n.lane == 0 && n.main));
+        assert_eq!(tree.flow.edges.len(), 199);
+        assert_flow_is_collision_free(&tree);
+    }
+
+    /// The probe fixture's shape: rewind to round 2, then a new round
+    /// becomes round 3's sibling. Both branches are one node long, so only
+    /// the tie-break (the chain holding the current round) can choose the
+    /// straight line.
+    #[test]
+    fn flow_forks_the_abandoned_branch_into_a_lane() {
+        let events = vec![um("one"), um("two"), um("three"), rw(2, "on"), um("four")];
+        let tree = build("s", &events);
+        assert_eq!(tree.current_seq, Some(5));
+        assert_eq!(tree.flow.main_len, 3);
+        assert_eq!(
+            flow_rows(&tree),
+            vec![
+                (1, 0, 0, true),   // round 1 — the line
+                (2, 1, 0, true),   // round 2 — the fork
+                (3, 2, -1, false), // round 3 — abandoned, one lane up
+                (5, 2, 0, true),   // round 4 — the line continues (here)
+            ]
+        );
+        assert_eq!((tree.flow.cols, tree.flow.lanes), (3, 1));
+        // The fork is an elbow: the abandoned branch leaves the line.
+        assert!(tree
+            .flow
+            .edges
+            .iter()
+            .any(|e| e.from == 2 && e.to == 3 && e.lane == -1 && !e.main));
+        assert!(tree
+            .flow
+            .edges
+            .iter()
+            .any(|e| e.from == 2 && e.to == 5 && e.lane == 0 && e.main));
+        let segs: Vec<(u64, i32, i32, u64, u64)> = tree
+            .flow
+            .branches
+            .iter()
+            .map(|b| (b.root, b.lane, b.parent_lane, b.from_x, b.to_x))
+            .collect();
+        assert_eq!(segs, vec![(1, 0, 0, 0, 2), (3, -1, 0, 2, 2)]);
+        assert_flow_is_collision_free(&tree);
+    }
+
+    /// The 1st branch off the line goes up, the 2nd down (§10.2) — they
+    /// cover the same columns, so they cannot share a lane.
+    #[test]
+    fn flow_alternates_sibling_lanes_up_then_down() {
+        let events = vec![
+            um("a"),
+            um("b"),
+            um("c1"),
+            rw(2, "on"),
+            um("c2"),
+            rw(2, "on"),
+            um("c3"),
+        ];
+        let tree = build("s", &events);
+        assert_eq!(
+            flow_rows(&tree),
+            vec![
+                (1, 0, 0, true),
+                (2, 1, 0, true),
+                (3, 2, -1, false), // 1st fork off round 2 → up
+                (5, 2, 1, false),  // 2nd fork → down
+                (7, 2, 0, true),   // the current round continues the line
+            ]
+        );
+        assert_eq!(tree.flow.lanes, 1);
+        assert_flow_is_collision_free(&tree);
+    }
+
+    /// A fork *inside* a branch nests further out (`-1` → `-2`), i.e. away
+    /// from the line, never across it.
+    #[test]
+    fn flow_nests_a_fork_inside_a_branch_further_out() {
+        let events = vec![
+            um("r1"),
+            um("r2"),
+            um("r3"),
+            rw(2, "on"),  // round 3 leaves the active path …
+            um("r4"),     // … and round 4 continues it
+            rw(3, "on"),  // give round 3 two children
+            um("r5"),
+            rw(3, "on"),
+            um("r6"),
+            rw(5, "on"), // and make round 4's chain the tallest
+            um("r7"),
+            um("r8"),
+        ];
+        let tree = build("s", &events);
+        assert_eq!(
+            flow_rows(&tree),
+            vec![
+                (1, 0, 0, true),   // r1
+                (2, 1, 0, true),   // r2 — the fork
+                (3, 2, -1, false), // r3 — the abandoned branch, up one lane
+                (5, 2, 0, true),   // r4 — the line
+                (7, 3, -1, false), // r5 — keeps r3's lane …
+                (9, 3, -2, false), // … r6 forks further out
+                (11, 3, 0, true),  // r7
+                (12, 4, 0, true),  // r8 — the current round
+            ]
+        );
+        assert_eq!((tree.flow.cols, tree.flow.lanes, tree.flow.main_len), (5, 2, 5));
+        let segs: Vec<(u64, i32, i32, u64, u64)> = tree
+            .flow
+            .branches
+            .iter()
+            .map(|b| (b.root, b.lane, b.parent_lane, b.from_x, b.to_x))
+            .collect();
+        assert_eq!(
+            segs,
+            vec![
+                (1, 0, 0, 0, 4),    // the line
+                (3, -1, 0, 2, 3),   // r3's branch
+                (9, -2, -1, 3, 3), // r6 nested inside it
+            ]
+        );
+        assert_flow_is_collision_free(&tree);
+    }
+
+    /// The D1 caveat, pinned: when an *abandoned* branch is longer than
+    /// what followed the rewind, the longest chain — the straight line —
+    /// is the abandoned one and the current round sits on a fork. This is
+    /// what the user's "longest chain is the main line" means.
+    #[test]
+    fn flow_lets_an_abandoned_branch_be_the_longest_line() {
+        let events = vec![
+            um("a"),
+            um("b"),
+            um("c"),
+            um("d"),
+            rw(2, "on"),
+            um("back"),
+        ];
+        let tree = build("s", &events);
+        assert_eq!(tree.current_seq, Some(6));
+        assert_eq!(tree.flow.main_len, 4); // a,b,c,d — not the live tail
+        assert_eq!(
+            flow_rows(&tree),
+            vec![
+                (1, 0, 0, true),
+                (2, 1, 0, true),
+                (3, 2, 0, true),
+                (4, 3, 0, true),  // the abandoned tail is the straight line
+                (6, 2, -1, false), // the current round hangs one lane up
+            ]
+        );
+        let cur = tree.flow.nodes.iter().find(|n| n.current).unwrap();
+        assert_eq!((cur.lane, cur.main), (-1, false));
+        assert_eq!(cur.restore, tree.flow.nodes[4].restore.clone());
+        assert_flow_is_collision_free(&tree);
+    }
+
+    /// The flow's per-node text is the same one style A shows, so the
+    /// detail panel and the list cannot disagree.
+    #[test]
+    fn flow_nodes_carry_the_detail_the_panel_shows() {
+        let events = vec![um("hello world"), am(), ext()];
+        let tree = build("s", &events);
+        let n = &tree.flow.nodes[0];
+        assert_eq!(n.summary, "hello world");
+        assert_eq!(n.events, 2); // the assistant message + the ext_status
+        assert_eq!(n.round, 1);
+        assert!(n.current && n.main);
+        assert_eq!(n.restore, Restore::Raw);
     }
 }
