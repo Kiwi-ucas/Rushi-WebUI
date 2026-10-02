@@ -754,6 +754,14 @@ pub struct AppState {
     /// Rewind plugin: bumped when a `user_message` / `rewind` event arrives
     /// (the only structure-changing event types) so the tree refetches.
     pub rewind_gen: RwSignal<u64>,
+    /// v0.5.57: display aliases for the session groups, keyed by the session's
+    /// **working path** (`cwd`). The group head shows the path's basename or,
+    /// when the user renamed it, this label — a display-only preference
+    /// (localStorage `rushi-project-labels`); the path itself never changes.
+    /// Shared by the sidebar dispatch view and the rewind History rail.
+    pub project_labels: RwSignal<std::collections::HashMap<String, String>>,
+    /// v0.5.57: which group head is being renamed (its path), None = none.
+    pub group_edit: RwSignal<Option<String>>,
 }
 
 // v0.5.23: module-level handle to the live AppState (set once at app
@@ -835,6 +843,8 @@ impl AppState {
             rewind_tree: RwSignal::new(None),
             rewind_pending: RwSignal::new(None),
             rewind_gen: RwSignal::new(0),
+            project_labels: RwSignal::new(std::collections::HashMap::new()),
+            group_edit: RwSignal::new(None),
         }
     }
 

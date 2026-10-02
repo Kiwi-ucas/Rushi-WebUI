@@ -286,6 +286,7 @@ Effort: P1 1d · P2 0.5d · P3 1d · P4 1d · P5 0.5d · P6 0.5d · P7 1d
 | P6 | `⟲` on every `.ev-user` card (`transcript.rs` → `quick_rewind_button`, `target_seq = hist_oldest_line + index`), inert on the current tail, same dialog | probe: 4 buttons, `[F,F,F,T]` disabled, tooltips, dialog target |
 | P7 | `docs/rewind-plugin.md`, README section + API row, `plugin-authoring-rules.md`/`plugin-area.md` registry notes, `e2e/rewind_probe.py` | probe 71/71 PASS; `e2e/layout_probe.py` still PASSes (the capsule-scrollbar lists) |
 | R1–R3 | the rail = the dispatch cards, grouped by working path, loop toggle included (§9.1) | probe 88/88 PASS |
+| L1–L3 | the group label: full-path tooltip on the basename + a display-only alias per working path (§9.2) | probe 107/107 PASS |
 
 ### 9.1 v0.5.56b — the rail becomes the dispatch view's cards (user request)
 
@@ -305,6 +306,24 @@ start/stop.*
 Verified: `cargo test -p rushi-web` 42 passed; `trunk build` clean;
 `e2e/rewind_probe.py` 88/88 PASS; `e2e/layout_probe.py` on the live server
 still PASS (no shell regression from the rail CSS).
+
+### 9.2 v0.5.57 — the group label: tooltip + display-only rename (user request)
+
+Request: *keep basename-only labels, but hovering the basename must show the
+full working path; also let the user customize the basename without changing
+the real working path.*
+
+| Step | Change |
+|---|---|
+| L1 | `ui.rs::session_group_head` renders the label as its own `<span class="dispatch-group-name" title=<full path>>` — the tooltip moved off the whole head row onto the basename (`…/rushi` vs `…/rushi/rushi` are distinguished by hovering) |
+| L2 | a **display-only alias per working path**: `ui.rs` gains `read_project_labels` / `persist_project_labels` (localStorage `rushi-project-labels`, same pattern as `rushi-sort-mode` / `rushi-custom-order`), `group_label(state, key)` (alias else basename) and `set_group_label`; `AppState` gains `project_labels` + `group_edit`; the head shows a hover-revealed `✎` that swaps the label for an input (Enter/blur commit, Escape cancel, empty = reset to the basename) |
+| L2 | the real path is never written: no server call, nothing in the session dir. The probe asserts the server's `cwd`, the event log and the `loop.last` marker are all unchanged by a rename |
+| L2 | M7's uppercase transform is kept for a basename, dropped for a custom alias (`.dispatch-group-name.custom`) so a rename reads as typed |
+| L3 | `e2e/rewind_probe.py`: +19 checks → 107 PASS (label/tooltip per group, pencil opens/prefills, Escape, Enter commit, as-typed rendering, real path + tooltip intact, persistence across a reload, clear → basename, localStorage dropped) |
+
+Kept as-is (user decisions this round): the rail card click stays `stay = true`
+(in-view switch, C2), and the loop toggle stays live while the loop runs —
+otherwise a stop button would be pointless.
 
 Extra (beyond the plan text, decided during implementation):
 

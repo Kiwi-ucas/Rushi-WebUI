@@ -103,6 +103,63 @@ pub(crate) fn set_layout_mode(mode: &str) {
     }
 }
 
+// ── project labels (v0.5.57) ──────────────────────────────────────
+// The session groups are keyed by the session's **working path** (its `cwd`
+// marker, `model::dispatch_groups`). The group head shows that path's
+// basename; the user may rename that *label* — a display-only alias kept in
+// localStorage next to every other UI preference (`rushi-project-labels`,
+// a `{ "<full path>": "<label>" }` object). The working path itself is never
+// touched: no server call, no write into the session directory, and the full
+// path stays the tooltip.
+
+/// The persisted path → display-label map. Tolerant: a missing key, a broken
+/// JSON blob or a non-object all read as "no aliases".
+pub fn read_project_labels() -> std::collections::HashMap<String, String> {
+    web_sys::window()
+        .and_then(|w| w.local_storage().ok())
+        .flatten()
+        .and_then(|s| s.get_item("rushi-project-labels").ok())
+        .flatten()
+        .and_then(|v| serde_json::from_str::<std::collections::HashMap<String, String>>(&v).ok())
+        .unwrap_or_default()
+}
+
+pub fn persist_project_labels(labels: &std::collections::HashMap<String, String>) {
+    if let Some(s) = web_sys::window().and_then(|w| w.local_storage().ok()).flatten() {
+        let _ = s.set_item(
+            "rushi-project-labels",
+            &serde_json::to_string(labels).unwrap_or_else(|_| "{}".into()),
+        );
+    }
+}
+
+/// The label a group head shows for `group_key` (a working path): the user's
+/// alias when one is set, else the path's basename (`dispatch_group_label`).
+pub fn group_label(state: AppState, group_key: &str) -> String {
+    let alias = state
+        .project_labels
+        .get()
+        .get(group_key)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    alias.unwrap_or_else(|| crate::model::dispatch_group_label(group_key))
+}
+
+/// Set (or clear, with an empty label) the display alias of one working path
+/// and persist the map. Clearing restores the basename.
+pub fn set_group_label(state: AppState, group_key: &str, label: &str) {
+    let key = group_key.to_string();
+    let label = label.trim().to_string();
+    state.project_labels.update(|m| {
+        if label.is_empty() {
+            m.remove(&key);
+        } else {
+            m.insert(key.clone(), label.clone());
+        }
+    });
+    persist_project_labels(&state.project_labels.get());
+}
+
 // ── M8: right tool panel (persisted open state; M11: tabs are
 //    connection-scoped, so no per-tab persistence) ─────────────────
 
@@ -709,16 +766,112 @@ fn dispatch_time_label(ts: Option<f64>) -> String {
     .unwrap_or_else(|| "no events".to_string())
 }
 
-/// M7 (v0.5.56): the project-group header line — the working directory
-/// (basename as the label, the full path in the title) plus the card count.
-/// Shared by the sidebar's dispatch view and the rewind History rail, which
-/// both group sessions by that path (`model::dispatch_groups`).
-pub(crate) fn session_group_head(group_key: &str, count: usize) -> AnyView {
-    let label = dispatch_group_label(group_key);
-    let title = group_key.to_string();
+/// M7 (v0.5.56, v0.5.57): the project-group header line — the working
+/// directory's label plus the card count. Shared by the sidebar's dispatch
+/// view and the rewind History rail, which both group sessions by that path
+/// (`model::dispatch_groups`).
+///
+/// The label is the path's basename (`dispatch_group_label`) or the user's
+/// alias for that path (`group_label`), and **the basename itself carries the
+/// full working path as its tooltip**: two projects can share a basename
+/// (`…/rushi` and `…/rushi/rushi`), so hovering is the way to tell them apart.
+///
+/// Hovering the head reveals `✎` (`.dispatch-group-edit`), which swaps the
+/// label for a compact input bound to `state.group_edit`. Enter/blur commits
+/// via `set_group_label`, Escape cancels, an empty value clears the alias.
+/// It is a **display-only** rename: the working path is never changed.
+pub(crate) fn session_group_head(state: AppState, group_key: &str, count: usize) -> AnyView {
+    // `StoredValue` (Copy): every closure below stays `Fn`, and the key — the
+    // group's working path — is fixed for this head instance (the `For` key
+    // includes it), so a plain copy is correct.
+    let key = StoredValue::new(group_key.to_string());
+    // The full working path. It is the tooltip and ONLY the tooltip: the
+    // visible text is the label (basename or alias) and the path is never
+    // rewritten.
+    let title = key;
+    let label = move || group_label(state, &key.get_value());
+    // M7 renders a group's label uppercase; the user's own alias shows as
+    // typed (`.custom`), which is what makes a rename feel like a rename.
+    let label_cls = move || {
+        let k = key.get_value();
+        let custom = state
+            .project_labels
+            .get()
+            .get(&k)
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false);
+        if custom {
+            "dispatch-group-name custom"
+        } else {
+            "dispatch-group-name"
+        }
+    };
+    let editing = move || state.group_edit.get().as_deref() == Some(key.get_value().as_str());
+    let open_edit = move |e: MouseEvent| {
+        e.stop_propagation();
+        state.group_edit.set(Some(key.get_value()));
+    };
+    let commit = move |value: String| {
+        set_group_label(state, &key.get_value(), &value);
+        state.group_edit.set(None);
+    };
+    let cancel = move |_| state.group_edit.set(None);
+
     view! {
-        <div class="dispatch-group-head" title=title>
-            { label }
+        <div class="dispatch-group-head">
+            <Show
+                when=editing
+                fallback=move || {
+                    view! {
+                        <span class=label_cls title=title.get_value()>
+                            { label }
+                        </span>
+                        <button
+                            class="dispatch-group-edit"
+                            title="rename this group's label (display only \u{2014} the working path is not changed)"
+                            on:click=open_edit
+                        >
+                            { "\u{270E}" }
+                        </button>
+                    }
+                }
+            >
+                <input
+                    class="dispatch-group-input"
+                    type="text"
+                    placeholder=move || dispatch_group_label(&key.get_value())
+                    prop:value=move || group_label(state, &key.get_value())
+                    on:keydown=move |e: web_sys::KeyboardEvent| {
+                        match e.key().as_str() {
+                            "Enter" => {
+                                e.prevent_default();
+                                let v = e
+                                    .target()
+                                    .and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok())
+                                    .map(|i| i.value())
+                                    .unwrap_or_default();
+                                commit(v);
+                            }
+                            "Escape" => {
+                                e.prevent_default();
+                                state.group_edit.set(None);
+                            }
+                            _ => {}
+                        }
+                    }
+                    on:blur=move |e: web_sys::FocusEvent| {
+                        let v = e
+                            .target()
+                            .and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok())
+                            .map(|i| i.value())
+                            .unwrap_or_default();
+                        commit(v);
+                    }
+                />
+                <button class="dispatch-group-edit on" title="cancel" on:click=cancel>
+                    { "\u{2715}" }
+                </button>
+            </Show>
             <span class="dispatch-group-count">{ count }</span>
         </div>
     }
@@ -738,7 +891,7 @@ fn dispatch_group_block(
     let count = group_sessions.len();
     view! {
         <div class="dispatch-group">
-            { session_group_head(&group_key, count) }
+            { session_group_head(state, &group_key, count) }
             <For
                 each=move || group_sessions.clone()
                 key=|s: &SessionInfo| s.name.clone()

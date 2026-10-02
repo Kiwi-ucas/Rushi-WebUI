@@ -59,6 +59,11 @@ fn App() -> impl IntoView {
         state.custom_order.set(order);
     }
 
+    // v0.5.57: the session groups' display aliases (localStorage). The group
+    // key is the session's working path; the head shows the alias or the
+    // path's basename, and the path itself is never modified.
+    state.project_labels.set(ui::read_project_labels());
+
     // v0.5.38: keep the loop-cmd chip's `loop_cmd` signal fresh from
     // the loaded event window. The WS history frame only carries the
     // last HIST_PAGE events, but a freshly sent command is always the

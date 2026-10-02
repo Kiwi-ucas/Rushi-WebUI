@@ -137,6 +137,22 @@ dispatch view's: it starts/stops **that** session's loop even when it is not
 the active one, and it stays available while the tree is read-only (the guard
 only forbids the *rewind*, not the loop control).
 
+**The group head (v0.5.57).** A group is one working path, so two projects can
+share a basename (`…/rushi` and `…/rushi/rushi`). The head therefore shows the
+basename and carries the **full path as the basename's own tooltip**
+(`.dispatch-group-name[title]`), and it can be renamed: hovering the head
+reveals `✎`, which swaps the label for a compact input (Enter/blur commits,
+Escape cancels, empty clears). The rename is a **display-only alias** — a
+`{ "<full path>": "<label>" }` map in localStorage
+(`rushi-project-labels`), next to every other UI preference
+(`rushi-layout`, `rushi-sort-mode`, …). No server call, no write into the
+session directory: the session's `cwd` marker — the real working path — is
+never touched, and the tooltip keeps showing it. M7 renders a basename
+uppercase; a custom alias is shown as typed (`.dispatch-group-name.custom`).
+Because the head is shared, the sidebar dispatch view gets all of this too —
+this half is **general webui UI, not plugin code**: the plugin only calls
+`ui::session_group_head`.
+
 Node states are the projection's: **active**, **abandoned** (dimmed,
 strikethrough summary), **current** (ring + `here`), plus the boundary
 footnote. Tooltips carry round, time, folded event count and state — and, when

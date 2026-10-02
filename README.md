@@ -68,7 +68,10 @@ read-only projection (`GET /api/sessions/{id}/rewind`), the UI, and the guard.
   rail on the left (so switching sessions stays full-screen) and the recursive
   round/branch tree filling the rest. The rail is the M7 dispatch view's
   session card — grouped by the session's **working path**, each with its own
-  `▶ start` / `■ stop` loop toggle and `…` menu (v0.5.56). One node = one user
+  `▶ start` / `■ stop` loop toggle and `…` menu (v0.5.56). A group head shows
+  the path's basename with the **full path as its tooltip**, and can be renamed
+  to a display-only alias (localStorage; the working path itself never changes,
+  v0.5.57). One node = one user
   message = one loop
   round; the agent's work folds into the node (summary + event count).
   Abandoned branches are dimmed with a strikethrough summary, the current

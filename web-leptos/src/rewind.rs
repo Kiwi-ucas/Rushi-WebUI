@@ -205,7 +205,7 @@ fn hist_rail(state: AppState) -> AnyView {
                 let count = items.len();
                 view! {
                     <div class="dispatch-group">
-                        { crate::ui::session_group_head(&key, count) }
+                        { crate::ui::session_group_head(state, &key, count) }
                         <For
                             each=move || items.clone()
                             key=|s: &SessionInfo| s.name.clone()

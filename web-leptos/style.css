@@ -319,6 +319,17 @@ button { font-weight: 700; }
 .dispatch-group-head { display: flex; align-items: baseline; gap: 8px; padding: 0 12px 6px; font-size: 11px; font-weight: 700; letter-spacing: .5px; text-transform: uppercase; color: var(--text-muted); }
 .dispatch-group-head > :first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dispatch-group-count { font-weight: 500; letter-spacing: 0; text-transform: none; }
+/* v0.5.57: the group head's label. The visible text is the working path's
+   basename; the FULL path is its `title` (two projects can share a basename:
+   .../rushi and .../rushi/rushi). `.dispatch-group-edit` is hover-revealed and
+   renames the label to a display-only alias — the path itself never changes. */
+.dispatch-group-name { cursor: default; } /* M7 shows the path basename uppercase; a custom alias shows as typed */
+.dispatch-group-name.custom { text-transform: none; }
+.dispatch-group-edit { background: none; border: none; color: var(--text-muted); font-size: 11px; line-height: 1; padding: 1px 4px; border-radius: 4px; cursor: pointer; opacity: 0; transition: opacity .12s; }
+.dispatch-group-head:hover .dispatch-group-edit { opacity: .7; }
+.dispatch-group-edit:hover, .dispatch-group-edit.on { opacity: 1; color: var(--text); background: var(--bg-elev); box-shadow: var(--shadow); }
+.dispatch-group-input { font: inherit; font-weight: 700; letter-spacing: 0; text-transform: none; color: var(--text); background: var(--bg-elev); border: none; border-radius: 4px; padding: 1px 6px; min-width: 80px; max-width: 220px; box-shadow: var(--groove); }
+.dispatch-group-input:focus { outline: none; box-shadow: var(--shadow); }
 .dispatch-card { position: relative; padding: 8px 12px 9px; border-radius: 6px; cursor: pointer; margin-bottom: 6px; background: var(--bg); box-shadow: var(--shadow); }
 .dispatch-card:hover { background: var(--bg-elev); box-shadow: var(--shadow-hover); }
 .dispatch-card.active { background: var(--bg-elev); box-shadow: inset 3px 0 0 var(--accent), var(--shadow); }
@@ -1668,6 +1679,7 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
 #hist-rail .dispatch-group { margin-top: 12px; }
 #hist-rail .dispatch-group:first-child { margin-top: 0; }
 #hist-rail .dispatch-group-head { padding: 0 4px 6px; font-size: 10px; }
+#hist-rail .dispatch-group-input { min-width: 60px; max-width: 150px; }
 #hist-rail .dispatch-card { padding: 7px 9px 8px; margin-bottom: 5px; }
 #hist-rail .dc-name { font-size: 13px; }
 #hist-rail .dc-time { font-size: 10px; }
