@@ -23,6 +23,7 @@ mod process;
 mod rewind;
 mod sessions;
 mod term;
+mod time_inject;
 
 use config::WebConfig;
 use files::{list_files, raw_file, read_file};
@@ -371,6 +372,39 @@ async fn get_goal(State(st): State<AppState>, Path(id): Path<String>) -> impl In
 async fn get_essence(State(st): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     let view = essence::read(&st.sessions.session_dir(&id));
     (StatusCode::OK, Json(view)).into_response()
+}
+
+// ── time-inject plugin (rushi-time-inject) ─────────────────────────
+
+/// v0.5.56: the per-session time-inject toggle state. The hook
+/// (harness-hook-time-inject) reads the `.time_inject` marker on every
+/// model call, so toggling applies from the session's next model call —
+/// no loop restart. Absent marker means ON (the hook's default).
+async fn get_time_inject(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let enabled = st.sessions.time_inject_enabled(&id);
+    (StatusCode::OK, Json(serde_json::json!({ "enabled": enabled }))).into_response()
+}
+
+#[derive(Deserialize)]
+struct TimeInjectBody {
+    enabled: bool,
+}
+
+/// v0.5.56: set the per-session time-inject toggle. `enabled: false`
+/// writes the explicit off marker; `enabled: true` clears it (back to
+/// the default-on state).
+async fn post_time_inject(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<TimeInjectBody>,
+) -> impl IntoResponse {
+    match st.sessions.set_time_inject(&id, body.enabled).await {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true, "enabled": body.enabled }))).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -1181,6 +1215,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/sessions/{id}/rewind", get(get_rewind_tree).post(post_rewind))
         .route("/api/sessions/{id}/goal", get(get_goal).post(post_goal))
         .route("/api/sessions/{id}/essence", get(get_essence))
+        .route(
+            "/api/sessions/{id}/time-inject",
+            get(get_time_inject).post(post_time_inject),
+        )
         .route("/api/model", get(get_model).post(post_model))
         .route("/api/model/probe", post(post_model_probe))
         .route("/api/model/models", post(post_model_models))

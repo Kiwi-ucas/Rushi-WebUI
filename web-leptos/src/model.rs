@@ -317,6 +317,20 @@ impl GoalView {
     }
 }
 
+/// v0.5.56: the session's time-inject toggle state (sidebar time plugin).
+/// The server mirrors the harness hook's marker
+/// (`sessions/<id>/.time_inject`, written by the plugin's toggle): a
+/// missing marker is ON (the hook default), an explicit off value is OFF.
+#[derive(Clone, Debug, Deserialize)]
+pub struct TimeInjectView {
+    #[serde(default = "default_time_inject_enabled")]
+    pub enabled: bool,
+}
+
+fn default_time_inject_enabled() -> bool {
+    true
+}
+
 /// v0.5.54: one session-essence entry (sidebar essence plugin, read-only).
 /// Mirrors the harness `essence` store (`rushi-essence/essence-state::Entry`,
 /// `sessions/<id>/essence.json`). `kind` is "invariant" or "belief".
@@ -582,6 +596,11 @@ pub struct AppState {
     pub loop_running: RwSignal<bool>,
     pub ctx_used: RwSignal<u64>,
     pub goal: RwSignal<Option<GoalView>>,
+    /// v0.5.56: the time plugin (sidebar): the active session's
+    /// time-inject toggle state. None until the first fetch. The marker
+    /// is read live by the harness hook on every model call, so the
+    /// server's answer is the current state.
+    pub time_inject: RwSignal<Option<TimeInjectView>>,
     /// v0.5.53: the sidebar plugin area. `active_plugin` is the id of the
     /// plugin rendered in `#plugin-view` (registry: `plugins.rs`);
     /// `plugin_menu_open` toggles the picker dropdown in `#plugin-bar`.
@@ -789,6 +808,7 @@ impl AppState {
             loop_running: RwSignal::new(false),
             ctx_used: RwSignal::new(0),
             goal: RwSignal::new(None),
+            time_inject: RwSignal::new(None),
             active_plugin: RwSignal::new("goal".to_string()),
             plugin_menu_open: RwSignal::new(false),
             view_round: RwSignal::new(None),

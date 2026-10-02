@@ -8,6 +8,7 @@ mod pile;
 mod plugins;
 mod rewind;
 mod terminal;
+mod time;
 mod timeutil;
 mod transcript;
 mod ui;

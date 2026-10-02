@@ -1757,6 +1757,7 @@ fn plugin_view(active: RwSignal<String>, state: AppState) -> AnyView {
         "goal" => goal_plugin_view(state).into_any(),
         "essence" => essence_plugin_view(state).into_any(),
         "rewind" => crate::rewind::rewind_plugin_view(state).into_any(),
+        "time" => crate::time::time_plugin_view(state).into_any(),
         _ => view! { <div class="plugin-empty">{ "plugin not found" }</div> }.into_any(),
     }
 }

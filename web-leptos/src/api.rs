@@ -319,6 +319,31 @@ pub async fn load_essence(id: &str) -> Result<Vec<crate::model::EssenceEntry>, S
     .map_err(|e| e.to_string())
 }
 
+/// v0.5.56: the session's time-inject toggle (sidebar time plugin). The
+/// server reads the session's `.time_inject` marker (the same marker the
+/// harness hook checks on every model call), so this is the live state.
+pub async fn load_time_inject(id: &str) -> Result<crate::model::TimeInjectView, String> {
+    let res = Request::get(&format!("/api/sessions/{id}/time-inject"))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let text = res.text().await.map_err(|e| e.to_string())?;
+    serde_json::from_str(&text).map_err(|e| e.to_string())
+}
+
+/// v0.5.56: set the session's time-inject toggle. `enabled` takes effect
+/// from the session's next model call — no loop restart.
+pub async fn set_time_inject(id: &str, enabled: bool) -> Result<crate::model::TimeInjectView, String> {
+    let payload = json!({ "enabled": enabled });
+    let status = post_json(&format!("/api/sessions/{id}/time-inject"), &payload).await?;
+    if status >= 400 {
+        Err(format!("set time-inject failed: HTTP {status}"))
+    } else {
+        // Refetch so the view mirrors the server's post-write state.
+        load_time_inject(id).await
+    }
+}
+
 /// Rewind plugin: the session's projected history tree (read-only). The
 /// server degrades a missing log to an empty tree.
 pub async fn load_rewind_tree(id: &str) -> Result<crate::model::RewindTree, String> {

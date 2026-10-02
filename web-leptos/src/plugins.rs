@@ -19,10 +19,11 @@ pub struct PluginDef {
 
 /// The registry. Compile-time: one line per plugin. Every loaded plugin is
 /// listed here, so the shared plugin bar/menu always shows the loaded set.
-pub const PLUGINS: [PluginDef; 3] = [
+pub const PLUGINS: [PluginDef; 4] = [
     PluginDef { id: "goal", label: "goal" },
     PluginDef { id: "essence", label: "essence" },
     PluginDef { id: "rewind", label: "rewind" },
+    PluginDef { id: "time", label: "time" },
 ];
 
 pub fn count() -> usize {

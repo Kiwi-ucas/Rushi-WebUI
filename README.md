@@ -174,6 +174,7 @@ from disk, so a `trunk build` is picked up without recompiling
 | GET | `/api/sessions/{id}/rewind` | the projected history tree (rounds, forks, boundaries, `current_seq`) |
 | POST | `/api/sessions/{id}/rewind` | `{"target_seq","mode":"before\|on"}` |
 | GET/POST | `/api/sessions/{id}/goal` | read / act on goal state |
+| GET/POST | `/api/sessions/{id}/time-inject` | read / set the session's time-inject toggle (`{"enabled":bool}`) |
 | WS | `/ws/sessions/{id}` | history frame + live event frames; inbound `message`/`approval`/`rewind`/`start`/`stop`/`load_earlier` frames; outbound `history` / `history_page` / `event` / `model_stream` / `loop_status` frames |
 
 ## Truncated history (v0.5.17)

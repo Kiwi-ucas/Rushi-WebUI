@@ -406,6 +406,35 @@ impl SessionManager {
         Ok(())
     }
 
+    /// v0.5.56: whether time-injection is ON for this session — the
+    /// sidebar `time` plugin's state. The contract (marker name, off
+    /// values, the default-on rule) lives in [`crate::time_inject`], the
+    /// same module the hook mirrors, so this is only the file I/O.
+    pub fn time_inject_enabled(&self, id: &str) -> bool {
+        crate::time_inject::enabled_from_marker(read_marker(
+            &self.session_dir(id),
+            crate::time_inject::MARKER,
+        )
+        .as_deref())
+    }
+
+    /// v0.5.56: record the time-inject toggle. `true` clears the marker
+    /// (back to the default-on state); `false` writes the explicit off
+    /// marker the hook reads. The hook re-reads it on every model call, so
+    /// this applies from the session's next call — no loop restart.
+    pub async fn set_time_inject(&self, id: &str, enabled: bool) -> Result<()> {
+        validate_session_name(id)?;
+        self.ensure_session(id).await?;
+        let path = self.session_dir(id).join(crate::time_inject::MARKER);
+        match crate::time_inject::marker_for(enabled) {
+            None => {
+                let _ = fs::remove_file(&path).await;
+            }
+            Some(value) => fs::write(&path, value).await?,
+        }
+        Ok(())
+    }
+
     /// Create a session and optionally record its working directory.
     /// `cwd`, when non-empty, must be an existing directory.
     pub async fn create(&self, id: &str, cwd: Option<&str>) -> Result<()> {
