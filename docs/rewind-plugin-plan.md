@@ -394,6 +394,12 @@ additional view, switched from the History top bar.
    with a **minimum scale floor** and **drag-to-pan**, so `--rw-t` (wheel) is
    never fighting a horizontal scrollbar.
 
+   → **the width estimate was wrong (§10.8, corrections).** The cell caps at
+   64 px, so 117 rounds is ~7 500 px, not tens of thousands — and the scene
+   *is* a horizontal scroller (`overflow-x: auto`, scrollbar hidden). The
+   wheel proxy takes the vertical delta and pans along the line, so there is
+   no vertical scroll for it to fight; a horizontal delta stays native.
+
 ### 10.2 Layout algorithm (server, pure + tested)
 
 * **Main line** = the longest root→leaf chain over the *whole* tree (count of
@@ -420,6 +426,10 @@ additional view, switched from the History top bar.
 
 ### 10.3 Step plan
 
+**Landed — as-built record in §10.8 (B1–B9, v0.5.63–v0.5.66). The table
+below is the plan as written; §10.8 lists every place the build diverged
+from it and why.**
+
 | step | what | files | proof |
 |---|---|---|---|
 | **B1** | flow layout projection: `main_chain`, `layout` (x/lane/side), `edges`, `Flow` types | `bin/rushi-web/src/rewind.rs` | unit tests: longest chain wins; tie→current; alternating lanes; no lane collision; single node; empty; a rewind fork puts the abandoned branch off-line; `cols/lanes/main_len` |
@@ -437,6 +447,15 @@ wasm `cargo check` + `trunk build` (client), `e2e/rewind_probe.py` (CDP),
 `e2e/layout_probe.py` on :8480 for the shell.
 
 ### 10.4 Decisions to align (recommended default in bold)
+
+> **All nine were confirmed by the user on 2026-10-03 before B1 started;
+> each entry below carries what was built.** D1 ✅, D2 ✅ (list stays the
+> default), D3 ✅ (the split is flow-only), D4 ✅ (auto-fit floor + drag,
+> no zoom UI), D5 ✅, D6 ✅ (native `title` only), D7 ✅ (the scroll proxy
+> takes over *only* the vertical wheel delta; a horizontal delta stays the
+> browser's), D8 ✅ **via B2's route** (see the note at D8), D9 ✅ (native
+> `view(x)` where supported, proxy elsewhere, static under
+> `prefers-reduced-motion`).
 
 * **D1 main line**: longest chain over the whole tree, ties → the chain that
   holds the current node (then leftmost). **Confirm**, because an abandoned
@@ -461,6 +480,9 @@ wasm `cargo check` + `trunk build` (client), `e2e/rewind_probe.py` (CDP),
   measured cost 4–47 KB per session, §10.6 finding 4 — a cap, e.g. 4 000
   chars, keeps it bounded). **Recommended: carry it in the tree** and drop
   B2's route.
+  → **DECIDED (user, 2026-10-03): the per-node route (B2).** The text is
+  served per round, verbatim and never summarized, fetched lazily on
+  selection; the recommendation above is *not* what was built (§10.8).
 * **D9 (added 2026-10-03) how the 3D rotation is driven**: **CSS
   scroll-driven animation (`animation-timeline: view(x)`) where supported,
   the §10.7 scroll-proxy fallback elsewhere** (Firefox), and always a flat,
@@ -476,6 +498,11 @@ to Style A's markup, and no new server-side truth: the flow layout is a
 *projection* of the same tree the kernel's `active_ranges` already proves.
 
 ### 10.6 Refresh (2026-10-03 — the research re-run)
+
+> **Superseded by §10.8** (kept as the record of the research round):
+> B1–B9 all landed in v0.5.63–v0.5.66, and D8 was decided the other way.
+> Findings 1–3 stand; finding 4's measurement stands; finding 5 (in §10.1)
+> was wrong about the scale — see §10.8 "corrections".
 
 **Status: plan only, no code yet.** §10 was written and committed as
 `b8b1d48` (*v0.5.60: plan — the rewind flow view (Style B)*) from the same
@@ -521,7 +548,8 @@ Four findings that change or firm up §10:
    response is refetched only on a structural WS frame, so carrying the text
    in the tree costs ~0.05 % of the transcript the client already loads in
    full for the chat view. That is what makes D8's "carry it in the tree"
-   recommendation cheap.
+   recommendation cheap — **but the user chose the per-node route instead**,
+   preferring a bounded payload per interaction over a fatter tree.
 
 ### 10.7 Why the wheel drives a CSS variable (not `scroll-behavior`, not JS transforms)
 
@@ -541,6 +569,151 @@ primary:
   scroll-height math per frame) — that is the failure mode that makes
   scroll-driven scenes janky, and the one the `full_fetch_probe.py` timeline
   would catch.
+
+### 10.8 As built (2026-10-03, v0.5.63 – v0.5.66)
+
+**Status: B1–B9 landed and verified.** The two styles are one tree read two
+ways: Style A unchanged, Style B a projection of the same response (§10.2's
+rule — one fetch, one cache, one invalidation path).
+
+| step | version | commit | what shipped |
+|---|---|---|---|
+| **B1** | v0.5.63 | `87d63b1` | server flow projection in `bin/rushi-web/src/rewind.rs`: `Flow { nodes, edges, branches, cols, lanes, main_len }`, `fn flow`, helpers `layout_x`, `primary_children`, `place`, `pick_lane`; `RewindTree.flow`. **8 unit tests** |
+| **B2** | v0.5.64 | `830781d` | `rewind::node_detail(&events, seq) -> Option<NodeDetail>`, route `GET /api/sessions/{id}/rewind/node/{seq}` (200/404), handler `get_rewind_node`. **3 tests** (65 total) |
+| **B3–B7** | v0.5.65 | `b4ab0b7` | the client types/state/API (`RewindFlow`, `FlowNode`, `FlowEdge`, `FlowBranch`, `RewindDetail`; `rw_view`/`rw_selected`/`rw_detail`), the `[ list \| flow ]` switch, `#rw-split` 1:2, the detail panel, the scene, the 3D ribbons + the light |
+| — | v0.5.65 | `38ae6a2` | the serde recursion fix the style forced into the open (below) |
+| **B9** | v0.5.66 | *this commit* | this record, `docs/rewind-plugin.md`, the mirror + `install/TOUCHPOINTS.md` §3.9 |
+
+**Every D1–D9 decision is implemented as confirmed** (§10.4). Where the
+*build* differs from the §10 spec, it is listed here rather than quietly
+diverging:
+
+1. **The scroller is x-only.** §10.1/§10.6 assumed a tall spacer with
+   vertical scroll and a sticky viewport inside it. Built instead:
+   `#rw-flow-scroll` scrolls **only x** (`overflow-x: auto`,
+   `overflow-y: hidden`, no scrollbar) and the lane pitch is a **percentage
+   of the scene's own height** (`--rowp: calc(50% / (var(--lanes) + 0.5))`),
+   so every lane always fits exactly one screen and no vertical scroll can
+   exist for the wheel to fight. The load-bearing §10.1.3 rule is respected:
+   the scroller is **not** the perspective element — `#rw-flow-track` (a child
+   of it) is, with `.rw3-grid { transform-style: preserve-3d }`.
+2. **Nothing rotates but the ribbons.** §10.1.3 wanted counter-rotated
+   labels; the dots and runs are never transformed at all, so labels stay
+   upright for free and there is nothing to counter-rotate (asserted: a dot's
+   computed transform is a 2D `matrix(...)`).
+3. **The light is a sticky band, not a travelling sheen.** One `.rw3-sheen`
+   pinned to the panel (`position: sticky; left: 0`, `pointer-events: none`)
+   — the scene slides under one fixed light. Same read, no per-node work.
+4. **The driver is `--rw-scroll`, and the turn is per ribbon**:
+   `--turn: clamp(-1, (var(--bx) - var(--rw-scroll) - var(--halfpw)) / var(--denom), 1)`,
+   `transform: rotateX(calc(var(--turn) * 62deg))`. `--bx` (the ribbon's own
+   centre), `--halfpw` and `--denom` are written at **layout** time (mount /
+   tree change / selection / `resize`); a scroll frame writes **exactly one**
+   value, so nothing reads layout while scrolling. `on:wheel` and the drag
+   write it, and so does `on:scroll` — a scrollbar drag or a programmatic
+   `scrollLeft` must not leave it stale (the probe's H7 found that).
+5. **`animation-timeline: view(x)` is the primary path** (§10.6 finding 1)
+   behind `@supports`, with the proxy elsewhere and
+   `@media (prefers-reduced-motion: reduce) { transform: none }`.
+
+#### Corrections to §10 (kept honest)
+
+* **§10.1 finding 5 / finding "scale" — wrong.** "the main line's logical
+  width … can be tens of thousands of px … so `--rw-t` is never fighting a
+  horizontal scrollbar": the cell caps at 64 px, so 117 rounds is ~7 500 px,
+  and the scene **is** a horizontal scroller. There is no vertical scroll
+  (see 1 above), so the wheel proxy takes over **only the vertical delta**
+  (`|dy| ≥ 0.5`); a horizontal delta — or shift+wheel — stays the browser's
+  native x-scroll. One gesture, one meaning, never doubled (D7 ✅).
+* **§10.1 finding 2** ("`animation-timeline: scroll()` is not safe to
+  depend on") is superseded by §10.6 finding 1 (Safari 26 shipped it); the
+  build uses `view(x)` as an enhancement on top of the proxy regardless.
+* **§10.4 D8** — the user confirmed **B2's per-node route** over the plan's
+  "carry it in the tree" recommendation: the text is fetched per round,
+  verbatim, never summarized.
+
+#### Two defects found while verifying, both fixed here
+
+1. **serde_json's 128-level recursion limit hid half the sessions.** The
+   tree nests one `children` array per round, so a chain past ~63 rounds made
+   the client reject the **whole** response; `register_tree_effect` mapped the
+   error to `Err(_)` and History sat on "loading…" forever. Fixed with
+   `serde_json` `unbounded_depth` + `api::parse_deep` on the two routes that
+   nest (tree, round detail), and the failure is now reported on the console
+   (`rewind tree ({session}): {error}`). Measured live before the fix:
+   `Webui` (117), `alpha` (82), `issue` (30) and `theme` (16) — 4 of 8
+   sessions — never rendered.
+2. **The main-line runs lost their `top`.** `.rw3-seg` was emitted without
+   `--lane`, so `calc(50% + var(--lane) * var(--rowp))` was invalid, `top`
+   fell back to `auto`, and every run took its *static flow* position — a
+   cascade of stray bright bars down the panel. The DOM assertions never
+   noticed (the elements existed; the dots were right); it was found by
+   **photographing the panel** and counting accent pixels. `--lane: 0` is
+   emitted now (with a `var(--lane, 0)` fallback in the CSS), a nested fork
+   no longer emits a zero-height hinge, and section C/I of the probe check
+   the connector rows and the paint in both palettes.
+
+#### Style A's long-chain limit — measured, and a decision to make
+
+The list style renders **one DOM level per round**, and the wasm stack gives
+out on a deep chain. Measured now (list style, live :8480, v0.5.65+):
+
+| session | rounds | list-style nodes rendered | wasm traps |
+|---|---|---|---|
+| `rewind` / `issue` / `webui_extend` | 32 / 30 / 27 | 32 / 30 / 27 ✅ | 0 |
+| `Time inject` / `theme` / `essence` | 11 / 16 / 6 | 11 / 16 / 6 ✅ | 0 |
+| **`Webui`** | **117** | **6** ❌ | 5 × `RuntimeError: memory access out of bounds` |
+| **`alpha`** | **82** | **6** ❌ | 8 × same |
+
+The app survives (the trap is caught at the wasm-bindgen closure boundary),
+but the new tree never paints — the previous session's tree stays on screen.
+The cut is between 32 and 82 rounds; it does **not** track payload size (the
+four parse-broken sessions included a 16-round one), so it is a per-round
+DOM/stack cost, not the serde limit.
+
+**Style B draws all 117 rounds fine** — the flat `flow` projection is
+precisely the answer to this, and is the reason to use it on the big
+sessions. Fixing Style A (e.g. rendering a single-child *chain* as flat
+siblings instead of nested `children`) would change Style A's markup, which
+§10 pinned as "byte-for-byte"; it is **left for a decision** rather than
+changed unilaterally.
+
+#### A design consequence worth a decision
+
+**A scene that fits its panel cannot turn.** The auto-fit (D4) leaves a short
+line almost no horizontal travel — an 8-column tree is at most ~1.125× the
+panel width — so the wheel has nothing to pan and a branch keeps the turn its
+position under the light implies (e.g. `Time inject`: ~28° at the default
+width, flattening only as it is pulled towards the centre). Long forked
+sessions pan and turn as designed. If more motion is wanted for short trees:
+raise the cell cap, skip the fit for short scenes, or make the *light* travel
+instead of the scene. Not changed unilaterally.
+
+#### Verification (the exact commands)
+
+| command | result |
+|---|---|
+| `cargo test -p rushi-web` | **65 passed**, 0 failed |
+| `cargo check --target wasm32-unknown-unknown --manifest-path web-leptos/Cargo.toml` | clean (pre-existing warnings only) |
+| `trunk build` | ✅ success |
+| `python3 e2e/flow_style_b_probe.py 8480` | **60 checks, 0 failed** |
+| `python3 e2e/flow_check.py 8480` | 8 sessions, 0 problems |
+| `python3 e2e/rewind_probe.py` | 140/140 (Style A untouched) |
+| `python3 e2e/layout_probe.py 8480` | PASS |
+
+`flow_style_b_probe.py` sections: **A** the switch (persisted, `list`
+default) · **B** the 1:2 split and the x-only scroller · **C** the scene
+(one dot per round, runs/hinges on the right lane, the lit live path, lane
+geometry, no dot overlap, the 64 px pitch cap, connector rows) · **D** the
+panel (D5 pre-select, the B2 text verbatim, the button inert on the current
+round, a click selects and opens **no** dialog) · **E** the button → the one
+dialog → cancel writes nothing · **F** the 117-round session (26 px floor,
+drag pan, wheel, a horizontal delta left native) · **G** persistence, and
+the list still draws afterwards · **H** the 3D (a ribbon per branch, real
+`perspective` + `preserve-3d`, the proxy's maths checked against the CSS at
+two offsets, flat under the light, `prefers-reduced-motion` → no transform)
+· **I** the paint (accent pixels counted from real screenshots in **both**
+palettes).
 
 ## 11. Rewind × compaction — the plugin side (plan, 2026-10-03)
 

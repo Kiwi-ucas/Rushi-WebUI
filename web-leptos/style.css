@@ -1827,7 +1827,7 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
 .rw3-node.blocked .rw3-dot { border: 2px dotted #cc0044; }
 .rw3-round { font-size: 9.5px; font-weight: 700; letter-spacing: .3px; color: var(--text-muted); }
 
-/* ── B7: the 3D branch + the light sweep (D9) ───────────────────────
+/* B7: the 3D branch + the light sweep (D9) ──────────────────────────
    `perspective` must sit INSIDE the scrolling element (a scroller flattens
    its own 3D children), and the scene grid carries `preserve-3d` so the
    ribbons — grandchildren of the perspective element — stay in that space.

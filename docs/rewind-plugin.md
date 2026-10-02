@@ -1,6 +1,9 @@
 # Rewind plugin — the history tree
 
-Status: **implemented** (P1–P7 of `rewind-plugin-plan.md`). UI text is English.
+Status: **implemented** (P1–P7, the v0.5.56b/v0.5.57 additions, and
+**Style B — the flow scene**, v0.5.63–v0.5.66, of
+`rewind-plugin-plan.md`; §10 there is the plan, §10.8 the as-built record).
+UI text is English.
 
 The rewind plugin lets a user rewind a conversation to any earlier user
 message **without losing anything**: every branch stays in the same
@@ -13,16 +16,20 @@ is untouched — rewind was already a first-class kernel event.
 
 ```
 server   bin/rushi-web/src/rewind.rs     GET  /api/sessions/{id}/rewind  (projection)
+                                         GET  /api/sessions/{id}/rewind/node/{seq}  (one round)
                                          POST /api/sessions/{id}/rewind  (write, pre-existing)
-client   web-leptos/src/rewind.rs        History view + dialog + sidebar panel + card button
+client   web-leptos/src/rewind.rs        History view (both styles) + dialog + sidebar panel + card button
          web-leptos/src/model.rs         RewindTree / RewindNode / RewindMarker / RewindBoundary
-         web-leptos/src/api.rs           load_rewind_tree / post_rewind
+         web-leptos/src/api.rs           load_rewind_tree / load_rewind_detail / post_rewind
+                                         (both rewind reads go through parse_deep)
          web-leptos/src/plugins.rs       registry entry (goal · essence · rewind)
          web-leptos/src/lib.rs           mount + the single tree-fetch effect
          web-leptos/src/transcript.rs    the `⟲` card button
-         web-leptos/style.css            #history-view / #hist-* / .rw-* / dialog
+         web-leptos/style.css            #history-view / #hist-* / .rw-* / .rw3-* / dialog
 test     bin/rushi-web/src/rewind.rs     unit tests (kernel fixtures + ported active_ranges)
-         e2e/rewind_probe.py             71 browser assertions over three fixtures
+         e2e/rewind_probe.py             browser assertions over four fixtures (Style A)
+         e2e/flow_style_b_probe.py       browser assertions over the live sessions (Style B)
+         e2e/flow_check.py               the flow projection, session by session (HTTP)
 ```
 
 ## 1. Kernel semantics this view mirrors
@@ -181,6 +188,116 @@ there. Errors keep the dialog open with a red line.
 card's own log line (`hist_oldest_line + card index`) and opens the same
 dialog.
 
+## 3b. The second style: the flow scene (Style B, v0.5.63–v0.5.66)
+
+The History view has two styles, switched from the top bar
+(`#hist-style` in `#hist-top`). They are **one tree read two ways**: same
+fetch (`register_tree_effect`), same cache (`state.rewind_tree`), same
+invalidation (`rewind_gen`). Style B simply ignores nothing and Style A
+ignores `flow`; the default is the list (**D2**), and the choice is persisted
+under `rushi-rw-view` — a plugin-owned key.
+
+```
+[ list | flow ]   ← #hist-style, persisted in localStorage 'rushi-rw-view'
+                   list = §3 above (full height, recursive)
+                   flow = #rw-split → 1 : 2  (D3 — flow only)
+                          ├─ #rw-detail   the selected round, in full (D8)
+                          └─ #rw-flow     the scene (D1, D4–D7, D9)
+```
+
+### 3b.1 The projection (server, pure, tested)
+
+`rewind::flow(&tree)` turns the same `RewindTree` into a flat, render-ready
+scene. Nothing about it is client-side, because the client crate cannot be
+unit-tested (`cargo test -p rushi-web-ui` does not build for the host):
+
+* **the main line** — the longest chain over the whole tree, ties to the
+  chain holding the current node, then leftmost (D1). An abandoned branch can
+  therefore *be* the line, and the current node then sits on a fork;
+* `x` = the column along the line, `lane` = the row offset (alternating
+  ±1 on each side so two branches never collide), `cols`/`lanes`/`main_len`
+  for the CSS;
+* `edges` — one per parent→child step, `main` for the ones on the line;
+* `branches` — one per off-line chain, with the column it hinges at (and
+  `lane 0` is the line itself, which the runs already draw);
+* `state` — `active` / `abandoned`, straight from the kernel's mask, so the
+  live path is lit and the abandoned branch is dim (**D1**).
+
+`GET /api/sessions/{id}/rewind/node/{seq}` (B2) serves **one round in full**
+— the verbatim user message, the event counts, the badges, never a summary —
+and 404s for a seq that is not a round (**D8**). It is fetched on selection
+and preferred over the node in the tree, so the panel is exact even while the
+detail request is in flight.
+
+### 3b.2 The scene
+
+* one `button.rw3-node` per round: `data-seq/x/lane/main/current`, a dot and
+  the round number, a native `title` tooltip — **no text in the graph**
+  (**D6**); a dot only ever **selects**, it never rewinds;
+* the line as `.rw3-seg.main` runs, a fork as `.rw3-elbow` (at the child's
+  lane) plus a `.rw3-hinge` (bridging the parent's lane to the child's —
+  omitted when a nested fork shares its lane, which would be a zero-height
+  hinge);
+* every run a dot is *fed* by is lit or dim by the **child's** state;
+* **auto-fit** (D4): the column pitch is `clamp(26px, 100cqw / cols - 4px,
+  64px)`, so a short line fills the panel and a long one gets the floor and
+  pans; the lane pitch is a **percentage of the scene's own height**
+  (`calc(50% / (lanes + 0.5))`), so every lane always fits one screen;
+* `#rw-flow-scroll` scrolls **x only** (`overflow-x: auto`,
+  `overflow-y: hidden`, scrollbar hidden): drag-to-pan on empty space (never
+  on a dot) and **the wheel's vertical delta** pan along the line, while a
+  horizontal delta — or shift+wheel — stays the browser's own x-scroll
+  (**D7**: one gesture, one meaning, never doubled);
+* **the light** (D9): `#rw-flow-track` carries the `perspective`, the grid
+  `preserve-3d` (the *scroller* must not be the perspective element — an
+  `overflow` ancestor flattens 3D), one translucent `.rw3-ribbon` per forking
+  branch, and one sticky `.rw3-sheen` band pinned to the panel that the scene
+  slides under. The dots and runs are never transformed, so labels stay
+  upright. Where the browser has it, `animation-timeline: view(x)` drives the
+  turn on the compositor; otherwise (Firefox) — and in the CSS either way —
+  the turn is `rotateX` of a pure `calc()` over **plane numbers**:
+
+  ```css
+  --turn: clamp(-1, (var(--bx) - var(--rw-scroll) - var(--halfpw)) / var(--denom), 1);
+  transform: rotateX(calc(var(--turn) * 62deg));
+  ```
+
+  `--bx` (the ribbon's centre), `--halfpw` and `--denom` are written at
+  **layout** time (mount, tree change, selection, `resize`);
+  `rewind::mark_scroll` writes the **one** value a scroll frame updates
+  (`--rw-scroll`), from `on:wheel`, the drag and `on:scroll` — so nothing
+  reads layout while scrolling. `prefers-reduced-motion: reduce` sets
+  `transform: none`: a flat, static, readable scene.
+
+### 3b.3 The panel
+
+`#rw-detail` shows the selected round: its number, time, event count, badges
+(`here` / `off the path` / `retracted` / a compaction boundary / what a
+restore would load), and the user's message **verbatim** with `pre-wrap`. The
+`⟲ Rewind to this point` button is the *only* rewind entry point here (as in
+Style A, §4): it is disabled on the current round, when the loop runs, or
+when the target is blocked, and otherwise calls the same `request_rewind` →
+the same confirm dialog (§3's one confirm point). Entering the style
+pre-selects the **current** round (**D5**), so the panel is never empty and
+the button explains itself by being disabled.
+
+### 3b.4 Limits (measured, see §10.8 of the plan)
+
+* A scene that **fits** its panel has nothing to pan, so its branches keep
+  the static turn their position under the light implies (a short, forked
+  tree is the visible case). Long sessions pan and turn as designed.
+* **Style A's** recursive list renders one DOM level per round and traps the
+  wasm stack past roughly 32–80 rounds (`Webui` 117, `alpha` 82: the app
+  survives, the tree does not paint, the console shows
+  `RuntimeError: memory access out of bounds`). Style B draws all of them —
+  the flat projection is exactly why. Changing Style A's markup is a
+  decision, not done here.
+* Both rewind reads parse **past serde_json's 128-level limit**
+  (`api::parse_deep`, `unbounded_depth`): the tree nests one `children`
+  array per round, so without it every long session failed the parse and
+  History sat on "loading…" (v0.5.65 fixed this for four of the eight
+  sessions on this host).
+
 ## 4. Rewind is forbidden while the loop runs (decision 5)
 
 An in-flight turn would land inside the freshly-created branch (the kernel
@@ -261,11 +378,12 @@ abandoned rounds are still rendered.
 | Window vs. full log | The tree is the server's full-log projection; the card button uses `hist_oldest_line + index` for rendered cards only. |
 | No session / no rounds | "select a session" / "no rounds yet". |
 | Performance | One file read + parse per structure-changing event; a multi-MB log is a one-off parse. |
+| A very long chain (32+ rounds) | **Use the flow style.** The list style renders one DOM level per round and exhausts the wasm stack at roughly 32–80 rounds (the app survives, the tree does not paint, the console says `memory access out of bounds`); the flow style's flat projection draws every session measured here, up to 117 rounds. |
 
 ## 6. Verification
 
-* `cargo test -p rushi-web` — the projection against the kernel fixtures
-  (42 tests green).
+* `cargo test -p rushi-web` — the projection against the kernel fixtures,
+  the flow layout and the per-round detail (**65 tests green**).
 * `trunk build` — the Leptos CSR bundle.
 * `python3 e2e/rewind_probe.py [port]` — **140 browser + HTTP assertions**
   over four fixture sessions built by the probe
@@ -283,3 +401,20 @@ abandoned rounds are still rendered.
   dialog), the `#plugin-area` entry, the loop-running guard (with a live
   `loop.pid`: every node locked, no dialog, footer explains, card buttons
   disabled), the `409` refusals, the ignored markers and the tail notice.
+* `python3 e2e/flow_style_b_probe.py [port]` — **60 browser assertions**, the
+  Style B surfaces end to end on the live sessions: the switch and its
+  persistence; the 1:2 split and the x-only scroller; the scene (a dot per
+  round, runs and hinges on the right lane, the lit live path, lane geometry,
+  no dot overlap, the pitch floor and cap); the panel (D5 pre-select, the
+  verbatim text, the button inert on the current round, a click that selects
+  and opens **no** dialog); the button → the one dialog → cancel writes
+  nothing; the 117-round session (pan, wheel, a horizontal delta left
+  native); persistence and the list untouched afterwards; the 3D (a ribbon
+  per branch, a real `perspective` + `preserve-3d` context, the proxy's maths
+  checked against the computed transform at two offsets, flat under the
+  light, `prefers-reduced-motion` → no transform); and the **paint** —
+  accent pixels counted from real screenshots in the light *and* dark
+  palettes (this is what caught the missing `--lane` on the line's runs).
+* `python3 e2e/flow_check.py [port]` — the flow projection over every session
+  the server knows (`main` chain, cols/lanes, each node's column and lane,
+  the edge list): 8 sessions, 0 problems on this host.
