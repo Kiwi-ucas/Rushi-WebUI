@@ -454,6 +454,19 @@ wasm `cargo check` + `trunk build` (client), `e2e/rewind_probe.py` (CDP),
   (round · summary) — no text in the graph; the panel is the text surface.
 * **D7 wheel semantics**: wheel = rotate (via the scroll proxy); horizontal
   panning is drag (and shift+wheel), never a horizontal scrollbar.
+* **D8 (added 2026-10-03) where the full message text comes from**: either
+  **B2's per-node route** (`GET .../rewind/node/{seq}`, lazy + bounded, one
+  more request and a loading state per selection) or the **tree response
+  carries it** (simpler: no route, no `rw_detail` state, no loading flicker;
+  measured cost 4–47 KB per session, §10.6 finding 4 — a cap, e.g. 4 000
+  chars, keeps it bounded). **Recommended: carry it in the tree** and drop
+  B2's route.
+* **D9 (added 2026-10-03) how the 3D rotation is driven**: **CSS
+  scroll-driven animation (`animation-timeline: view(x)`) where supported,
+  the §10.7 scroll-proxy fallback elsewhere** (Firefox), and always a flat,
+  static view under `prefers-reduced-motion`. Chrome 115+/Safari 26+ get the
+  compositor-driven version for free (§10.6 finding 1); the proxy keeps one
+  code path alive for Firefox and doubles as the reduced-motion path.
 
 ### 10.5 Non-goals (v1)
 
@@ -461,6 +474,73 @@ No tree editing, no in-graph search/jump box, no manual zoom UI, no touch/
 pinch gestures (the webui is a desktop surface), no change to the kernel or
 to Style A's markup, and no new server-side truth: the flow layout is a
 *projection* of the same tree the kernel's `active_ranges` already proves.
+
+### 10.6 Refresh (2026-10-03 — the research re-run)
+
+**Status: plan only, no code yet.** §10 was written and committed as
+`b8b1d48` (*v0.5.60: plan — the rewind flow view (Style B)*) from the same
+request (this session's round 13, log seq 6670); the session then moved on to
+the rewind × compaction defect and to the loop-liveness fix. Verified while
+re-reading the tree today: **no Style-B code exists** — `Flow` / `main_chain`
+/ `lane` are absent from `bin/rushi-web/src/rewind.rs`, `rw_view` /
+`flow_view` / `rw_selected` from `web-leptos/src/`, and `e2e/rewind_probe.py`
+mentions only `overflowY`. B1–B9 are all still open.
+
+Four findings that change or firm up §10:
+
+1. **Browser support — resolved (was "contested").** MDN browser-compat-data
+   (`css/properties/animation-timeline`, read 2026-10-03): `scroll()` and
+   `view()` are **Chrome/Edge 115+**, **Safari 26+**, **Firefox `preview`**
+   (behind a flag). §10.1.2's "Safari's status is contested, WebKit's own
+   tracking issue is still open" is stale — Safari 26 shipped it. So the
+   compositor-driven path is available on every browser the probes drive plus
+   Safari, and only Firefox needs the proxy → **D9**.
+2. **The `preserve-3d` flattening rule is confirmed verbatim** (MDN
+   `transform-style`): *"grouping property values … force the element to have
+   a used value of `transform-style: flat`, even when `preserve-3d` is
+   specified"* — and `overflow` ≠ `visible` is one of them. §10.1.3's DOM
+   constraint (the scroller must **not** be the perspective element; the
+   perspective lives on a `position: sticky` viewport inside it) is therefore
+   load-bearing design, not a micro-optimisation. Keep it.
+3. **Real tree shapes — what the new style will actually be drawn from**
+   (live server on :8480 + the probe fixtures):
+
+   | tree | rounds | rewinds | shape |
+   |---|---|---|---|
+   | `Time inject` | 11 | 1 | spine **8** nodes; **one 3-node abandoned branch** forking off round 5 (seq 2114) — the only real fork available in the wild |
+   | `rewindprobe` (probe fixture) | 4 | 1 | spine `r1,r2,r4` (3); abandoned `r3` forking off `r2` — the deterministic DOM/geometry fixture |
+   | **`rewind` (this session)** | 30 | 4 | a **straight 30-node line**: all four markers are `ignored` by the P4 pair-stranding guard (`tree.ignored` = 4), so no fork to look at here |
+   | `Webui` / `alpha` | 117 / 82 | 0 | straight lines, the long-session stress cases (17 k / 26 k log lines) |
+
+   Practical consequence: **check the visuals on `Time inject` and the probe
+   fixtures**, not on this session — and add a probe fixture whose spine is
+   *shorter* than an abandoned branch, because that is the case D1 is about.
+4. **D8 measured**: the full user-message text of a whole session is **4 KB
+   (27 rounds) / 47 KB (117 rounds)** — avg 85–403 B/round, longest single
+   message 1.2 KB — against `events.jsonl` files of 16–29 MB. The tree
+   response is refetched only on a structural WS frame, so carrying the text
+   in the tree costs ~0.05 % of the transcript the client already loads in
+   full for the chat view. That is what makes D8's "carry it in the tree"
+   recommendation cheap.
+
+### 10.7 Why the wheel drives a CSS variable (not `scroll-behavior`, not JS transforms)
+
+Kept from the original design, restated because D9 makes the native path
+primary:
+
+* The scene's rotation is a **pure function of the scroll offset** of one
+  scroll container, so it can be expressed as a CSS animation on a scroll
+  timeline (`view(x)` / `scroll(x)`) — the compositor interpolates it, no
+  per-frame main-thread work, and native momentum scrolling keeps working.
+* The fallback for browsers without the timeline (Firefox today) is **one
+  `on:scroll` handler writing one custom property** (`--rw-t`) on the scene
+  element: a single style-invalidation, no layout read, no per-node work.
+  It is also the `prefers-reduced-motion` path (write `--rw-t = 0` once, so
+  the scene is flat and static).
+* Nothing reads layout inside the handler (no `getBoundingClientRect`, no
+  scroll-height math per frame) — that is the failure mode that makes
+  scroll-driven scenes janky, and the one the `full_fetch_probe.py` timeline
+  would catch.
 
 ## 11. Rewind × compaction — the plugin side (plan, 2026-10-03)
 
