@@ -616,10 +616,120 @@ impl LoopManager {
     }
 }
 
-/// Signal-0 liveness probe. Public so the loop-state endpoint can
+/// Liveness probe for a loop pid. Public so the loop-state endpoint can
 /// check a `loop.pid` left by a previous server instance or the TUI.
+///
+/// `kill(pid, 0)` alone answers "does anything still hold this pid slot?",
+/// which is **also true for a zombie** — a process that has died but whose
+/// parent has not `wait()`ed for it yet. That matters here because the
+/// webui can `stop()` a loop it did not start: it signals the process group
+/// read out of `loop.pid`, and nothing in this server owns that child, so
+/// nobody reaps it on our behalf. A zombie in that window is not a running
+/// loop, and reporting it as one sticks the whole UI: `▶ start` never comes
+/// back, `/api/sessions/{id}/loop` keeps saying running, the rewind guard
+/// stays on and `/loop/viewed` never cleans the stale `loop.pid`
+/// (v0.5.58).
+///
+/// So the probe is `kill(pid, 0)` **and not a zombie** ([`is_zombie`]).
+/// Loops this server started are children with a waiter task
+/// ([`LoopManager::start`]), so they are reaped within milliseconds and the
+/// distinction never shows; for a loop started elsewhere (the TUI, a
+/// previous server instance) it is the difference between "stopped" and
+/// "stuck".
 pub fn is_pid_alive(pid: u32) -> bool {
-    unsafe { libc::kill(pid as i32, 0) == 0 }
+    if pid == 0 {
+        return false;
+    }
+    let signalled = unsafe { libc::kill(pid as i32, 0) } == 0;
+    signalled && !is_zombie(pid)
+}
+
+/// Whether `pid` is a zombie: dead, but still occupying its pid slot
+/// because its parent has not reaped it. Only called when the signal-0
+/// probe already succeeded.
+///
+/// macOS: `proc_pidinfo(PROC_PIDTBSDINFO)` reports the BSD process state
+/// (`SZOMB`). Linux: `/proc/<pid>/stat`'s third field. Anywhere else (and
+/// on any odd reply from the OS) this says "not a zombie", i.e. exactly the
+/// pre-v0.5.58 behaviour — a false "alive" only delays a lamp, never kills
+/// anything.
+#[cfg(target_os = "linux")]
+fn is_zombie(pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false; // gone (or unreadable) → leave it to the signal probe
+    };
+    matches!(stat_state(&stat), Some('Z') | Some('X'))
+}
+
+/// The process-state field of a `/proc/<pid>/stat` line: `pid (comm) STATE …`.
+///
+/// `comm` is the raw executable name and **may contain spaces and
+/// parentheses**, so the parse starts after the LAST `)` — the kernel's own
+/// documented caveat. `None` when the line is truncated or anonymous.
+///
+/// Compiled on Linux for real use, and on every platform under `test` so the
+/// parse itself is covered where the platform path cannot run.
+#[cfg(any(target_os = "linux", test))]
+fn stat_state(line: &str) -> Option<char> {
+    let (_, rest) = line.rsplit_once(')')?;
+    rest.split_whitespace().next().and_then(|f| f.chars().next())
+}
+
+#[cfg(target_os = "macos")]
+fn is_zombie(pid: u32) -> bool {
+    // `sysctl(KERN_PROC, KERN_PROC_PID)` — the interface `ps` reads — is the
+    // one that still describes a zombie. `proc_pidinfo(PROC_PIDTBSDINFO)`
+    // (and `PROC_PIDT_SHORTBSDINFO`) return 0/ESRCH for a zombie on macOS,
+    // so it cannot answer this question at all (measured on Darwin 24).
+    //
+    // The reply is a `struct kinfo_proc`; the byte we need is its very first
+    // field's successor:
+    //
+    //   struct extern_proc {           /* kinfo_proc.kp_proc */
+    //       union { ... } p_un;        /* +0  (two pointers / timeval, 16) */
+    //       struct vmspace *p_vmspace; /* +16 */
+    //       struct sigacts *p_sigacts; /* +24 */
+    //       int p_flag;                /* +32 */
+    //       char p_stat;               /* +36  ← the process state */
+    //       ...
+    //
+    // `kinfo_proc`'s prefix is frozen ABI (`ps`, `top` and every process
+    // monitor depend on it), and `a_zombie_is_not_alive` in this module's
+    // tests is the canary: it fails loudly if this offset ever stops
+    // meaning "state". `SZOMB` is the value we look for.
+    const P_STAT_OFFSET: usize = 36;
+    const KINFO_PROC_MAX: usize = 1024; // sizeof(kinfo_proc) is 648 today
+
+    let mut mib: [libc::c_int; 4] = [
+        libc::CTL_KERN,
+        libc::KERN_PROC,
+        libc::KERN_PROC_PID,
+        pid as libc::c_int,
+    ];
+    let mut buf = [0u8; KINFO_PROC_MAX];
+    let mut len = buf.len();
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    // Any failure (or a reply too short to hold the field: an unknown pid
+    // gives len == 0) means "nothing to conclude" — report "not a zombie",
+    // i.e. keep the plain signal-0 answer.
+    if rc != 0 || len <= P_STAT_OFFSET {
+        return false;
+    }
+    buf[P_STAT_OFFSET] as u32 == libc::SZOMB
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn is_zombie(_pid: u32) -> bool {
+    false
 }
 
 /// Read the last `max_bytes` of a file (the loop's `loop.stderr`
@@ -678,5 +788,73 @@ mod tests {
         // never panic.
         let path = session_config_path(Path::new("config.toml"), "s1");
         assert_eq!(path, Path::new("config.session.s1.toml"));
+    }
+
+    /// v0.5.58: a zombie is NOT a live loop.
+    ///
+    /// The child below exits immediately and is deliberately never reaped,
+    /// which is exactly the state a loop started elsewhere sits in between
+    /// our `kill(-pid)` and its real parent's `wait()`. `kill(pid, 0)`
+    /// still succeeds (the pid slot is held), so the old probe called it
+    /// alive and the webui stayed stuck on "running".
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_zombie_is_not_alive() {
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .expect("spawn a short-lived child");
+        let pid = child.id();
+
+        // Wait for the process to actually die (without reaping it: that is
+        // what `waitpid` would do, and it would destroy the state under
+        // test).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !is_zombie(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(is_zombie(pid), "the child never reached the zombie state");
+        assert_eq!(
+            unsafe { libc::kill(pid as i32, 0) },
+            0,
+            "a zombie still holds its pid slot — this is why signal 0 alone is not enough"
+        );
+        assert!(
+            !is_pid_alive(pid),
+            "a zombie must not be reported as a live loop"
+        );
+
+        let _ = child.wait(); // reap, so nothing is left behind
+    }
+
+    /// The Linux branch's parse, exercised anywhere (the platform call is
+    /// `read_to_string`, so this is the whole of its logic).
+    #[test]
+    fn stat_state_reads_the_linux_state_field() {
+        assert_eq!(stat_state("1234 (bash) S 1 1234 1234 0 -1 4194560"), Some('S'));
+        assert_eq!(stat_state("9 (sleep) Z 1 9 9 0 -1 0"), Some('Z'));
+        // comm with spaces AND parentheses (the reason for the last-')' rule)
+        assert_eq!(stat_state("77 (a (weird) name) Z 1 77"), Some('Z'));
+        assert_eq!(stat_state("77 (sneaky) name) R 1 77"), Some('R'));
+        assert_eq!(stat_state("no parens at all"), None);
+        assert_eq!(stat_state("77 () "), None);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_live_process_is_alive() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a sleeping child");
+        assert!(
+            is_pid_alive(child.id()),
+            "a running child must be reported alive"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(is_pid_alive(std::process::id()), "we are alive");
+        assert!(!is_pid_alive(0), "pid 0 is never a loop");
     }
 }

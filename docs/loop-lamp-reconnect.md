@@ -191,3 +191,51 @@ before closing does not re-light its green lamp on the next open.
 - **Scope:** P0 (running lamps survive reload) + P1 (finished lamps
   survive close/reopen) are done. P2 (persist `active_session` + a
   cross-reload viewed marker) remains optional.
+
+---
+
+## v0.5.58 — the liveness probe must not count a zombie
+
+Found while building the rewind plugin's loop toggle probe (a `■ stop` click
+against a fixture whose `loop.pid` points at a `sleep` started by the probe).
+
+`process::is_pid_alive` — the single gate for "is this loop still running?",
+used by `start()`'s restart guard, `is_running`, `running_sessions`, the
+orphan sweep, `get_loop` and `/loop/viewed`'s stale-`loop.pid` cleanup — was
+`kill(pid, 0) == 0`. **That is also true for a zombie**: a process that has
+died but whose parent has not `wait()`ed for it still holds its pid slot.
+The webui can `stop()` a loop it did not start (`loop.pid` from the TUI or a
+previous server instance) and nothing in this server owns that child, so
+nobody reaps it on our behalf — during that window the session looked
+permanently *running*: `▶ start` never came back, `/api/sessions/{id}/loop`
+kept saying running, the rewind guard stayed on, and `/loop/viewed` never
+cleaned the stale `loop.pid`.
+
+`is_pid_alive` is now `kill(pid, 0) && !is_zombie(pid)`:
+
+| platform | how the state is read | verified by |
+|---|---|---|
+| Linux | `/proc/<pid>/stat`, after the last `)` — `Z` (or `X`) | `stat_state_reads_the_linux_state_field` (the parse is platform-independent, so it runs everywhere) + a `cargo check --target x86_64-unknown-linux-gnu` of the branch (a full cross-check of the crate needs a cross C compiler for the dep tree, so the branch was type-checked in an isolated crate with the same code) |
+| macOS | `sysctl(KERN_PROC, KERN_PROC_PID)` → `kinfo_proc`, byte 36 = `p_stat`, compared with `SZOMB` | `a_zombie_is_not_alive` / `a_live_process_is_alive` (real processes) |
+| other | no answer → keep the plain signal-0 result (the pre-v0.5.58 behaviour) | — |
+
+Two notes worth keeping:
+
+- **`proc_pidinfo` cannot see zombies.** `PROC_PIDTBSDINFO` *and*
+  `PROC_PIDT_SHORTBSDINFO` both return `0`/`ESRCH` for a zombie on Darwin 24
+  (measured), so the obvious API is the wrong one here; `sysctl` is what
+  `ps` itself reads.
+- The macOS path depends on a **byte offset** into the kernel's frozen
+  `kinfo_proc` prefix (`extern_proc`: `p_un` 16 + `p_vmspace` 8 +
+  `p_sigacts` 8 + `p_flag` 4 → `p_stat` at 36). `process::tests::
+  a_zombie_is_not_alive` is the canary: it spawns a child, never reaps it,
+  and requires the probe to call it dead — if that offset ever stops
+  meaning "state", the test fails loudly instead of silently regressing to
+  "everything looks alive".
+
+Verified: `cargo test -p rushi-web` 45 passed — "a zombie is not alive"
+(spawns a child, never reaps it, asserts signal 0 still succeeds *and* the
+probe calls it dead), "a live process is alive", and the Linux parse. The
+browser probe drives a real `■ stop` against an unreaped fake loop and asserts
+`/api/loops` drops the session (110 checks; reverting the fix fails exactly
+those two checks — mutation-tested).
