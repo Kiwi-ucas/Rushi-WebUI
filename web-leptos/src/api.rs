@@ -358,13 +358,32 @@ pub async fn load_rewind_tree(id: &str) -> Result<crate::model::RewindTree, Stri
 /// Rewind plugin: write a `rewind` marker. `mode:"on"` keeps the target user
 /// message as the active tail and abandons everything after it; the fork
 /// stays in the log and can be re-entered later.
-pub async fn post_rewind(id: &str, target_seq: u64, mode: &str) -> Result<(), String> {
+pub async fn post_rewind(
+    id: &str,
+    target_seq: u64,
+    mode: &str,
+) -> Result<crate::model::RewindVerdict, String> {
     let payload = json!({ "target_seq": target_seq, "mode": mode });
-    let status = post_json(&format!("/api/sessions/{id}/rewind"), &payload).await?;
-    if status >= 400 {
-        Err(format!("rewind failed: HTTP {status}"))
-    } else {
-        Ok(())
+    let res = Request::post(&format!("/api/sessions/{id}/rewind"))
+        .json(&payload)
+        .map_err(|e| e.to_string())?
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let status = res.status();
+    let text = res.text().await.map_err(|e| e.to_string())?;
+    // The R1 pre-check rides back with the response: the kernel itself
+    // never refuses a marker, so the server answers what its projection
+    // would do with it (plan 11.1/11.2). 409 = the pick was refused
+    // (the verdict still parses, so the dialog shows the notice).
+    let verdict = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| v.get("verdict").cloned())
+        .and_then(|v| serde_json::from_value(v).ok());
+    match verdict {
+        Some(v) => Ok(v),
+        None if status >= 400 => Err(format!("rewind failed: HTTP {status}")),
+        None => Ok(crate::model::RewindVerdict::Ok),
     }
 }
 

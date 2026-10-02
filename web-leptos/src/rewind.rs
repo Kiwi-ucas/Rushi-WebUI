@@ -24,7 +24,7 @@ use leptos::task::spawn_local;
 use web_sys::MouseEvent;
 
 use crate::api;
-use crate::model::{AppState, RewindNode, RewindTarget, SessionInfo};
+use crate::model::{AppState, Restore, RewindNode, RewindTarget, SessionInfo};
 use crate::timeutil;
 
 /// Whether a rewind targeting `session` is allowed right now. Never while
@@ -290,6 +290,9 @@ fn node_view(state: AppState, sess: String, node: RewindNode) -> AnyView {
     let current = node.current;
     let retracted = node.retracted;
     let kids = node.children.clone();
+    let restore = node.restore.clone();
+    let blocked = restore.blocked();
+    let restore_label = restore.label();
 
     let sess_cls = sess.clone();
     let node_cls = move || {
@@ -303,11 +306,15 @@ fn node_view(state: AppState, sess: String, node: RewindNode) -> AnyView {
         if !rewind_allowed(state, &sess_cls) {
             c.push_str(" locked");
         }
+        if blocked {
+            c.push_str(" unresumable");
+        }
         c
     };
     let sess_title = sess.clone();
     let ts_title = ts.clone();
     let state_title = node.state.clone();
+    let restore_title = restore_label.clone();
     let title = move || {
         let head = format!(
             "round {round} \u{00b7} {ts_title} \u{00b7} {events} event{} \u{00b7} {state_title}",
@@ -315,10 +322,14 @@ fn node_view(state: AppState, sess: String, node: RewindNode) -> AnyView {
         );
         if !rewind_allowed(state, &sess_title) {
             format!("{head} \u{2014} rewind is disabled while the loop is running")
+        } else if blocked {
+            format!("{head} \u{2014} this point cannot be resumed: it would strand a tool call")
         } else if current {
-            format!("{head} \u{2014} you are here")
+            format!("{head} \u{2014} you are here \u{00b7} resumes from {restore_title}")
         } else {
-            format!("{head} \u{2014} click to rewind to this point")
+            format!(
+                "{head} \u{2014} resumes from {restore_title} \u{2014} click to rewind to this point"
+            )
         }
     };
     let label = format!("round {round} \u{00b7} {summary}");
@@ -335,6 +346,12 @@ fn node_view(state: AppState, sess: String, node: RewindNode) -> AnyView {
     } else {
         ().into_any()
     };
+    let warn: AnyView = if blocked {
+        view! { <span class="rw-badge-warn">{ "not resumable" }</span> }.into_any()
+    } else {
+        ().into_any()
+    };
+    let restore_text = restore_label.clone();
 
     view! {
         <div class=node_cls data-seq=seq.to_string() data-round=round.to_string()>
@@ -343,9 +360,11 @@ fn node_view(state: AppState, sess: String, node: RewindNode) -> AnyView {
                 <span class="rw-round">{ format!("round {round}") }</span>
                 <span class="rw-sum">{ summary.clone() }</span>
                 { badge }
+                { warn }
                 <span class="rw-meta">
                     { format!("{events} event{}", if events == 1 { "" } else { "s" }) }
                 </span>
+                <span class="rw-restore">{ restore_text }</span>
                 <span class="rw-time">{ ts.clone() }</span>
                 <Show when=move || current fallback=|| ()>
                     <span class="rw-here">{ "here" }</span>
@@ -367,12 +386,34 @@ fn node_view(state: AppState, sess: String, node: RewindNode) -> AnyView {
 pub fn rewind_confirm_dialog(state: AppState) -> AnyView {
     let open = state.rewind_pending;
     let err = RwSignal::new(Option::<String>::None);
+    // The post-hoc notice: the marker landed but the kernel's
+    // projection will drop it (the response verdict, D-C).
+    let warn = RwSignal::new(Option::<String>::None);
 
     let close = move || {
         crate::ui::after_dispatch(move || {
             open.set(None);
             err.set(None);
+            warn.set(None);
         });
+    };
+
+    // R3: what this node restores (the tree's annotation), and whether
+    // the pick must be refused (the kernel would ignore the marker).
+    let restore = move || {
+        let seq = open.get().map(|t| t.seq)?;
+        state.rewind_tree.get()?.restore_at(seq)
+    };
+    let blocked = move || restore().map(|r| r.blocked()).unwrap_or(false);
+    let restore_note = move || match restore() {
+        Some(r) if r.blocked() => match r {
+            Restore::Unresumable { missing } => format!(
+                "This point cannot be resumed: the context it restores would leave tool call `{missing}` without its result, so the loop would ignore the rewind. Pick the round's first message instead."
+            ),
+            _ => String::new(),
+        },
+        Some(r) => format!("The context resumes from {}.", r.label()),
+        None => String::new(),
     };
 
     let confirm = move |_| {
@@ -387,14 +428,30 @@ pub fn rewind_confirm_dialog(state: AppState) -> AnyView {
             err.set(Some("the loop is running".to_string()));
             return;
         }
+        // The pre-check in the tree: a pick the kernel would ignore is
+        // refused before the write (plan 11.1/11.2).
+        if blocked() {
+            return;
+        }
+        warn.set(None);
         spawn_local(async move {
             match api::post_rewind(&sess, t.seq, "on").await {
-                Ok(()) => {
+                Ok(verdict) => {
                     state.rewind_gen.update(|g| *g += 1);
-                    crate::ui::after_dispatch(move || {
-                        open.set(None);
-                        err.set(None);
-                    });
+                    match verdict.notice() {
+                        // The marker landed but the kernel's projection
+                        // drops it: say so and stay open (D-C). The
+                        // user can pick another round.
+                        Some(n) => crate::ui::after_dispatch(move || {
+                            warn.set(Some(n));
+                            err.set(None);
+                        }),
+                        None => crate::ui::after_dispatch(move || {
+                            open.set(None);
+                            err.set(None);
+                            warn.set(None);
+                        }),
+                    }
                 }
                 Err(e) => err.set(Some(e)),
             }
@@ -414,12 +471,19 @@ pub fn rewind_confirm_dialog(state: AppState) -> AnyView {
                             </div>
                         </div>
                     }) }
+                    { move || {
+                        let note = restore_note();
+                        (!note.is_empty()).then(|| view! {
+                            <div class="rw-restore-note" class:rw-block=blocked()>{ note }</div>
+                        })
+                    } }
                     { move || err.get().map(|e| view! { <div class="rw-err">{ e }</div> }) }
+                    { move || warn.get().map(|w| view! { <div class="rw-warn">{ w }</div> }) }
                     <div class="rw-actions">
                         <button class="ns-btn ns-cancel" on:click=move |_| close()>{ "Cancel" }</button>
                         <button
                             class="ns-btn ns-danger"
-                            disabled=move || match state.active_session.get() {
+                            disabled=move || blocked() || match state.active_session.get() {
                                 Some(s) => !rewind_allowed(state, &s),
                                 None => true,
                             }
@@ -449,11 +513,18 @@ pub fn quick_rewind_button(state: AppState, card_seq: u64, excerpt: String) -> A
             .map(|s| !rewind_allowed(state, &s))
             .unwrap_or(true)
     };
+    // R1/R3: the tree's annotation for this card's line, when the tree
+    // has it (a card outside the tree — an edited log — stays pickable
+    // and the dialog's post-hoc notice covers it).
+    let restore = move || state.rewind_tree.get()?.restore_at(card_seq);
+    let blocked = move || restore().map(|r| r.blocked()).unwrap_or(false);
     let title = move || {
         if locked() {
             "rewind is disabled while the loop is running".to_string()
         } else if at_tail() {
             "you are already here".to_string()
+        } else if blocked() {
+            "this point cannot be resumed: it would strand a tool call".to_string()
         } else {
             "rewind to this message".to_string()
         }
@@ -511,7 +582,11 @@ pub fn rewind_plugin_view(state: AppState) -> AnyView {
                     let n = t.total_rounds;
                     let a = t.active_rounds();
                     let ab = t.abandoned_rounds();
+                    let notice = t.tail_ignored.as_ref().map(|m| m.notice());
                     view! {
+                        { notice.map(|msg| view! {
+                            <div class="rewind-notice">{ msg }</div>
+                        }) }
                         <div class="rewind-meta">
                             { format!("{n} rounds \u{00b7} {a} active \u{00b7} {ab} abandoned") }
                         </div>

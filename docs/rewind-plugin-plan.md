@@ -461,3 +461,208 @@ No tree editing, no in-graph search/jump box, no manual zoom UI, no touch/
 pinch gestures (the webui is a desktop surface), no change to the kernel or
 to Style A's markup, and no new server-side truth: the flow layout is a
 *projection* of the same tree the kernel's `active_ranges` already proves.
+
+## 11. Rewind × compaction — the plugin side (plan, 2026-10-03)
+
+Context: the kernel defect this plan depends on is fixed in
+`rushi/docs/rewind-fork-design.md` section 11. Before that fix, a rewind
+past a compaction boundary that was created *inside* the branch being
+abandoned did two wrong things (measured on this session): the framing
+item was the abandoned branch's handoff (`handoff/v4.md`) and every
+active event was dropped, so the model resumed with no history and with
+a summary of the branch the user had just left. With the fix the
+projection uses the boundary on the active path: the history comes back
+raw and the framing is the handoff in force at the target.
+
+The plugin itself was correct — it appends one marker and renders the
+tree — but it was silent about three things the user needs to see. This
+section is the plan for those.
+
+### 11.1 R1 — the server-side pre-check (pure, tested)
+
+`bin/rushi-web/src/rewind.rs` already mirrors the kernel's
+`active_ranges` (with the oracle test asserting equality). Add the same
+treatment for the two guards the kernel applies *after* the mask:
+
+```rust
+/// Would the kernel ignore the marker this pick would append?
+/// The P4 pair-stranding rule (docs/rewind-fork-design.md I3/P4) and
+/// the settled-target rule (section 7) evaluated over the projected
+/// context, i.e. exactly what `bin/assemble` decides.
+pub fn rewind_verdict(events: &[Value], target_seq: u64, mode: &str)
+    -> RewindVerdict;   // Ok / StrandsPair{missing} / NotSettled{...} / TargetMasked
+```
+
+- Pure function over the event slice: no I/O, so `cargo test -p
+  rushi-web` covers it (the client crate cannot be host-tested — the
+  reason the tree is server-side in the first place).
+- Tests: a target mid-step (steer message) strands a call → `StrandsPair`;
+  a settled `user_message` target is `Ok`; a target that is itself
+  masked (inside an abandoned span) is `TargetMasked`; an
+  `assistant_message` with outstanding calls is `NotSettled`.
+
+**Implemented (v0.5.61)** — `rewind_verdict(events, target_seq, mode)`,
+`verdict_with(..)` (the tree supplies its parsed markers/boundaries) and
+`strands_pair(&[&Value])`, a port of the kernel's
+`context_strands_pairs` (`bin/assemble/src/main.rs`), over the kept
+region the *kernel's* rule selects (the boundary on the active path,
+then the active ranges, then `seq >= first_kept_seq`).
+
+Two deviations from the sketch, both recorded rather than silently
+taken:
+
+- **`TargetMasked` is not a verdict.** A target inside an abandoned
+  span is a perfectly good pick — re-entering an abandoned branch is
+  case C of the design doc, and the tree already shows that node as
+  `abandoned`. The verdict answers one question only: *would the
+  kernel's projection drop the marker?* A masked target is answered by
+  the same strand test as any other.
+- **`POST …/rewind` refuses with `409 Conflict` + the verdict in the
+  body** (`{"ok":false,"verdict":…}`) and writes nothing; `200` means
+  the marker landed. The low-level WS command path
+  (`{"kind":"rewind"}`) stays permissive — it is the TUI-compatible
+  transport, the kernel itself accepts every marker there, and that is
+  exactly the case the post-hoc notice (11.2) exists for.
+- `POST /api/sessions/{id}/rewind` runs it before appending. The
+  verdict rides back in the response (and is exposed read-only in the
+  tree projection so the client can disable the node without a POST).
+
+Decision (user, 2026-10-03, D-C): a rewind that will not take effect
+must produce a notice. The plan is **block at the node (pre-check) and
+still notify after the fact** (11.2) — the pre-check cannot be perfect
+(the log is hand-editable), so the post-hoc path stays.
+
+### 11.2 R2 — the notice
+
+Two surfaces, one message each:
+
+- **Pre-dialog**: the confirm dialog names the consequence before the
+  marker lands — e.g. *"This point sits inside the branch the previous
+  rewind abandoned; the model will resume from the handoff in force
+  there."* or, for a stranded pair, *"…would leave a tool call without
+  its result, so the loop ignores it. Pick the round's first message
+  instead."* with the buttons unchanged (Cancel / Rewind).
+- **Post-hoc**: after a rewind, if the kernel ignored the marker, the
+  plugin area shows it. The reliable source is the kernel, not a
+  re-run of R1 in the client: the kernel already prints
+  `assemble: ignoring rewind at seq N (target seq T): …` on stderr of
+  the *loop*, which the webui cannot read. Two options:
+
+  | option | mechanism | cost |
+  |---|---|---|
+  | A | the loop appends an `ext_status` marker (`id = "rewind.ignored"`, value = the marker seq/target) when `mask_active_path` drops a marker | one small kernel change, visible in the TUI too |
+  | B | the webui re-evaluates R1 over the log after the loop runs and flags a disagreement | no kernel change, one re-implementation (already needed for R1) |
+
+  Recommendation: **A**, with R1 as the pre-flight predictor. A is a
+  3-line addition next to the existing `eprintln!` in `bin/assemble`,
+  and it makes "did my rewind take effect" a fact in the log rather
+  than an inference.
+
+  **Implemented: B** (v0.5.61). B is the same rule as R1, which had to
+  be written anyway, and it lives in the server module where
+  `cargo test -p rushi-web` covers it — the kernel stays untouched for
+  a client-side concern (the kernel-side `eprintln!` remains the
+  loop's own record). The tree gains `ignored: [{seq, target_seq,
+  mode, missing}]` (outermost first, a port of `mask_active_path`'s
+  pop loop) and `tail_ignored: Option<IgnoredMarker>` — the log's last
+  marker *is* one the kernel dropped, i.e. "your last rewind did not
+  take effect". The plugin area renders it; `settled` becomes false
+  for that log (the tail marker did not move the cursor).
+
+  **One consequence that was easy to miss**, and is a real defect
+  class of its own: a dropped marker must not move the tree's cursor.
+  Before v0.5.61 `build()` let *every* marker move the cursor, so a
+  log whose tail marker the kernel ignores showed a "you are here"
+  one round too far back — the tree disagreed with the projection.
+  The scan now skips the dropped markers (`ignored_markers` is
+  computed once, before the scan) and the active path, the round
+  states and every annotation come from the markers that survive.
+  `a_dropped_marker_does_not_move_the_tree_cursor` pins it.
+
+### 11.3 R3 — the node annotation ("what will be restored")
+
+The tree projection gains one field per node:
+
+```rust
+/// How the context at this node is reconstructed (kernel rule,
+/// docs/rewind-fork-design.md section 11).
+pub enum Restore {
+    Raw,                       // no boundary on the active path at this seq
+    Framed { version: u64, from_seq: u64, to_seq: u64 },  // handoff vN + raw from_seq..to_seq
+    Unresumable,               // the marker would be ignored (R1 verdict)
+}
+```
+
+- Computed server-side from the same helper the kernel uses (the
+  boundary on the active path), so the annotation is provably the kernel's
+  answer rather than the client's guess.
+- Rendered in the expanded view's node detail (top panel of Style B,
+  and the tree's detail line for Style A): *"Resume: raw 1..x"* or
+  *"Resume: handoff v3 + raw 6211..x"*.
+- This is the user-visible form of D-D: a rewind to a round before the
+  last compaction shows `Raw`, and the earlier rounds really are rebuilt
+  from their original events.
+
+**Implemented (v0.5.61)** — `Restore { Raw | Framed{version, from_seq,
+to_seq} | Unresumable{missing} }` per node, from `restore_with` (one
+parse of the markers/boundaries for the whole tree). Client:
+
+- every node carries a `.rw-restore` detail ("raw history", "handoff v1
+  + raw 1..4") and its tooltip ends in *", resumes from …"*;
+- an `Unresumable` node gets the `.unresumable` class and a
+  `not resumable` badge;
+- the dialog names the source before the write (*"The context resumes
+  from handoff v1 + raw 1..4."*), and for a blocked pick it explains
+  the strand and **disables Rewind** — the dialog still opens, because
+  a dead click tells the user nothing (the pick is refused by the
+  dialog, not by silence).
+
+### 11.4 R4 — probes, mirrors, docs
+
+- `e2e/rewind_probe.py` (110 checks today, local-only per the account
+  rule) gains:
+  - a fixture whose log has a boundary inside an abandoned span (the
+    session-`rewind` shape) → assert the tree marks `Framed{v3}` for the
+    rounds before it and `Raw` for the ones after;
+  - a stranded-pair fixture → assert the POST is refused, the dialog
+    shows the notice, and the log gains no marker;
+  - a "kernel ignored the marker" fixture (`rewind.ignored` marker) →
+    assert the plugin area shows the notice.
+- Mirror sync: `rushi-rewind` package — `server/rewind.rs`,
+  `client/rewind.rs`, `client/*.css`, `install/TOUCHPOINTS.md`,
+  `UPSTREAM`, README; probe stays local.
+- `docs/rewind-plugin.md` (the design doc) gets the same section summary.
+
+**Implemented (v0.5.61)** — a fourth fixture session, `rewindprobe4`:
+
+```
+1  user "round one"        5  assistant → tool_call c1    10 boundary v2 (fk 8)
+2  assistant               6  user "steer"                11 rewind → 4
+3  boundary v1 (fk 1)      7  tool_result c1              12 assistant
+4  user "round two"        8  user "round four"           13 user "round five"
+                           9  assistant                   14 assistant
+                                                          15 rewind → 6  ← the kernel ignores it
+```
+
+`v2` is inside the span the rewind at 11 abandons (the session-`rewind`
+shape); the marker at 15 would strand `c1`. Checks: the annotations
+(`1 → raw`, `4 → framed v1 1..4`, `6 → unresumable c1`, `8 → framed v1
+1..8`, `13 → framed v1 1..13`), the ignored list `[(15, "on", "c1")]`,
+the tail notice, `409 + strands_pair` on a repeat pick **with no line
+written**, `409 + not_settled`, the client's `.rw-restore` / badge /
+tooltips / dialog (blocked + enabled), the plugin-area notice, and the
+settled path (200, one line, cursor at 4, the old marker then masked
+rather than ignored).
+
+The probe is now **140 checks** (was 110), all green; the three
+pre-existing rail checks gained the fourth session. `e2e/layout_probe.py`
+still PASSes.
+
+### 11.5 Verification
+
+| step | command | result (v0.5.61) |
+|---|---|---|
+| server logic | `cargo test -p rushi-web` | **54 passed** (49 + `boundary_on_active_path_ignores_an_abandoned_boundary`, `verdict_flags_a_stranded_pair`, `ignored_markers_report_the_dropped_marker`, `a_mid_step_node_is_unresumable`, `a_dropped_marker_does_not_move_the_tree_cursor`) |
+| frontend | `trunk build` | clean |
+| probes | `e2e/rewind_probe.py`, `e2e/layout_probe.py` | **140 checks PASS**, layout PASS |
+| end-to-end (kernel) | rewind this session to 6670 and to 6998, dump `bin/assemble` | framing = `handoff/v3.md`; `6211..<target>` present; no seq in `6671..9087` — proved with the kernel fix (`rushi/docs/rewind-fork-design.md` 11.4) |

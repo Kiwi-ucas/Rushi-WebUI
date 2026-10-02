@@ -254,13 +254,40 @@ async fn get_rewind_tree(
     }
 }
 
+/// Write a `rewind` marker. The R1 pre-check
+/// (`docs/rewind-plugin-plan.md` 11.1) rides back in the response: the
+/// kernel never refuses a marker, so the plugin is told what the
+/// projection will do with it — `Ok` (it takes effect) or
+/// `StrandsPair` (the kernel's P4 guard drops it, the user's rewind
+/// does not happen; the client shows the notice, D-C). The marker is
+/// written either way: the log is append-only and the client decides
+/// whether to offer the pick.
 async fn post_rewind(
     State(st): State<AppState>,
     Path(id): Path<String>,
     Json(body): Json<PostRewind>,
 ) -> impl IntoResponse {
+    let verdict = match st.sessions.events(&id).await {
+        Ok(events) => rewind::rewind_verdict(&events, body.target_seq, &body.mode),
+        Err(e) => return (StatusCode::NOT_FOUND, e.to_string()).into_response(),
+    };
+    // A pick the kernel would ignore is refused here, so the log never
+    // gains a marker that does nothing (the pre-check is over the same
+    // rule the projection applies). The verdict rides in the body
+    // either way; the client shows the notice instead of a bare error.
+    if !matches!(verdict, rewind::RewindVerdict::Ok) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "ok": false, "verdict": verdict })),
+        )
+            .into_response();
+    }
     match st.sessions.append_rewind(&id, body.target_seq, &body.mode).await {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "ok": true, "verdict": verdict })),
+        )
+            .into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }

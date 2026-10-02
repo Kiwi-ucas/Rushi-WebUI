@@ -204,6 +204,51 @@ When locked:
 
 The kernel's rewind semantics are unchanged: it remains a first-class event.
 
+## 4b. Rewind × compaction — what the plugin now shows (v0.5.61)
+
+The kernel's projection rule lives in
+`rushi/docs/rewind-fork-design.md` section 11: the compaction boundary
+is the last `compaction_summary` **on the active path**, not the last
+one in the log. The plugin was already correct — it appends one marker
+and renders the tree — but it was silent about the three things a user
+needs to see, and its tree had one disagreement with the projection.
+This section is the summary; `docs/rewind-plugin-plan.md` section 11 is
+the plan and the implementation record.
+
+**R1 — the pre-check (server, pure, tested).** `rewind_verdict(events,
+target_seq, mode) -> RewindVerdict { Ok | StrandsPair{missing} |
+NotSettled{reason} }` re-evaluates the kernel's own decision: build the
+log plus the candidate marker, take the boundary on the active path,
+mask the active ranges, and run the kernel's
+`context_strands_pairs` over the kept region. `POST
+/api/sessions/{id}/rewind` refuses a pick the kernel would ignore with
+`409` and the verdict in the body, and writes nothing — the log never
+gains a marker that does nothing. `200` means it landed.
+
+**R2 — the notices.** Before the write, the confirm dialog names what
+the pick restores and, when it is refused, why. After the fact the
+plugin area shows it: the tree carries `ignored` (every marker the
+projection drops, outermost first — a port of the kernel's
+`mask_active_path` pop loop) and `tail_ignored` (the log's last marker
+*is* one of them). The post-hoc path is what covers markers the plugin
+did not write — a TUI pick, the WS transport, a hand-edited log.
+
+**R3 — the annotation.** Every node carries `restore`:
+`Raw` (no boundary on the active path), `Framed{version, from_seq,
+to_seq}` ("handoff v1 + raw 1..4"), or `Unresumable{missing}`. It is
+the kernel's answer, computed server-side from the same rule, and it
+is the user-visible form of decision D-D: a rewind to a round before
+the last compaction shows `raw history`, and those rounds really are
+rebuilt from their original events.
+
+**The tree follows the drop.** A marker the kernel ignores does not
+move the cursor: before v0.5.61 the scan let every marker move it, so
+a log whose tail marker was ignored showed "you are here" one round
+too far back and disagreed with the projection. The active path, the
+round states (`active` / `abandoned`) and every annotation now come
+from the markers that survive. All history stays in the file — the
+abandoned rounds are still rendered.
+
 ## 5. Edge cases
 
 | Case | Behaviour |
@@ -222,15 +267,19 @@ The kernel's rewind semantics are unchanged: it remains a first-class event.
 * `cargo test -p rushi-web` — the projection against the kernel fixtures
   (42 tests green).
 * `trunk build` — the Leptos CSR bundle.
-* `python3 e2e/rewind_probe.py [port]` — 71 browser assertions over three
-  fixture sessions built by the probe (`/tmp/rw-e2e/sessions/rewindprobe`,
-  forked; `rewindprobe2`, a second session; `rewindprobe3`, no round at all): the rebuilt expanded view (layout, rail,
-  scroller), the rail switching sessions in-view, the recursive tree
-  (abandoned / current / retracted / boundary / tooltips / legend), light +
-  dark theme, the dialog copy and its English text, node-click ⇒
+* `python3 e2e/rewind_probe.py [port]` — **140 browser + HTTP assertions**
+  over four fixture sessions built by the probe
+  (`/tmp/rw-e2e/sessions/rewindprobe`, forked; `rewindprobe2`, a second
+  session; `rewindprobe3`, no round at all; `rewindprobe4`, the rewind ×
+  compaction fixture of section 4b — a boundary inside an abandoned span,
+  a pick that would strand a tool pair, and a marker the kernel ignores):
+  the rebuilt expanded view (layout, rail, scroller), the rail switching
+  sessions in-view, the recursive tree (abandoned / current / retracted /
+  boundary / tooltips / legend / restore annotation), light + dark theme,
+  the dialog copy and its English text, node-click ⇒
   `{"type":"rewind","target_seq":6,"mode":"on"}` appended and the marker
   moving live, **case C** (re-entering the abandoned branch — the log stays
   append-only), the card button (present, inert on the current tail, same
-  dialog), the `#plugin-area` entry, and the loop-running guard (with a live
+  dialog), the `#plugin-area` entry, the loop-running guard (with a live
   `loop.pid`: every node locked, no dialog, footer explains, card buttons
-  disabled).
+  disabled), the `409` refusals, the ignored markers and the tail notice.

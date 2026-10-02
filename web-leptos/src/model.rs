@@ -375,8 +375,118 @@ pub struct RewindNode {
     pub current: bool,
     #[serde(default)]
     pub retracted: bool,
+    /// How the context is reconstructed if the user rewinds here (the
+    /// kernel's boundary rule, server-side; plan 11.3).
+    #[serde(default)]
+    pub restore: Restore,
     #[serde(default)]
     pub children: Vec<RewindNode>,
+}
+
+/// Rewind plugin R3: what a rewind to a node restores.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Restore {
+    /// No compaction boundary on the active path there.
+    #[default]
+    Raw,
+    /// The boundary in force at the node: its handoff plus the raw
+    /// events `from_seq..=to_seq`.
+    Framed {
+        #[serde(default)]
+        version: u64,
+        #[serde(default)]
+        from_seq: u64,
+        #[serde(default)]
+        to_seq: u64,
+    },
+    /// The kernel's projection would drop the marker (a stranded tool
+    /// pair): the pick is refused client-side.
+    Unresumable {
+        #[serde(default)]
+        missing: String,
+    },
+}
+
+impl Restore {
+    /// One line for the node detail / dialog ("raw 1..42",
+    /// "handoff v3 + raw 6211..6670").
+    pub fn label(&self) -> String {
+        match self {
+            Restore::Raw => "raw history".to_string(),
+            Restore::Framed {
+                version,
+                from_seq,
+                to_seq,
+            } => {
+                let src = if *version == 0 {
+                    "the inline summary".to_string()
+                } else {
+                    format!("handoff v{version}")
+                };
+                format!("{src} + raw {from_seq}..{to_seq}")
+            }
+            Restore::Unresumable { .. } => "not resumable".to_string(),
+        }
+    }
+    /// Whether the pick must be refused.
+    pub fn blocked(&self) -> bool {
+        matches!(self, Restore::Unresumable { .. })
+    }
+}
+
+/// Rewind plugin R1: the server's pre-check for a pick. The kernel
+/// never refuses a marker; this says what its projection would do.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RewindVerdict {
+    Ok,
+    StrandsPair {
+        #[serde(default)]
+        missing: String,
+    },
+    NotSettled {
+        #[serde(default)]
+        reason: String,
+    },
+}
+
+impl RewindVerdict {
+    /// The notice for the user, or `None` when the pick takes effect.
+    pub fn notice(&self) -> Option<String> {
+        match self {
+            RewindVerdict::Ok => None,
+            RewindVerdict::StrandsPair { missing } => Some(format!(
+                "The loop will ignore this rewind: the resumed context would leave tool call `{missing}` without its result. Rewind to the round's first message instead."
+            )),
+            RewindVerdict::NotSettled { reason } => {
+                Some(format!("This point cannot be resumed: {reason}."))
+            }
+        }
+    }
+}
+
+/// Rewind plugin R2: a marker the projection drops (a rewind that did
+/// not take effect).
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct IgnoredMarker {
+    pub seq: u64,
+    #[serde(default)]
+    pub target_seq: u64,
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub missing: String,
+}
+
+impl IgnoredMarker {
+    /// The plugin-area notice (D-C).
+    pub fn notice(&self) -> String {
+        format!(
+            "The rewind at line {} was ignored: the context it restored would leave tool call `{}` without its result, so the conversation did not resume from line {}. Pick a round's first message instead.",
+            self.seq, self.missing, self.target_seq
+        )
+    }
 }
 
 /// Rewind plugin: one `rewind` marker (a fork point) at its log line.
@@ -420,6 +530,13 @@ pub struct RewindTree {
     /// The log's tail is a rewind marker (settled at the target).
     #[serde(default)]
     pub settled: bool,
+    /// The markers the projection drops (R2 post-hoc), outermost first.
+    #[serde(default)]
+    pub ignored: Vec<IgnoredMarker>,
+    /// The dropped marker whose line is the log's last rewind marker:
+    /// "your last rewind did not take effect" (D-C).
+    #[serde(default)]
+    pub tail_ignored: Option<IgnoredMarker>,
 }
 
 impl RewindTree {
@@ -469,6 +586,22 @@ impl RewindTree {
             }
         }
     }
+    /// The restore annotation of the round at log line `seq`.
+    pub fn restore_at(&self, seq: u64) -> Option<Restore> {
+        fn find(nodes: &[RewindNode], seq: u64) -> Option<Restore> {
+            for n in nodes {
+                if n.seq == seq {
+                    return Some(n.restore.clone());
+                }
+                if let Some(r) = find(&n.children, seq) {
+                    return Some(r);
+                }
+            }
+            None
+        }
+        find(&self.roots, seq)
+    }
+
     /// The active path in order (root → current), one node per round.
     /// An abandoned node cannot have active descendants (the active path is
     /// a single root-to-cursor chain), so abandoned subtrees are skipped.
