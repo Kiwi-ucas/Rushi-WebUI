@@ -171,6 +171,26 @@ pub struct FlowBranch {
     pub to_x: u64,
 }
 
+/// One round in full, for the flow view's top panel (B2). The tree and the
+/// flow keep only the 60-char [`summarize`]d preview of every round (a
+/// session's whole user-message text is 4-47 KB, small — but the panel needs
+/// exactly one round at a time, so it is fetched on selection).
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeDetail {
+    pub seq: u64,
+    pub round: u64,
+    pub ts: String,
+    /// The user message, verbatim (never summarized).
+    pub text: String,
+    /// The agent's work folded into this round.
+    pub events: u64,
+    /// `"active"` or `"abandoned"` (the round's place on the active path).
+    pub state: String,
+    /// The "you are here" round.
+    pub current: bool,
+    pub retracted: bool,
+}
+
 struct Round {
     seq: u64,
     ts: String,
@@ -382,6 +402,32 @@ fn build_node(
             .map(|&c| build_node(c, rounds, active, current, restores))
             .collect(),
     }
+}
+
+/// The full detail of the round whose `user_message` sits at 1-based log
+/// line `seq` — `None` when that line is not a round's message (an
+/// assistant message, the middle of a round, past the end of the log…),
+/// which the route answers with 404.
+pub fn node_detail(events: &[Value], seq: u64) -> Option<NodeDetail> {
+    let idx = seq.checked_sub(1)? as usize;
+    let ev = events.get(idx)?;
+    if ev.get("type").and_then(|t| t.as_str()) != Some("user_message") {
+        return None;
+    }
+    // The meta comes from the same projection the tree is built from, so
+    // the panel and the node it was opened for cannot disagree.
+    let tree = build("", events);
+    let n = tree.flow.nodes.iter().find(|n| n.seq == seq)?;
+    Some(NodeDetail {
+        seq,
+        round: n.round,
+        ts: n.ts.clone(),
+        text: str_field(ev, "content"),
+        events: n.events,
+        state: n.state.clone(),
+        current: n.current,
+        retracted: n.retracted,
+    })
 }
 
 // ── the flow projection (Style B) ─────────────────────────────────
@@ -1833,6 +1879,63 @@ mod tests {
         assert_eq!((cur.lane, cur.main), (-1, false));
         assert_eq!(cur.restore, tree.flow.nodes[4].restore.clone());
         assert_flow_is_collision_free(&tree);
+    }
+
+    // ── B2: the per-round detail ─────────────────────────────────────
+
+    #[test]
+    fn node_detail_returns_the_full_message() {
+        let long = "first line\nsecond line \u{2014} with \"quotes\" and,; punctuation".to_string();
+        let events = vec![um("short one"), um(&long), am(), ext()];
+        let d = node_detail(&events, 2).expect("round 2 is a user message");
+        assert_eq!(d.seq, 2);
+        assert_eq!(d.round, 2);
+        assert_eq!(d.text, long); // verbatim, newlines and all — never summarized
+        assert_ne!(d.text, summarize(&long));
+        // The event count is the round's span minus `ext_status`, and the
+        // round's own `user_message` is part of it (see
+        // `round_metadata_and_event_folding`): um + am here, the ext not.
+        assert_eq!(d.events, 2);
+        assert_eq!(d.state, "active");
+        assert!(d.current);
+        assert!(!d.retracted);
+        // round 1 carries no folded events, and the summary differs
+        let d1 = node_detail(&events, 1).unwrap();
+        assert_eq!(d1.text, "short one");
+        assert_eq!(d1.events, 1); // its own message, nothing folded in
+        assert!(!d1.current);
+    }
+
+    #[test]
+    fn node_detail_rejects_lines_that_are_not_a_round() {
+        let events = vec![um("one"), am(), um("two")];
+        assert!(node_detail(&events, 2).is_none(), "an assistant message");
+        assert!(node_detail(&events, 0).is_none(), "line 0");
+        assert!(node_detail(&events, 4).is_none(), "past the end");
+        assert!(node_detail(&[], 1).is_none(), "an empty log");
+    }
+
+    #[test]
+    fn node_detail_reports_an_abandoned_or_retracted_round() {
+        let events = vec![
+            um("one"),
+            um("two"),
+            um("three"),
+            rw(2, "on"),
+            um("four"),
+            um_id("five", "id5"),
+            json!({ "v": 1, "type": "user_message_retract", "ts": "t", "target": "id5" }),
+        ];
+        // round 3 was masked by the rewind to round 2
+        let three = node_detail(&events, 3).unwrap();
+        assert_eq!(three.text, "three");
+        assert_eq!(three.state, "abandoned");
+        assert!(!three.current);
+        // round 6 is the current one, and it was retracted
+        let six = node_detail(&events, 6).unwrap();
+        assert_eq!(six.state, "active");
+        assert!(six.current);
+        assert!(six.retracted);
     }
 
     /// The flow's per-node text is the same one style A shows, so the

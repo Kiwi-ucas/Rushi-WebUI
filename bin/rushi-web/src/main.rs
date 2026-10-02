@@ -254,6 +254,26 @@ async fn get_rewind_tree(
     }
 }
 
+/// B2 (plan section 10.3): one round in full, for the flow view's top
+/// panel — the *verbatim* user message (the tree carries a 60-char
+/// preview). 404 when that line is not a round's `user_message`.
+async fn get_rewind_node(
+    State(st): State<AppState>,
+    Path((id, seq)): Path<(String, u64)>,
+) -> impl IntoResponse {
+    match st.sessions.events(&id).await {
+        Ok(events) => match rewind::node_detail(&events, seq) {
+            Some(d) => (StatusCode::OK, Json(d)).into_response(),
+            None => (
+                StatusCode::NOT_FOUND,
+                format!("no round starts at line {seq}"),
+            )
+                .into_response(),
+        },
+        Err(e) => (StatusCode::NOT_FOUND, e.to_string()).into_response(),
+    }
+}
+
 /// Write a `rewind` marker. The R1 pre-check
 /// (`docs/rewind-plugin-plan.md` 11.1) rides back in the response: the
 /// kernel never refuses a marker, so the plugin is told what the
@@ -1240,6 +1260,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/sessions/{id}/stop", post(post_stop))
         .route("/api/sessions/{id}/approval", post(post_approval))
         .route("/api/sessions/{id}/rewind", get(get_rewind_tree).post(post_rewind))
+        .route("/api/sessions/{id}/rewind/node/{seq}", get(get_rewind_node))
         .route("/api/sessions/{id}/goal", get(get_goal).post(post_goal))
         .route("/api/sessions/{id}/essence", get(get_essence))
         .route(
