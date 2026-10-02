@@ -34,7 +34,11 @@ pub fn Transcript(state: AppState) -> impl IntoView {
     // The effect's first tick lands after mount_to, so the DOM is
     // ready and the engine can register its listeners lazily.
     Effect::new(move || {
-        let _ = events.get();
+        // v0.5.52: `with` (borrow) instead of `get` — this effect re-runs
+        // on EVERY appended event, and `get()` deep-clones the whole
+        // event Vec (O(N) per event; the "freezes after a while" bug,
+        // plan §9.13). `with` keeps the same reactive subscription.
+        let _ = events.with(|_| ());
         let _ = state.view_round.get();
         let _ = state.active_session.get();
         crate::pile::init(state);
@@ -94,7 +98,9 @@ pub fn Transcript(state: AppState) -> impl IntoView {
                 // rebuild with correct content; streaming appends do
                 // not bump, so the hot path keeps stable keys.
                 each=move || {
-                    ev_key_indices(events.get().len(), ev_gen.get())
+                    // v0.5.52: borrow, don't clone — this `each` re-runs on
+                    // every append and only needs the length (see §9.13).
+                    ev_key_indices(events.with(|v| v.len()), ev_gen.get())
                 }
                 key=|item: &(u64, usize)| item.clone()
                 children=move |item| {
@@ -299,7 +305,8 @@ fn event_card_view(key: usize, events: RwSignal<Vec<Value>>, state: AppState) ->
     // the .ev-settling class so its entry glides FROM the in-flight look
     // (tool-colored face + lifted relief) TO the settled one — no hard
     // color step at the handoff.
-    let cls = if t == "assistant_message" && key == events.get().len() - 1 && state.settling_card.get()
+    // v0.5.52: borrow for the length (was a whole-Vec clone per card).
+    let cls = if t == "assistant_message" && key == events.with(|v| v.len()) - 1 && state.settling_card.get()
     {
         state.settling_card.set(false);
         format!("{cls} ev-settling")
@@ -331,7 +338,14 @@ fn event_card_view(key: usize, events: RwSignal<Vec<Value>>, state: AppState) ->
     // place a time is shown).
     let ts_str = crate::timeutil::ts_full(ev.get("ts").and_then(|v| v.as_str()).unwrap_or(""));
 
-    let body = ev_body(&ev, &t, state, events);
+    // The card's own 1-based log line: the server ships the window's first
+    // line (`oldest_line`) and index-keyed cards, so the line is
+    // `oldest_line + key`. That is the SAME non-empty-line numbering the
+    // kernel's `seq`/`target_seq` use, so the rewind plugin can post a
+    // `target_seq` straight from a rendered card. Only meaningful for
+    // `user_message` (the only event type a rewind may target).
+    let card_seq = state.hist_oldest_line.get_untracked() + key as u64;
+    let body = ev_body(&ev, &t, state, events, card_seq);
     let type_word = t.replace('_', " ");
 
     let card = view! {
@@ -347,7 +361,13 @@ fn event_card_view(key: usize, events: RwSignal<Vec<Value>>, state: AppState) ->
 }
 
 /// Build the inner content for each event type.
-fn ev_body(ev: &Value, t: &str, state: AppState, events: RwSignal<Vec<Value>>) -> AnyView {
+fn ev_body(
+    ev: &Value,
+    t: &str,
+    state: AppState,
+    events: RwSignal<Vec<Value>>,
+    card_seq: u64,
+) -> AnyView {
     match t {
         "ext_status" => view! { <span /> }.into_any(),
 
@@ -358,9 +378,17 @@ fn ev_body(ev: &Value, t: &str, state: AppState, events: RwSignal<Vec<Value>>) -
                 Some(q) => view! { <div class="ev-badge">{ format!("queued: {q}") }</div> }.into_any(),
                 None => view! { <div /> }.into_any(),
             };
+            // Rewind plugin: the card quick button (`\u{27f2}`, bottom-right).
+            // It opens the same confirm dialog as the History tree; the
+            // target is this card's own line. Hidden on the very newest
+            // user message is not needed — `quick_rewind_button` disables
+            // itself when this line IS the current tail (decision 5 +
+            // P6) and while the loop runs.
+            let excerpt: String = content.chars().take(60).collect();
             let v = view! {
                 { badge }
                 <div class="ev-content">{ md_blocks_view(content) }</div>
+                { crate::rewind::quick_rewind_button(state, card_seq, excerpt) }
             };
             v.into_any()
         }

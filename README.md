@@ -42,8 +42,9 @@ All 14 kernel event types: `user_message`, `assistant_message`
 `model_thinking`, `model_call_context`, …), `compaction_started`,
 `compaction_summary`, `compaction_failed`, `context_exhausted`,
 `approval_request` (Approve/Deny card → writes `approval`),
-`approval`, `rewind` (fork divider), `user_message_retract`
-(strikethrough).
+`approval`, `rewind` (fork divider in the transcript, and a node in the
+history tree — see the rewind plugin), `user_message_retract`
+(strikethrough; the target's node carries a `retracted` badge in the tree).
 
 ## Goal panel (web-native goal-ext)
 
@@ -53,6 +54,39 @@ and writes the same on-disk layout the kernel hooks use
 `goal-state` crate's schema): create / pause / resume / clear / edit
 from the browser. The kernel's `model.before` / `run.idle` goal
 hooks keep working unchanged.
+
+## Rewind plugin (history tree)
+
+Rewinding to an earlier user message no longer throws anything away: every
+branch lives in the same append-only `events.jsonl`, and the abandoned ones
+stay visible — and re-enterable — in a history tree. The kernel already had
+`rewind` as a first-class event and `POST …/rewind`; this plugin adds the
+read-only projection (`GET /api/sessions/{id}/rewind`), the UI, and the guard.
+
+- **The expanded view is a new full-window interface.** `layout-full` is no
+  longer the stretched sidebar: `#history-view` replaces it, with a session
+  rail on the left (so switching sessions stays full-screen) and the recursive
+  round/branch tree filling the rest. One node = one user message = one loop
+  round; the agent's work folds into the node (summary + event count).
+  Abandoned branches are dimmed with a strikethrough summary, the current
+  round carries a ring and "here", and compaction boundaries are footnoted.
+- **Clicking a node** opens *"Rewind to this point?"* → the active
+  conversation resumes from there, everything after it moves to an abandoned
+  branch, and the next context assembly ends there (kernel `mode:"on"`). The
+  same dialog is reachable from the `⟲` button on every user card and from
+  the sidebar panel's active-path rows. Nothing is irreversible, so the
+  dialog says so.
+- **The plugin also appears in `#plugin-area`** (`goal · essence · rewind`),
+  summarizing the tree and offering *open History view*.
+- **Rewind is forbidden while the session's loop runs** (an in-flight turn
+  would land inside the fresh branch): the tree stays viewable but read-only,
+  the dialog's button and the card `⟲` are disabled, and the tooltips/the
+  footer say why. No `POST /stop` — wait for idle.
+- The projection is proven equal to the kernel's own `active_ranges` over the
+  kernel's fixtures (`cargo test -p rushi-web`), and a browser probe
+  (`e2e/rewind_probe.py`) asserts the whole flow, including re-entering an
+  abandoned branch. Design notes: `docs/rewind-plugin.md`;
+  plan: `docs/rewind-plugin-plan.md`.
 
 ## Build & run
 
@@ -131,6 +165,7 @@ from disk, so a `trunk build` is picked up without recompiling
 | POST | `/api/sessions/{id}/start` | spawn the loop |
 | POST | `/api/sessions/{id}/stop` | SIGKILL the loop process group |
 | POST | `/api/sessions/{id}/approval` | `{"id","decision"}` answer an approval_request |
+| GET | `/api/sessions/{id}/rewind` | the projected history tree (rounds, forks, boundaries, `current_seq`) |
 | POST | `/api/sessions/{id}/rewind` | `{"target_seq","mode":"before\|on"}` |
 | GET/POST | `/api/sessions/{id}/goal` | read / act on goal state |
 | WS | `/ws/sessions/{id}` | history frame + live event frames; inbound `message`/`approval`/`rewind`/`start`/`stop`/`load_earlier` frames; outbound `history` / `history_page` / `event` / `model_stream` / `loop_status` frames |

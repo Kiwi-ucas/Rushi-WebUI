@@ -229,6 +229,63 @@ pub async fn loop_running(id: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// v0.5.55 P1: the server's full sidebar loop state. `running` = sessions
+/// with a live loop process (orange breathing lamp); `finished` = sessions
+/// whose most recent loop ended and left a `loop.last` marker but are not
+/// currently running (green "finished, unviewed" lamp). The client polls
+/// this on load and on a timer so both lamp kinds stay correct even with
+/// no live WS connection open (a fresh page load has no active session,
+/// hence no WS, so the connect-time `loops` frame never arrives).
+pub struct LoopsSnapshot {
+    pub running: Vec<String>,
+    pub finished: Vec<String>,
+}
+
+impl Default for LoopsSnapshot {
+    fn default() -> Self {
+        Self {
+            running: Vec::new(),
+            finished: Vec::new(),
+        }
+    }
+}
+
+pub async fn load_loops() -> LoopsSnapshot {
+    let Ok(res) = Request::get("/api/loops").send().await else {
+        return LoopsSnapshot::default();
+    };
+    let Ok(text) = res.text().await else {
+        return LoopsSnapshot::default();
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&text) else {
+        return LoopsSnapshot::default();
+    };
+    let running = v
+        .get("running")
+        .and_then(|r| r.as_array())
+        .cloned()
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let finished = v
+        .get("finished")
+        .and_then(|f| f.as_array())
+        .cloned()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.get("session").and_then(|s| s.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    LoopsSnapshot { running, finished }
+}
+
+/// v0.5.55 P1: the user viewed this session, so its finished-unviewed
+/// green lamp is consumed. Fire-and-forget; the server deletes the
+/// `loop.last` marker so the next poll does not re-light the lamp.
+pub async fn mark_loop_viewed(id: &str) {
+    let _ = Request::post(&format!("/api/sessions/{id}/loop/viewed")).send().await;
+}
+
 pub async fn load_goal(id: &str) -> Option<crate::model::GoalView> {
     let res = Request::get(&format!("/api/sessions/{id}/goal")).send().await.ok()?;
     let text = res.text().await.ok()?;
@@ -243,6 +300,47 @@ pub async fn goal_action(id: &str, action: &str, goal: Option<&str>) {
         "goal": goal,
     });
     let _ = post_json(&format!("/api/sessions/{id}/goal"), &payload).await;
+}
+
+/// v0.5.54: the session's essence entries (invariants + beliefs) for the
+/// sidebar essence plugin. Read-only — the harness's `essence` tool is the
+/// writer; the server endpoint degrades to an empty list when the store is
+/// absent or mid-write.
+pub async fn load_essence(id: &str) -> Result<Vec<crate::model::EssenceEntry>, String> {
+    let res = Request::get(&format!("/api/sessions/{id}/essence"))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let text = res.text().await.map_err(|e| e.to_string())?;
+    let v: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    serde_json::from_value(
+        v.get("entries").cloned().unwrap_or(Value::Array(vec![])),
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Rewind plugin: the session's projected history tree (read-only). The
+/// server degrades a missing log to an empty tree.
+pub async fn load_rewind_tree(id: &str) -> Result<crate::model::RewindTree, String> {
+    let res = Request::get(&format!("/api/sessions/{id}/rewind"))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let text = res.text().await.map_err(|e| e.to_string())?;
+    serde_json::from_str(&text).map_err(|e| e.to_string())
+}
+
+/// Rewind plugin: write a `rewind` marker. `mode:"on"` keeps the target user
+/// message as the active tail and abandons everything after it; the fork
+/// stays in the log and can be re-entered later.
+pub async fn post_rewind(id: &str, target_seq: u64, mode: &str) -> Result<(), String> {
+    let payload = json!({ "target_seq": target_seq, "mode": mode });
+    let status = post_json(&format!("/api/sessions/{id}/rewind"), &payload).await?;
+    if status >= 400 {
+        Err(format!("rewind failed: HTTP {status}"))
+    } else {
+        Ok(())
+    }
 }
 
 pub async fn post_message(

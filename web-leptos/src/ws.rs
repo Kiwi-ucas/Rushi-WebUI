@@ -219,6 +219,9 @@ pub fn connect(state: &AppState, session: &str) {
     let tool_pending = state.tool_pending;
     let looping = state.looping_sessions;
     let done_unviewed = state.loop_done_unviewed;
+    // v0.5.55 P1: sessions already viewed this session — the `loops`
+    // frame does not re-seed their green lamp.
+    let viewed = state.loop_viewed;
     let settling = state.settling_card;
     // v0.5.30: "output" sidebar rank — bumped only when a loop
     // COMPLETES (the running=false branch of "loop_status").
@@ -234,6 +237,10 @@ pub fn connect(state: &AppState, session: &str) {
     let earlier_loaded = state.earlier_loaded;
     let earlier_failed = state.earlier_failed;
     let ev_gen = state.ev_gen;
+    // v0.5.52: derived-state signals (Copy) — the WS closures must stay
+    // 'static, so they capture these instead of `&AppState`.
+    let last_ext = state.last_ext;
+    let cmd_gen = state.cmd_gen;
 
     // v0.5.23: the per-frame flush of coalesced model_stream deltas
     // (see make_delta_flush). Created per connection — it captures THIS
@@ -262,6 +269,9 @@ pub fn connect(state: &AppState, session: &str) {
         let earlier_loaded = earlier_loaded;
         let earlier_failed = earlier_failed;
         let ev_gen = ev_gen;
+        // v0.5.52: the window manager needs the whole AppState; the
+        // closure must stay 'static, so capture a COPY (AppState: Copy).
+        let st = *state;
         let term_state = term_state;
         let flush = flush;
         Closure::wrap(Box::new(move |e: MessageEvent| {
@@ -299,6 +309,9 @@ pub fn connect(state: &AppState, session: &str) {
                         earlier_failed.set(false);
                         loading_earlier.set(false);
                         events.set(normed);
+                        // v0.5.52: the window was REPLACED — one pass
+                        // rebuilds the derived signals (P2).
+                        crate::model::rebuild_derived_signals(events, last_ext, cmd_gen);
                         // v0.5.33: this REPLACES the loaded list (fresh
                         // connection, or a reconnect after the window
                         // may have grown) — bump the generation so the
@@ -329,6 +342,10 @@ pub fn connect(state: &AppState, session: &str) {
                         if new_count > 0 {
                             let normed: Vec<Value> =
                                 evs.into_iter().map(|mut v| normalize_event(&mut v)).collect();
+                            // v0.5.52: tell the window manager a prepend
+                            // is in flight (it must not trim while the pile
+                            // engine is compensating the inserted height).
+                            crate::win::note_prepend();
                             crate::pile::on_history_prepended();
                             let merged = {
                                 let mut v = normed;
@@ -341,6 +358,9 @@ pub fn connect(state: &AppState, session: &str) {
                             tool_pending.set(rebuild_tool_pending(&merged));
                             earlier_loaded.update(|v| *v += new_count as u64);
                             events.set(merged);
+                            // v0.5.52: prepend merged — rebuild the
+                            // derived signals over the merged window.
+                            crate::model::rebuild_derived_signals(events, last_ext, cmd_gen);
                             // v0.5.33: prepend shifts every index — bump
                             // the generation so the keyed For re-keys
                             // and rebuilds all cards (a plain index key
@@ -364,6 +384,12 @@ pub fn connect(state: &AppState, session: &str) {
                             })),
                         };
                         let t = ev.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        // Rewind plugin: only `user_message` / `rewind`
+                        // change the history tree's shape (a round or a
+                        // fork); the plugin refetches on these two.
+                        if t == "user_message" || t == "rewind" {
+                            st.rewind_gen.update(|g| *g += 1);
+                        }
                         let content = ev
                             .get("content")
                             .and_then(|c| c.as_str())
@@ -458,7 +484,11 @@ pub fn connect(state: &AppState, session: &str) {
                             }
                             _ => {}
                         }
+                        // v0.5.52: the append closure is 'static; it
+                        // captures the derived signals (Copy, bound at
+                        // the top of connect) — O(1) per event.
                         events.update(move |old| {
+                            crate::model::note_event_signals(last_ext, cmd_gen, &ev);
                             // Replace our own optimistic card with the
                             // canonical server user_message echo (and
                             // only user_messages) instead of pushing a
@@ -480,6 +510,9 @@ pub fn connect(state: &AppState, session: &str) {
                             }
                             old.push(ev);
                         });
+                        // v0.5.52 P1: keep the client window bounded
+                        // (no-op until it passes EVENTS_TRIM_AT).
+                        crate::win::maybe_trim(&st);
                         crate::pile::on_change();
                     }
                     "error" => {
@@ -507,16 +540,39 @@ pub fn connect(state: &AppState, session: &str) {
                         // v0.5.13: connect-time snapshot of the
                         // server-side running-loop set — resync the
                         // sidebar lamps on (re)connect.
+                        // v0.5.55 P1: the frame now carries BOTH sets —
+                        // `running` (live loops, orange lamps) and
+                        // `finished` (loop.last markers with no live
+                        // loop, green "finished, unviewed" lamps) — so a
+                        // reconnect restores the green lamps too, not
+                        // just the orange ones.
                         let mut set: std::collections::HashSet<String> =
                             std::collections::HashSet::new();
-                        if let Some(a) = item.get("data").and_then(|v| v.as_array()) {
+                        if let Some(a) = item.get("running").and_then(|v| v.as_array()) {
                             for v in a {
                                 if let Some(s) = v.as_str() {
                                     set.insert(s.to_string());
                                 }
                             }
                         }
-                        *looping.write() = set;
+                        *looping.write() = set.clone();
+                        // Seed the green lamps: finished sessions that
+                        // are not running again and not already viewed
+                        // by the user (loop_viewed). Insert-only —
+                        // removal stays with loop_status/select_session.
+                        let viewed_set = viewed.get();
+                        if let Some(a) = item.get("finished").and_then(|v| v.as_array()) {
+                            let mut du = done_unviewed.write();
+                            for v in a {
+                                let Some(name) = v.get("session").and_then(|s| s.as_str()) else {
+                                    continue;
+                                };
+                                let name = name.to_string();
+                                if !set.contains(&name) && !viewed_set.contains(&name) {
+                                    du.insert(name);
+                                }
+                            }
+                        }
                     }
                     "loop_status" => {
                         let running = item.get("running").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -832,7 +888,7 @@ pub fn term_close(id: u32) {
 /// list: `ctx_used` is the last assistant input_tokens usage; each
 /// user_message (except the very first event) closes the previous
 /// round, recording `ctx_used` as that round's ctxK.
-fn rebuild_ctx_bookkeeping(normed: &[Value]) -> (u64, Vec<u64>) {
+pub(crate) fn rebuild_ctx_bookkeeping(normed: &[Value]) -> (u64, Vec<u64>) {
     let mut ctx = 0u64;
     let mut ctxk: Vec<u64> = Vec::new();
     for (i, ev) in normed.iter().enumerate() {
@@ -857,7 +913,7 @@ fn rebuild_ctx_bookkeeping(normed: &[Value]) -> (u64, Vec<u64>) {
 
 /// Rebuild the running tool-call set: tool_call ids with no matching
 /// tool_result (only survives when a loop died mid-tool).
-fn rebuild_tool_pending(normed: &[Value]) -> Vec<String> {
+pub(crate) fn rebuild_tool_pending(normed: &[Value]) -> Vec<String> {
     let pending: Vec<String> = normed
         .iter()
         .filter(|e| e.get("type").and_then(|t| t.as_str()) == Some("tool_call"))
@@ -1268,6 +1324,203 @@ pub fn run_freeze_test() {
                 let f: &js_sys::Function =
                     jsfn.unchecked_ref::<js_sys::Function>();
                 let _ = f.call0(&wasm_bindgen::JsValue::UNDEFINED);
+            },
+        ));
+    }
+}
+
+// ── v0.5.52: freeze regression on the EVENT path ────────────────────
+//
+// The v0.5.23 flood above pushes model_stream DELTAS — it never appends
+// events, so it could not see the event-path saturation (plan §9.13:
+// every appended event deep-cloned the whole window, and the window
+// itself was unbounded). Open `?test=freeze&mode=events` and this runs
+// the same kind of verdict on the production append path:
+//
+//   * default — `events.update(push)` + `note_event_signals` +
+//     `win::maybe_trim` (the v0.5.52 shape: O(1) per event, window
+//     capped at EVENTS_CAP). EXPECTED PASS.
+//   * `&flood=raw` — the PRE-v0.5.52 shape: each event its own timer
+//     task, a whole-window `events.get()` clone plus a full
+//     status-strip rescan/view rebuild per event, and NO trimming.
+//     EXPECTED FAIL — that is what makes the test discriminate.
+//
+// Verdict gates and reporting are shared with the delta test
+// (FLOOD_MAX_GAP_MS / FLOOD_MAX_TIMER_MS / flood_report, so the same
+// `data-freeze-*` attributes and #rushi-freeze-badge are written).
+
+/// Appended synthetic events per tick. Higher than the delta flood
+/// because each event is cheap on the fixed path — the raw control
+/// needs the window to grow fast enough to be visibly saturated.
+const EVENTS_PER_FRAME: u32 = 60;
+/// Ticks; 96 × 60 = 5760 events appended in ~1.5 s.
+const EVENTS_FLOOD_FRAMES: u32 = 96;
+/// Raw control stops once a gate is exceeded for a few ticks (proven).
+const EVENTS_FLOOD_EARLY_STOP_FRAMES: u32 = 24;
+
+/// One synthetic flood event: an `ext_status` (renders no card) whose
+/// value changes every time, so it drives the same per-event work the
+/// real hook stream does (strip update + a strip view diff).
+fn flood_event(i: u32, frame: u32) -> Value {
+    serde_json::json!({
+        "type": "ext_status",
+        "id": "hook_applied",
+        "v": 1,
+        "ts": crate::timeutil::now_iso(),
+        "value": format!("freeze-flood-{frame}-{i}"),
+    })
+}
+
+/// See the module comment above.
+pub fn run_freeze_test_events(raw_mode: bool) {
+    let Some(state) = crate::model::AppState::current_app_state() else {
+        flood_report(None, "no AppState (call after mount)", 0.0, 0.0, 0, 0);
+        return;
+    };
+    if js_sys::eval("document.visibilityState")
+        .ok()
+        .and_then(|v| v.as_string())
+        .as_deref()
+        == Some("hidden")
+    {
+        flood_report(None, "tab hidden (rAF throttled)", 0.0, 0.0, 0, 0);
+        return;
+    }
+
+    let timer_latency = std::rc::Rc::new(std::cell::RefCell::new(0.0f64));
+    let alive = std::rc::Rc::new(std::cell::RefCell::new(true));
+    let ds = std::rc::Rc::new(std::cell::RefCell::new(FloodState {
+        frame: 0,
+        last_ts: None,
+        max_gap_ms: 0.0,
+        timer_max_ms: 0.0,
+        pending: Vec::new(),
+        tick: None,
+        first: None,
+    }));
+    let next_frame: std::rc::Rc<std::cell::RefCell<Option<Closure<dyn Fn()>>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
+    {
+        let ns = next_frame.clone();
+        let ds = ds.clone();
+        let lat = timer_latency.clone();
+        let driver = Closure::wrap(Box::new(move || {
+            let done = {
+                let mut st = ds.borrow_mut();
+                st.frame += 1;
+                let now = js_sys::Date::now();
+                if let Some(last) = st.last_ts {
+                    st.max_gap_ms = st.max_gap_ms.max(now - last);
+                }
+                st.last_ts = Some(now);
+                let frame = st.frame;
+                if raw_mode {
+                    // Pre-v0.5.52 shape: one task per event, whole-window
+                    // clone + full strip scan/view, no window cap.
+                    for i in 0..EVENTS_PER_FRAME {
+                        let ev = flood_event(i, frame);
+                        let al = alive.clone();
+                        crate::pile::leak_timeout(gloo_timers::callback::Timeout::new(
+                            0,
+                            move || {
+                                if !*al.borrow() {
+                                    return;
+                                }
+                                let st = state;
+                                st.events.update(|v| v.push(ev.clone()));
+                                let _ = st.events.get(); // the pre-fix clone
+                                let _ = crate::ui::status_strip_chips_full(&st.events.get());
+                                crate::pile::on_change();
+                            },
+                        ));
+                    }
+                } else {
+                    // Production path, event by event.
+                    for i in 0..EVENTS_PER_FRAME {
+                        let ev = flood_event(i, frame);
+                        crate::model::note_event_signals(state.last_ext, state.cmd_gen, &ev);
+                        state.events.update(|v| v.push(ev));
+                        crate::win::maybe_trim(&state);
+                    }
+                    crate::pile::on_change();
+                }
+                let t0v = now;
+                let latc = lat.clone();
+                let to = gloo_timers::callback::Timeout::new(
+                    0,
+                    move || {
+                        *latc.borrow_mut() = js_sys::Date::now() - t0v;
+                    },
+                );
+                st.pending.push(to);
+                st.timer_max_ms = st.timer_max_ms.max(*lat.borrow());
+                let done = st.frame >= EVENTS_FLOOD_FRAMES
+                    || (raw_mode
+                        && st.frame >= EVENTS_FLOOD_EARLY_STOP_FRAMES
+                        && (st.max_gap_ms > FLOOD_MAX_GAP_MS
+                            || st.timer_max_ms > FLOOD_MAX_TIMER_MS));
+                if !done {
+                    let c = ns.borrow_mut().take();
+                    if let Some(c) = c {
+                        let jsfn = c.as_js_value().clone();
+                        ns.borrow_mut().replace(c);
+                        st.tick = Some(gloo_timers::callback::Timeout::new(
+                            FLOOD_FRAME_MS,
+                            move || {
+                                let _ = jsfn.unchecked_ref::<js_sys::Function>().call0(
+                                    &wasm_bindgen::JsValue::UNDEFINED,
+                                );
+                            },
+                        ));
+                    }
+                    None
+                } else {
+                    let gap = st.max_gap_ms;
+                    let clk = st.timer_max_ms;
+                    let frames = st.frame;
+                    drop(st);
+                    *alive.borrow_mut() = false;
+                    flood_report(
+                        Some(false),
+                        "pending",
+                        gap,
+                        clk,
+                        frames,
+                        state.events.with(|v| v.len()),
+                    );
+                    Some((gap, clk, frames))
+                }
+            };
+            if let Some((gap, clk, frames)) = done {
+                // The report above is a placeholder: recompute the real
+                // verdict now that the window has settled.
+                let pass = gap <= FLOOD_MAX_GAP_MS && clk <= FLOOD_MAX_TIMER_MS;
+                let len = state.events.with(|v| v.len());
+                let reason = if pass {
+                    format!(
+                        "event path stayed responsive (raw={}) window={len}",
+                        raw_mode
+                    )
+                } else {
+                    format!(
+                        "saturated on the event path (raw={raw_mode}, gap {gap:.0}ms / timer {clk:.0}ms), window={len}"
+                    )
+                };
+                flood_report(Some(pass), &reason, gap, clk, frames, len);
+            }
+        }) as Box<dyn Fn()>);
+        next_frame.borrow_mut().replace(driver);
+    }
+    {
+        let c = next_frame.borrow_mut().take().expect("driver stored");
+        let jsfn = c.as_js_value().clone();
+        next_frame.borrow_mut().replace(c);
+        ds.borrow_mut().first = Some(gloo_timers::callback::Timeout::new(
+            FLOOD_FRAME_MS,
+            move || {
+                let _ = jsfn
+                    .unchecked_ref::<js_sys::Function>()
+                    .call0(&wasm_bindgen::JsValue::UNDEFINED);
             },
         ));
     }

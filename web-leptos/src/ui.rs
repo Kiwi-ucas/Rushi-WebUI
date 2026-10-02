@@ -8,6 +8,7 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 
 use crate::api;
+use crate::plugins::PluginDef;
 use crate::model::{
     AppState, GoalView, SessionInfo, DirEntry, compute_rounds,
     dispatch_group_label, dispatch_groups, ordered_sessions,
@@ -96,7 +97,7 @@ pub fn read_layout_mode() -> String {
     }
 }
 
-fn set_layout_mode(mode: &str) {
+pub(crate) fn set_layout_mode(mode: &str) {
     if let Some(s) = web_sys::window().and_then(|w| w.local_storage().ok()).flatten() {
         let _ = s.set_item("rushi-layout", mode);
     }
@@ -144,7 +145,7 @@ pub fn read_theme_mode() -> String {
     }
 }
 
-fn set_theme_mode_stored(mode: &str) {
+pub(crate) fn set_theme_mode_stored(mode: &str) {
     if let Some(s) = web_sys::window().and_then(|w| w.local_storage().ok()).flatten() {
         let _ = s.set_item("rushi-theme", mode);
     }
@@ -212,7 +213,7 @@ pub fn theme_init(state: AppState) {
 /// shapes are drawn on the same 24-unit grid, sized by CSS, and the
 /// button box is uniform — cycling the mode no longer changes the
 /// button's size or position.
-fn theme_icon(mode: &str) -> AnyView {
+pub(crate) fn theme_icon(mode: &str) -> AnyView {
     match mode {
         "light" => view! {
             <svg class="tt-ic" viewBox="0 0 24 24" aria-hidden="true">
@@ -510,7 +511,14 @@ pub fn select_session(state: AppState, name: &str) {
         }
     }
     state.active_session.set(Some(name.to_string()));
+    // v0.5.55 P1: opening this session consumes its "finished, unviewed"
+    // green lamp. Remember the view so the 10 s `loops` poll and the
+    // connect-time `loops` frame do not re-seed the lamp for this session
+    // (the server's marker deletion, fired below, covers reloads).
+    state.loop_viewed.write().insert(name.to_string());
     state.events.set(Vec::new());
+    // v0.5.52: window cleared — drop the derived signals too.
+    state.clear_derived();
     state.view_round.set(None);
     state.ctx_used.set(0);
     state.rounds_ctxk.set(Vec::new());
@@ -532,6 +540,10 @@ pub fn select_session(state: AppState, name: &str) {
             s2.sessions.set(sessions);
         }
         ws::connect(&s2, &name2);
+        // v0.5.55 P1: fire-and-forget — tell the server this session was
+        // viewed so it deletes the `loop.last` marker and the green lamp
+        // does not come back on the next poll or reload.
+        api::mark_loop_viewed(&name2).await;
         s2.goal.set(api::load_goal(&name2).await);
         s2.loop_running.set(api::loop_running(&name2).await);
         // v0.5.38: fetch the full transcript right away so the loop-cmd
@@ -556,12 +568,11 @@ fn reset_panel_session(state: AppState) {
         ws::term_close(t.id);
     }
     ws::clear_all_term_writers();
-    state.rp_tabs.set(vec![RpTab {
-        id: 0,
-        kind: RpTabKind::Files,
-        path: String::new(),
-        label: "Files".to_string(),
-    }]);
+    // M13: reset to the EMPTY start view (no tabs). Files/terminal tabs
+    // are opened on demand via the start view's launcher buttons or the
+    // "+" menu; tab ids are connection-scoped, so a session switch drops
+    // every open tab.
+    state.rp_tabs.set(Vec::new());
     state.rp_active.set(0);
     state.rp_next_id.set(1);
     state.rp_term_seq.set(1);
@@ -581,6 +592,7 @@ pub fn delete_session(state: AppState, name: &str) {
                 if s2.active_session.get().as_deref() == Some(name_owned.as_str()) {
                     s2.active_session.set(None);
                     s2.events.set(Vec::new());
+                    s2.clear_derived();
                     s2.view_round.set(None);
                     s2.ctx_used.set(0);
                     s2.rounds_ctxk.set(Vec::new());
@@ -880,6 +892,9 @@ pub async fn do_send(state: AppState, content: String, queue: String) {
         state.rounds_ctxk.update(|v| v.push(state.ctx_used.get()));
     }
     state.events.update(|v| v.push(ev.clone()));
+    // v0.5.52: keep the derived signals current for the optimistic card
+    // (a user_message ⇒ the loop-cmd chip may change).
+    state.note_event(&ev);
     // v0.5.48: sending IS "watch this round". Re-arm the follow here, at
     // the one place the user's intent is unambiguous — the trigger
     // detection in the engine sees the same `user_message` type the loop
@@ -1380,7 +1395,7 @@ pub fn Sidebar(state: AppState) -> impl IntoView {
                     />
                     </Show>
                 </div>
-                <GoalPanel state=state />
+                <PluginArea state=state />
                 <div id="status-bar">
                     <span class=ws_dot_class></span>
                     { move || ws_status.get() }
@@ -1462,89 +1477,276 @@ pub fn Sidebar(state: AppState) -> impl IntoView {
     }
 }
 
-// ── goal panel ─────────────────────────────────────────────────────
+// ── sidebar plugin area (v0.5.53) ─────────────────────────────────
+// v0.5.53: the sidebar's lower slot is a generic plugin area. A thin
+// switch bar (‹ [plugin ▾] ›) sits above the active plugin's view; the
+// shared #plugin-area chrome carries the height cap so one long prompt
+// can never crush the session list. Plugins register in plugins.rs
+// (compile-time registry + one match arm in plugin_view below).
 #[component]
-fn GoalPanel(state: AppState) -> impl IntoView {
+pub fn PluginArea(state: AppState) -> impl IntoView {
+    let active = state.active_plugin;
+    let menu_open = state.plugin_menu_open;
+    let n_plugins = crate::plugins::count();
+
+    view! {
+        <div id="plugin-area">
+            <div id="plugin-bar">
+                <button
+                    id="plugin-prev"
+                    title="previous plugin"
+                    disabled={n_plugins <= 1}
+                    on:click=move |_| {
+                        let cur = active.get();
+                        after_dispatch(move || {
+                            active.set(crate::plugins::prev_id(cur.as_str()).to_string());
+                            menu_open.set(false);
+                        });
+                    }
+                >
+                    { "\u{2039}" }
+                </button>
+                <button
+                    id="plugin-list"
+                    title="switch plugin"
+                    on:click=move |_| {
+                        let open = !menu_open.get();
+                        after_dispatch(move || menu_open.set(open));
+                    }
+                >
+                    { move || crate::plugins::label(active.get().as_str()) }
+                    <span class="plugin-caret">{ "\u{25BE}" }</span>
+                </button>
+                <button
+                    id="plugin-next"
+                    title="next plugin"
+                    disabled={n_plugins <= 1}
+                    on:click=move |_| {
+                        let cur = active.get();
+                        after_dispatch(move || {
+                            active.set(crate::plugins::next_id(cur.as_str()).to_string());
+                            menu_open.set(false);
+                        });
+                    }
+                >
+                    { "\u{203A}" }
+                </button>
+                <Show when=move || menu_open.get() fallback=|| ()>
+                    <div
+                        id="plugin-menu"
+                        on:click=move |e: MouseEvent| { e.stop_propagation(); }
+                    >
+                        <For
+                            each=move || crate::plugins::PLUGINS.to_vec()
+                            key=|p: &PluginDef| p.id
+                            children=move |p: PluginDef| {
+                                let label = p.label;
+                                view! {
+                                    <button
+                                        class=move || {
+                                            if active.get() == p.id { "plugin-item on" } else { "plugin-item" }
+                                        }
+                                        on:click=move |_| {
+                                            let id = p.id.to_string();
+                                            after_dispatch(move || {
+                                                active.set(id);
+                                                menu_open.set(false);
+                                            });
+                                        }
+                                    >
+                                        { label }
+                                    </button>
+                                }
+                            }
+                        />
+                    </div>
+                </Show>
+            </div>
+            <div id="plugin-view">
+                { move || plugin_view(active, state) }
+            </div>
+        </div>
+    }
+}
+
+/// Render the active plugin's view into #plugin-view — one match arm per
+/// registered plugin (registry: plugins.rs).
+fn plugin_view(active: RwSignal<String>, state: AppState) -> AnyView {
+    match active.get().as_str() {
+        "goal" => goal_plugin_view(state).into_any(),
+        "essence" => essence_plugin_view(state).into_any(),
+        "rewind" => crate::rewind::rewind_plugin_view(state).into_any(),
+        _ => view! { <div class="plugin-empty">{ "plugin not found" }</div> }.into_any(),
+    }
+}
+
+/// The goal plugin — the first registered plugin. It renders the goal
+/// prompt, status badge, meta line and the new/pause/resume/clear actions.
+/// The height cap + switch bar live in the shared #plugin-area chrome, so
+/// this view is content-only: no outer panel, no header (the bar's list
+/// button shows the plugin name, in the former goal-header typography).
+fn goal_plugin_view(state: AppState) -> impl IntoView {
     let goal = state.goal;
 
     view! {
-        <div id="goal-panel">
-            <div class="goal-header">{ "goal" }</div>
-            <div id="goal-body">
-                { move || match goal.get() {
-                    Some(ref g) => goal_body_view(g),
-                    None => view! { <div class="goal-empty">{ "no goal" }</div> }.into_any(),
-                } }
+        <div id="goal-body">
+            { move || match goal.get() {
+                Some(ref g) => goal_body_view(g),
+                None => view! { <div class="goal-empty">{ "no goal" }</div> }.into_any(),
+            } }
+        </div>
+        <div class="goal-actions">
+            <button
+                id="goal-create"
+                on:click=move |_| {
+                    let Some(text) = web_sys::window()
+                        .and_then(|w| w.prompt_with_message("New goal:").ok())
+                        .flatten()
+                    else {
+                        return;
+                    };
+                    let t = text.trim().to_string();
+                    if t.is_empty() {
+                        return;
+                    }
+                    let s = state;
+                    spawn_local(async move {
+                        let id = s.active_session.get().unwrap_or_default();
+                        api::goal_action(&id, "create", Some(&t)).await;
+                        s.goal.set(api::load_goal(&id).await);
+                    });
+                }
+            >
+                { "new" }
+            </button>
+            <button
+                id="goal-pause"
+                on:click=move |_| {
+                    let s = state;
+                    spawn_local(async move {
+                        let id = s.active_session.get().unwrap_or_default();
+                        api::goal_action(&id, "pause", None).await;
+                        s.goal.set(api::load_goal(&id).await);
+                    });
+                }
+            >
+                { "pause" }
+            </button>
+            <button
+                id="goal-resume"
+                on:click=move |_| {
+                    let s = state;
+                    spawn_local(async move {
+                        let id = s.active_session.get().unwrap_or_default();
+                        api::goal_action(&id, "resume", None).await;
+                        s.goal.set(api::load_goal(&id).await);
+                    });
+                }
+            >
+                { "resume" }
+            </button>
+            <button
+                id="goal-clear"
+                on:click=move |_| {
+                    if web_sys::window()
+                        .and_then(|w| w.confirm_with_message("Clear the current goal?").ok())
+                        .unwrap_or(false)
+                    {
+                        let s = state;
+                        spawn_local(async move {
+                            let id = s.active_session.get().unwrap_or_default();
+                            api::goal_action(&id, "clear", None).await;
+                            s.goal.set(api::load_goal(&id).await);
+                        });
+                    }
+                }
+            >
+                { "clear" }
+            </button>
+        </div>
+    }
+}
+
+/// v0.5.54: the essence plugin — a read-only display of the active session's
+/// session-essence entries (invariants + beliefs). Data comes from the
+/// harness's `essence` store via GET /api/sessions/{id}/essence; refetched
+/// on mount and whenever the active session changes. Content-only: no outer
+/// panel / header — the shared #plugin-area chrome carries the cap + bar.
+fn essence_plugin_view(state: AppState) -> impl IntoView {
+    let entries = RwSignal::new(Option::<Vec<crate::model::EssenceEntry>>::None);
+    let sess = state.active_session;
+
+    Effect::new(move || {
+        let s = match sess.get() {
+            Some(s) => s.clone(),
+            None => {
+                entries.set(None);
+                return;
+            }
+        };
+        let ent = entries;
+        spawn_local(async move {
+            let v = api::load_essence(&s).await.unwrap_or_default();
+            ent.set(Some(v));
+        });
+    });
+
+    view! {
+        <div id="essence-body">
+            { move || match entries.get() {
+                None => view! { <div class="essence-loading">{ "loading\u{2026}" }</div> }.into_any(),
+                Some(es) if es.is_empty() => view! { <div class="essence-empty">{ "no essence entries yet" }</div> }.into_any(),
+                Some(es) => {
+                    let inv: Vec<crate::model::EssenceEntry> = es.iter().filter(|e| e.kind == "invariant").cloned().collect();
+                    let bel: Vec<crate::model::EssenceEntry> = es.iter().filter(|e| e.kind == "belief").cloned().collect();
+                    let inv_active = inv.iter().filter(|e| e.active).count();
+                    let bel_active = bel.iter().filter(|e| e.active).count();
+                    let inv_total = inv.len();
+                    let bel_total = bel.len();
+                    view! {
+                        <div class="essence-groups">
+                            <div class="essence-group">
+                                <div class="essence-group-head">
+                                    <span class="essence-group-label inv">{ "invariants" }</span>
+                                    <span class="essence-count">{ format!("{inv_active}/{inv_total} active") }</span>
+                                </div>
+                                <For
+                                    each=move || inv.clone()
+                                    key=|e: &crate::model::EssenceEntry| e.id.clone()
+                                    children=move |e: crate::model::EssenceEntry| essence_entry_view(e)
+                                />
+                            </div>
+                            <div class="essence-group">
+                                <div class="essence-group-head">
+                                    <span class="essence-group-label bel">{ "beliefs" }</span>
+                                    <span class="essence-count">{ format!("{bel_active}/{bel_total} active") }</span>
+                                </div>
+                                <For
+                                    each=move || bel.clone()
+                                    key=|e: &crate::model::EssenceEntry| e.id.clone()
+                                    children=move |e: crate::model::EssenceEntry| essence_entry_view(e)
+                                />
+                            </div>
+                        </div>
+                    }.into_any()
+                }
+            } }
+        </div>
+    }
+}
+
+/// One essence entry: an id chip + an active/demoted state chip + the text.
+fn essence_entry_view(e: crate::model::EssenceEntry) -> impl IntoView {
+    let id = e.id.clone();
+    let text = e.text.clone();
+    let active = e.active;
+    view! {
+        <div class=move || if active { "essence-entry on" } else { "essence-entry" }>
+            <div class="essence-entry-head">
+                <span class="essence-id">{ id }</span>
+                <span class=move || if active { "essence-state on" } else { "essence-state" }>{ move || if active { "active" } else { "demoted" } }</span>
             </div>
-            <div class="goal-actions">
-                <button
-                    id="goal-create"
-                    on:click=move |_| {
-                        let Some(text) = web_sys::window()
-                            .and_then(|w| w.prompt_with_message("New goal:").ok())
-                            .flatten()
-                        else {
-                            return;
-                        };
-                        let t = text.trim().to_string();
-                        if t.is_empty() {
-                            return;
-                        }
-                        let s = state;
-                        spawn_local(async move {
-                            let id = s.active_session.get().unwrap_or_default();
-                            api::goal_action(&id, "create", Some(&t)).await;
-                            s.goal.set(api::load_goal(&id).await);
-                        });
-                    }
-                >
-                    { "new" }
-                </button>
-                <button
-                    id="goal-pause"
-                    on:click=move |_| {
-                        let s = state;
-                        spawn_local(async move {
-                            let id = s.active_session.get().unwrap_or_default();
-                            api::goal_action(&id, "pause", None).await;
-                            s.goal.set(api::load_goal(&id).await);
-                        });
-                    }
-                >
-                    { "pause" }
-                </button>
-                <button
-                    id="goal-resume"
-                    on:click=move |_| {
-                        let s = state;
-                        spawn_local(async move {
-                            let id = s.active_session.get().unwrap_or_default();
-                            api::goal_action(&id, "resume", None).await;
-                            s.goal.set(api::load_goal(&id).await);
-                        });
-                    }
-                >
-                    { "resume" }
-                </button>
-                <button
-                    id="goal-clear"
-                    on:click=move |_| {
-                        if web_sys::window()
-                            .and_then(|w| w.confirm_with_message("Clear the current goal?").ok())
-                            .unwrap_or(false)
-                        {
-                            let s = state;
-                            spawn_local(async move {
-                                let id = s.active_session.get().unwrap_or_default();
-                                api::goal_action(&id, "clear", None).await;
-                                s.goal.set(api::load_goal(&id).await);
-                            });
-                        }
-                    }
-                >
-                    { "clear" }
-                </button>
-            </div>
+            <div class="essence-text">{ text }</div>
         </div>
     }
 }
@@ -1646,11 +1848,14 @@ pub fn ContextBar(state: AppState) -> impl IntoView {
                 </div>
                 <span id="ctx-pct">{ ctx_pct }</span>
                 <span id="ctx-k">{ ctx_k }</span>
-                // M8: right tool panel toggle (Files tree / preview /
-                // terminal). Right edge of the context bar, symmetric to
-                // the sidebar's own edge buttons.
+                // M8/M13: right tool panel toggle. Right edge of the
+                // context bar, symmetric to the sidebar's own edge
+                // buttons. M13: redesigned as a stateful "panel" icon
+                // (the right column fills with the accent when open) on
+                // a neomorphic 26×26 pill, replacing the old ▢/▣ glyph.
                 <button
                     id="rp-toggle"
+                    class=move || if state.rp_open.get() { "rp-toggle active" } else { "rp-toggle" }
                     title=move || {
                         if state.rp_open.get() {
                             "close the right panel".to_string()
@@ -1660,7 +1865,7 @@ pub fn ContextBar(state: AppState) -> impl IntoView {
                     }
                     on:click=move |_| toggle_rp(state)
                 >
-                    { move || if state.rp_open.get() { "▣" } else { "▢" } }
+                    { move || rp_toggle_icon(state.rp_open.get()) }
                 </button>
             </div>
             <div id="ctx-rounds">
@@ -1678,10 +1883,27 @@ fn rounds_view(
     view_round: RwSignal<Option<usize>>,
     state: AppState,
 ) -> AnyView {
-    let rounds = compute_rounds(&events.get());
+    // v0.5.52: ONE borrow for everything this view needs from `events`.
+    // `events.get()` deep-clones the whole event Vec and this view
+    // re-runs on every appended event (O(N) per event — §9.13), so we
+    // take the borrow and lift out only what is needed (the round
+    // ranges + each round's user text).
+    let (rounds, user_texts) = events.with(|evs| {
+        let rounds = compute_rounds(evs);
+        let texts: Vec<String> = rounds
+            .iter()
+            .map(|r| {
+                evs.get(r.start)
+                    .and_then(|e| e.get("content"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .collect();
+        (rounds, texts)
+    });
     let n = rounds.len();
     let slots = 6.max(n);
-    let evs = events.get();
     let ctxk = state.rounds_ctxk.get();
 
     // v0.5.21: global round numbering. When the loaded window is
@@ -1696,13 +1918,9 @@ fn rounds_view(
 
     let chips: Vec<AnyView> = (0..slots).map(|i| {
         if i < n {
-            let range = &rounds[i];
-            let user_text = evs
-                .get(range.start)
-                .and_then(|e| e.get("content"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+            // v0.5.52: `rounds[i]` is no longer read here — the round's
+            // user text is lifted out of the single borrow above.
+            let user_text = user_texts.get(i).cloned().unwrap_or_default();
             let k = ctxk.get(i).copied().unwrap_or(0);
             let mut lines: Vec<String> = Vec::new();
             if !user_text.is_empty() {
@@ -1776,8 +1994,10 @@ fn rounds_view(
                         if state.loading_earlier.get() {
                             "\u{22ef}\u{2026}".to_string()
                         } else {
+                            // v0.5.52: borrow instead of cloning the whole
+                            // event Vec on every append (§9.13).
                             let m = state.hist_total_rounds.get().saturating_sub(
-                                compute_rounds(&events.get()).len() as u64,
+                                events.with(|v| compute_rounds(v).len()) as u64,
                             );
                             format!("\u{22ef}{m}")
                         }
@@ -1797,16 +2017,24 @@ fn rounds_view(
 // ── status strip (port of updateStatusStrip) ──────────────────────
 #[component]
 pub fn StatusStrip(state: AppState) -> impl IntoView {
-    let events = state.events;
-
     view! {
         <div id="status-strip">
-            { move || status_strip_chips(&events.get()) }
+            // v0.5.52: the strip reads only the incrementally maintained
+            // `last_ext` map (O(1) per appended event; no whole-window
+            // scan and no view rebuild unless an id's value changed).
+            { move || state.last_ext.with(|m| status_strip_chips(m)) }
         </div>
     }
 }
 
-fn status_strip_chips(events: &[serde_json::Value]) -> AnyView {
+/// v0.5.52: the PRE-P2 shape, kept verbatim for the `?test=freeze
+/// mode=events flood=raw` NEGATIVE CONTROL — it walks the whole event
+/// window and rebuilds every chip, which is what the app did on each
+/// appended event before the incremental `last_ext` map. The control
+/// only discriminates while this stays faithful, so do not "optimise"
+/// it.
+#[allow(dead_code)]
+pub(crate) fn status_strip_chips_full(events: &[serde_json::Value]) -> AnyView {
     use std::collections::HashMap;
     let mut latest: HashMap<String, String> = HashMap::new();
     for ev in events {
@@ -1816,15 +2044,16 @@ fn status_strip_chips(events: &[serde_json::Value]) -> AnyView {
         let Some(id) = ev.get("id").and_then(|v| v.as_str()) else {
             continue;
         };
-        let v = ev.get("value").cloned();
-        let s = match &v {
-            Some(serde_json::Value::Null) => "null".to_string(),
-            Some(x @ serde_json::Value::Object(_) | x @ serde_json::Value::Array(_)) => x.to_string(),
-            Some(x) => x.to_string(),
-            None => String::new(),
-        };
+        let s = crate::model::ext_status_value_str(ev.get("value"));
         latest.insert(id.to_string(), s);
     }
+    status_strip_chips(&latest)
+}
+
+/// v0.5.52: chips are built from the incrementally maintained
+/// `AppState::last_ext` map (plan §9.13/§9.14 P2) — this used to scan
+/// the whole event window and rebuild every chip on each appended event.
+fn status_strip_chips(latest: &std::collections::HashMap<String, String>) -> AnyView {
     let order = ["loop_phase", "model_thinking", "hook_applied", "model_call_context"];
     let mut ids: Vec<String> = order
         .iter()
@@ -2436,6 +2665,28 @@ fn tab_icon_term() -> impl IntoView {
     }
 }
 
+/// M13: 16×16 "panel on the right" icon for the #rp-toggle button.
+/// When the panel is open the right column is filled (accent), when it
+/// is closed only the outline shows — so the control reads as a state
+/// indicator, not just a static glyph.
+fn rp_toggle_icon(open: bool) -> impl IntoView {
+    view! {
+        <svg class="rp-toggle-ic" viewBox="0 0 16 16" aria_hidden="true">
+            <rect class="ln" x="1.5" y="2.5" width="13" height="11" rx="2.5" />
+            <path class="ln" d="M10.5 2.5v11" />
+            <rect
+                class=move || {
+                    if open { "rp-toggle-fill" } else { "rp-toggle-fill off" }
+                }
+                x="10.5"
+                y="2.5"
+                width="4"
+                height="11"
+            />
+        </svg>
+    }
+}
+
 /// M8/M11: extension label for the preview name chip ("PNG", "RS", …),
 /// falling back to "FILE" for extension-less names.
 fn ext_label(name: &str) -> String {
@@ -2520,6 +2771,32 @@ fn toggle_dir(state: AppState, rel: &str) {
     if opening && !state.rp_children.get().contains_key(rel) {
         ensure_dir_loaded(state, rel);
     }
+}
+
+/// M13: open (or refocus) the Files tree tab. The Files tab has the
+/// stable id 0; if it is already open we just focus it, otherwise we
+/// (re)create it and focus it. Used by the panel start view's Files
+/// launcher and the "+" menu.
+fn open_files_tab(state: AppState) {
+    if let Some(id) = state
+        .rp_tabs
+        .get()
+        .iter()
+        .find(|t| t.kind == RpTabKind::Files)
+        .map(|t| t.id)
+    {
+        state.rp_active.set(id);
+        return;
+    }
+    state.rp_tabs.update(|tabs| {
+        tabs.push(RpTab {
+            id: 0,
+            kind: RpTabKind::Files,
+            path: String::new(),
+            label: "Files".to_string(),
+        });
+    });
+    state.rp_active.set(0);
 }
 
 /// M11: open a file in the panel. If a tab already has it, just focus
@@ -2631,15 +2908,14 @@ fn new_terminal(state: AppState) {
     state.rp_active.set(id);
 }
 
-/// M11: close one tab. Terminal tabs close their pty on the server
+/// M11/M13: close one tab. Terminal tabs close their pty on the server
 /// (`term_close{id}` — the connection stays open, the other tabs'
-/// shells keep running). File tabs just drop their cached preview/error.
-/// The Files home tab (id 0) is permanent. After closing the active tab,
-/// focus moves to the previous tab (or the home tab).
+/// shells keep running). File/Files tabs just drop their cached
+/// preview/error. M13: the Files tab (id 0) is now closable too —
+/// closing the last tab leaves the panel on its empty start view.
+/// After closing the active tab, focus moves to the previous tab
+/// (or the start view when none remain).
 fn close_tab(state: AppState, id: u32) {
-    if id == 0 {
-        return; // the Files home tab is permanent
-    }
     let kind = match state.rp_tabs.get().iter().find(|t| t.id == id) {
         Some(t) => t.kind,
         None => return,
@@ -2946,18 +3222,22 @@ fn tab_pane(state: AppState, tab: RpTab) -> AnyView {
     .into_any()
 }
 
-/// M8/M11: the right tool panel — a fixed 420 px column in #app
+/// M8/M11/M13: the right tool panel — a fixed 420 px column in #app
 /// (sibling of #main, so #main shrinks to make room). Browser-style
-/// multi-tab: a persistent "Files" home tab (id 0, not closable) owns
-/// the directory tree; every opened file or terminal becomes its own
-/// closable tab; the "+" button spawns a new terminal (max 4, mirroring
-/// the server's pty cap). Hidden in the "full" dispatch layout (that
-/// view owns the whole window) and when the context-bar toggle is off.
+/// multi-tab: M13 starts on an EMPTY "start" view (no tabs) with two
+/// launcher buttons (Files / Terminal); opening one creates that tab.
+/// The "+" button only appears once a tab exists, and opens a small
+/// dropdown (Files / Terminal) rather than spawning a terminal directly.
+/// Every tab — including Files — is closable; closing the last one
+/// returns the panel to the start view. Hidden in the "full" dispatch
+/// layout and when the context-bar toggle is off.
 #[component]
 pub fn RightPanel(state: AppState) -> impl IntoView {
     let tabs = state.rp_tabs;
     let active_id = state.rp_active;
     let active_session = state.active_session;
+    // M13: the "+" dropdown's open state (local to this panel).
+    let plus_menu = create_rw_signal(false);
 
     view! {
         <aside id="right-panel">
@@ -2970,7 +3250,6 @@ pub fn RightPanel(state: AppState) -> impl IntoView {
                             let t_id = tab.id;
                             let t_kind = tab.kind;
                             let t_label = tab.label.clone();
-                            let closable = tab.id != 0;
                             view! {
                                 <div
                                     class=move || {
@@ -2998,36 +3277,72 @@ pub fn RightPanel(state: AppState) -> impl IntoView {
                                         }
                                         <span class="rp-tab-label">{ t_label.clone() }</span>
                                     </button>
-                                    {
-                                        move || {
-                                            if closable {
-                                                Some(view! {
-                                                    <button
-                                                        class="rp-tab-x"
-                                                        title="close tab"
-                                                        on:click=move |_| close_tab(state, t_id)
-                                                    >
-                                                        { "\u{00d7}" }
-                                                    </button>
-                                                })
-                                            } else {
-                                                None
-                                            }
-                                        }
-                                    }
+                                    <button
+                                        class="rp-tab-x"
+                                        title="close tab"
+                                        on:click=move |_| close_tab(state, t_id)
+                                    >
+                                        { "\u{00d7}" }
+                                    </button>
                                 </div>
                             }
                         }
                     />
                 </div>
-                <button
-                    class="rp-tab-new"
-                    title="new terminal (max 4 open)"
-                    disabled=move || active_session.get().is_none()
-                    on:click=move |_| new_terminal(state)
+                // M13: the "+" button (dropdown) is only present once a tab
+                // exists — the empty start view carries its own launchers.
+                <Show
+                    when=move || !tabs.get().is_empty()
+                    fallback=|| ()
                 >
-                    { "+" }
-                </button>
+                    <div class="rp-tabnew-wrap">
+                        <button
+                            class="rp-tab-new"
+                            id="rp-tab-new"
+                            title="new tab"
+                            disabled=move || active_session.get().is_none()
+                            on:click=move |_| plus_menu.set(!plus_menu.get())
+                        >
+                            { "+" }
+                        </button>
+                        <Show when=move || plus_menu.get() fallback=|| ()>
+                            {
+                                move || {
+                                    if plus_menu.get() {
+                                        Some(view! {
+                                            <div class="rp-menu-backdrop"
+                                                on:click=move |_| plus_menu.set(false) />
+                                            <div class="rp-tabnew-menu" id="rp-tabnew-menu">
+                                                <button
+                                                    class="rp-menu-item"
+                                                    on:click=move |_| {
+                                                        plus_menu.set(false);
+                                                        open_files_tab(state);
+                                                    }
+                                                >
+                                                    { tab_icon_files() }
+                                                    <span>Files</span>
+                                                </button>
+                                                <button
+                                                    class="rp-menu-item"
+                                                    on:click=move |_| {
+                                                        plus_menu.set(false);
+                                                        new_terminal(state);
+                                                    }
+                                                >
+                                                    { tab_icon_term() }
+                                                    <span>Terminal</span>
+                                                </button>
+                                            </div>
+                                        })
+                                    } else {
+                                        None
+                                    }
+                                }
+                            }
+                        </Show>
+                    </div>
+                </Show>
             </div>
             <div class="rp-body">
                 <For
@@ -3035,6 +3350,36 @@ pub fn RightPanel(state: AppState) -> impl IntoView {
                     key=|t: &RpTab| t.id.to_string()
                     children=move |tab| tab_pane(state, tab)
                 />
+                // M13: the empty "start" view — two launcher buttons that
+                // create the Files / Terminal tab the user picks.
+                <Show when=move || tabs.get().is_empty() fallback=|| ()>
+                    <div class="rp-start">
+                        <div class="rp-start-hint">open a tool</div>
+                        <button
+                            class="rp-start-btn"
+                            id="rp-start-files"
+                            on:click=move |_| open_files_tab(state)
+                        >
+                            { tab_icon_files() }
+                            <div class="rp-start-txt">
+                                <div class="rp-start-name">Files</div>
+                                <div class="rp-start-sub">directory tree &amp; previews</div>
+                            </div>
+                        </button>
+                        <button
+                            class="rp-start-btn"
+                            id="rp-start-term"
+                            disabled=move || active_session.get().is_none()
+                            on:click=move |_| new_terminal(state)
+                        >
+                            { tab_icon_term() }
+                            <div class="rp-start-txt">
+                                <div class="rp-start-name">Terminal</div>
+                                <div class="rp-start-sub">a live shell</div>
+                            </div>
+                        </button>
+                    </div>
+                </Show>
             </div>
         </aside>
     }

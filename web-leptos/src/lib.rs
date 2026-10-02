@@ -5,10 +5,13 @@ mod markdown;
 mod model;
 mod ms;
 mod pile;
+mod plugins;
+mod rewind;
 mod terminal;
 mod timeutil;
 mod transcript;
 mod ui;
+mod win;
 mod ws;
 
 /// v0.5.40: build-time webui version, injected by `build.rs`
@@ -66,8 +69,18 @@ fn App() -> impl IntoView {
     {
         let st = state;
         Effect::new(move || {
-            let s = model::last_user_command_slice(&st.events.get());
-            if !s.is_empty() {
+            // v0.5.52: borrow (was a whole-Vec deep clone per event) AND
+            // only touch `loop_cmd` when the command actually changed —
+            // writing it on every appended event re-rendered the loop-cmd
+            // chip at event rate (§9.13).
+            // v0.5.52: watch ONLY the user-message generation, not the
+            // whole event list — an ordinary appended event no longer
+            // re-derives the chip (the window read is untracked).
+            let _ = st.cmd_gen.get();
+            let s = st
+                .events
+                .with_untracked(|v| model::last_user_command_slice(v));
+            if !s.is_empty() && st.loop_cmd.get_untracked() != s {
                 st.loop_cmd.set(s);
             }
         });
@@ -144,6 +157,47 @@ fn App() -> impl IntoView {
         }
     });
 
+    // v0.5.55 P0/P1: resync the sidebar loop lamps from the server's
+    // full loop state on mount + every 10s — independent of any WS
+    // connection. A fresh page load has no active session, so no WS is
+    // open, so the connect-time `loops` frame never arrives and the
+    // lamps stay off until a session is clicked. The server's
+    // `GET /api/loops` is the source of truth (in-memory map + `loop.pid`
+    // liveness + `loop.last` markers), so this is correct even across a
+    // server restart.
+    let s4 = state;
+    spawn_local(async move {
+        loop {
+            let snap = api::load_loops().await;
+            {
+                let mut set = s4.looping_sessions.write();
+                set.clear();
+                for n in &snap.running {
+                    set.insert(n.clone());
+                }
+            }
+            // Seed the green "finished, unviewed" lamps from the
+            // server's `finished` list: a session whose loop ended while
+            // this client was away. Skipped when the loop is running
+            // again, or when the user already viewed that session
+            // (loop_viewed) — viewing consumed the lamp. The poll only
+            // ADDS; removal is owned by the live loop_status frames and
+            // select_session.
+            {
+                let viewed = s4.loop_viewed.get();
+                let mut du = s4.loop_done_unviewed.write();
+                for name in &snap.finished {
+                    if !snap.running.iter().any(|r| r == name)
+                        && !viewed.contains(name)
+                    {
+                        du.insert(name.clone());
+                    }
+                }
+            }
+            gloo_timers::future::TimeoutFuture::new(10_000).await;
+        }
+    });
+
     // v0.5.23: freeze regression test (?test=freeze): ~1.5s after
     // mount, drive a synthetic model-stream flood through the real
     // coalescing path and report a PASS/FAIL verdict (console +
@@ -155,9 +209,20 @@ fn App() -> impl IntoView {
             .and_then(|w| w.location().search().ok())
             .unwrap_or_default();
         if search.contains("test=freeze") {
+            // v0.5.52: `&mode=events` runs the same verdict against the
+            // EVENT append path (the shape that actually froze: whole
+            // window clones + no cap, §9.13) instead of the delta path.
+            // `&flood=raw` stays the pre-fix negative control in both
+            // modes.
+            let mode_events = search.contains("mode=events");
+            let raw = search.contains("flood=raw");
             spawn_local(async move {
                 gloo_timers::future::TimeoutFuture::new(1_500).await;
-                crate::ws::run_freeze_test();
+                if mode_events {
+                    crate::ws::run_freeze_test_events(raw);
+                } else {
+                    crate::ws::run_freeze_test();
+                }
             });
         }
     }
@@ -192,6 +257,11 @@ fn App() -> impl IntoView {
             layout.to_string()
         }
     };
+
+    // Rewind plugin: one tree fetch for the whole app (the History view and
+    // the sidebar panel both read `state.rewind_tree`); keyed on the active
+    // session + the structure-generation counter.
+    crate::rewind::register_tree_effect(state);
 
     view! {
         <div id="app" class=app_class>
@@ -242,6 +312,16 @@ fn App() -> impl IntoView {
                 </Show>
                 <ui::InputModule state=state />
             </main>
+            // Rewind plugin: the rebuilt expanded view — a full-window
+            // History interface (session rail + the conversation tree),
+            // mounted only in `layout-full` (the sidebar/main are hidden
+            // there by CSS). See crates::rewind.
+            <Show
+                when=move || state.layout_mode.get() == "full"
+                fallback=|| ()
+            >
+                { crate::rewind::history_view(state) }
+            </Show>
             // M8: the right tool panel (Files tree + preview / terminal).
             // A flex column in #app — `#main` shrinks to make room.
             // Hidden in the "full" layout (the dispatch view owns the
@@ -256,6 +336,7 @@ fn App() -> impl IntoView {
             </Show>
             <ui::NewSessionDialog state=state />
             <ui::DeleteConfirmDialog state=state />
+            { crate::rewind::rewind_confirm_dialog(state) }
             <ms::ModelSettingsDialog state=state />
         </div>
     }
@@ -297,5 +378,9 @@ mod entry {
             .dyn_into()
             .expect("mount-root is an HtmlElement");
         leptos::mount::mount_to(el, || App()).forget();
+        // v0.5.52: expose the event-window bounds to the probe suites.
+        if let Some(st) = crate::model::AppState::current_app_state() {
+            crate::win::register_debug_hook(st);
+        }
     }
 }

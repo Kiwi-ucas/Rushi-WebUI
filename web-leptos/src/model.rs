@@ -187,7 +187,10 @@ pub struct FilePreview {
 /// The kind of one right-panel tab.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum RpTabKind {
-    /// The persistent home tab: the Files tree (not closable, id 0).
+    /// The Files tree. M13: no longer a permanent home tab — the panel
+    /// starts empty (a "start" view with Files/Terminal launcher
+    /// buttons); a Files tab is opened on demand (id 0, empty path) and
+    /// is closable like the others.
     Files,
     /// A text/code/image preview of one file (closable).
     File,
@@ -195,11 +198,13 @@ pub enum RpTabKind {
     Term,
 }
 
-/// One open right-panel tab. The `Files` home tab has `id == 0`, an
-/// empty `path` and the label "Files". File tabs carry the workdir-
-/// relative `path`; terminal tabs carry an empty `path` and the label
-/// "Term N". Terminal tab ids double as the server's pty ids, so a tab
-/// closing maps 1:1 onto `term_close{id}`.
+/// One open right-panel tab. The `Files` tab has `id == 0`, an empty
+/// `path` and the label "Files" (re-opened after closing always
+/// re-uses id 0, so the per-tab error/preview slots keyed at 0 stay
+/// valid). File tabs carry the workdir-relative `path`; terminal tabs
+/// carry an empty `path` and the label "Term N". Terminal tab ids
+/// double as the server's pty ids, so a tab closing maps 1:1 onto
+/// `term_close{id}`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RpTab {
     pub id: u32,
@@ -312,6 +317,176 @@ impl GoalView {
     }
 }
 
+/// v0.5.54: one session-essence entry (sidebar essence plugin, read-only).
+/// Mirrors the harness `essence` store (`rushi-essence/essence-state::Entry`,
+/// `sessions/<id>/essence.json`). `kind` is "invariant" or "belief".
+#[derive(Clone, Debug, Deserialize)]
+pub struct EssenceEntry {
+    pub id: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub active: bool,
+    #[serde(default)]
+    pub survivals: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retracted_reason: Option<String>,
+}
+
+/// Rewind plugin: one node of the conversation history tree = one user
+/// message = one loop round. Projected server-side from `events.jsonl`
+/// (`GET /api/sessions/{id}/rewind`); rendered by the full-window History
+/// view and summarized in the sidebar plugin panel.
+#[derive(Clone, Debug, Deserialize)]
+pub struct RewindNode {
+    /// 1-based log line of this round's user message (the rewind target).
+    pub seq: u64,
+    /// 1-based round index.
+    #[serde(default)]
+    pub round: u64,
+    #[serde(default)]
+    pub ts: String,
+    #[serde(default)]
+    pub summary: String,
+    /// Non-`ext_status` events folded into this round (the agent's work).
+    #[serde(default)]
+    pub events: u64,
+    /// "active" (on the active path) | "abandoned" (a masked fork).
+    #[serde(default)]
+    pub state: String,
+    /// The "you are here" round.
+    #[serde(default)]
+    pub current: bool,
+    #[serde(default)]
+    pub retracted: bool,
+    #[serde(default)]
+    pub children: Vec<RewindNode>,
+}
+
+/// Rewind plugin: one `rewind` marker (a fork point) at its log line.
+#[derive(Clone, Debug, Deserialize)]
+pub struct RewindMarker {
+    pub seq: u64,
+    pub target_seq: u64,
+    #[serde(default)]
+    pub mode: String,
+}
+
+/// Rewind plugin: a compaction boundary — a rewind targeting below
+/// `first_kept_seq` degrades to the boundary (kernel rule I4).
+#[derive(Clone, Debug, Deserialize)]
+pub struct RewindBoundary {
+    pub seq: u64,
+    pub first_kept_seq: u64,
+}
+
+/// Rewind plugin: the projected history tree of one session.
+#[derive(Clone, Debug, Deserialize)]
+pub struct RewindTree {
+    #[serde(default)]
+    pub session: String,
+    #[serde(default)]
+    pub total_events: u64,
+    #[serde(default)]
+    pub total_rounds: u64,
+    #[serde(default)]
+    pub roots: Vec<RewindNode>,
+    #[serde(default)]
+    pub rewinds: Vec<RewindMarker>,
+    #[serde(default)]
+    pub boundaries: Vec<RewindBoundary>,
+    /// The "you are here" round's log line.
+    #[serde(default)]
+    pub current_seq: Option<u64>,
+    /// Where the next context assembly ends (equal to `current_seq`).
+    #[serde(default)]
+    pub pending_from: Option<u64>,
+    /// The log's tail is a rewind marker (settled at the target).
+    #[serde(default)]
+    pub settled: bool,
+}
+
+impl RewindTree {
+    fn count(nodes: &[RewindNode]) -> usize {
+        nodes.iter().map(|n| 1 + Self::count(&n.children)).sum()
+    }
+    fn active_count(nodes: &[RewindNode]) -> usize {
+        nodes
+            .iter()
+            .filter(|n| n.state == "active")
+            .map(|n| 1 + Self::active_count(&n.children))
+            .sum()
+    }
+    fn find_current(nodes: &[RewindNode]) -> Option<&RewindNode> {
+        for n in nodes {
+            if n.current {
+                return Some(n);
+            }
+            if let Some(x) = Self::find_current(&n.children) {
+                return Some(x);
+            }
+        }
+        None
+    }
+
+    /// Every round in the tree (active + abandoned).
+    pub fn rounds(&self) -> usize {
+        Self::count(&self.roots)
+    }
+    /// Rounds on the active path.
+    pub fn active_rounds(&self) -> usize {
+        Self::active_count(&self.roots)
+    }
+    /// Abandoned (masked-fork) rounds.
+    pub fn abandoned_rounds(&self) -> usize {
+        self.rounds().saturating_sub(self.active_rounds())
+    }
+    /// The "you are here" node, if any.
+    pub fn current_node(&self) -> Option<&RewindNode> {
+        Self::find_current(&self.roots)
+    }
+    fn collect_active(nodes: &[RewindNode], out: &mut Vec<RewindNode>) {
+        for n in nodes {
+            if n.state == "active" {
+                out.push(n.clone());
+                Self::collect_active(&n.children, out);
+            }
+        }
+    }
+    /// The active path in order (root → current), one node per round.
+    /// An abandoned node cannot have active descendants (the active path is
+    /// a single root-to-cursor chain), so abandoned subtrees are skipped.
+    pub fn active_path(&self) -> Vec<RewindNode> {
+        let mut v = Vec::new();
+        Self::collect_active(&self.roots, &mut v);
+        v
+    }
+}
+
+/// Rewind plugin: the pending rewind target (the confirm dialog's state).
+#[derive(Clone, Debug, PartialEq)]
+pub struct RewindTarget {
+    /// The target round's 1-based log line.
+    pub seq: u64,
+    /// Display label ("round 3 · first 40 chars…").
+    pub label: String,
+}
+
+impl EssenceEntry {
+    /// Display grouping: active invariants, active beliefs, then the
+    /// demoted (inactive) ones.
+    pub fn rank(&self) -> u8 {
+        match (self.kind.as_str(), self.active) {
+            ("invariant", true) => 0,
+            ("belief", true) => 1,
+            ("invariant", false) => 2,
+            _ => 3,
+        }
+    }
+}
+
 /// A closed/in-flight round = a run of events starting at a user_message.
 pub type Round = std::ops::Range<usize>;
 
@@ -371,6 +546,17 @@ pub struct AppState {
     /// silently swallowed every "load earlier" page. Streaming
     /// appends do NOT bump it, so the hot path keeps stable keys.
     pub ev_gen: RwSignal<u64>,
+    /// v0.5.52: incremental input for the status strip — the LATEST
+    /// value per `ext_status` id, maintained in O(1) at the append
+    /// sites instead of re-scanning the whole event window (and
+    /// rebuilding the chip views) on every appended event. See plan
+    /// §9.13/§9.14 (P2).
+    pub last_ext: RwSignal<std::collections::HashMap<String, String>>,
+    /// v0.5.52: bumped only when the last `user_message` may have
+    /// changed (append / history replace / prepend / optimistic send /
+    /// clear). The loop-cmd Effect watches THIS instead of the whole
+    /// event list, so an ordinary event no longer re-derives the chip.
+    pub cmd_gen: RwSignal<u64>,
     /// v0.5.17: 1-based line number of the OLDEST event currently in
     /// `events` (truncated history: the server ships only the last
     /// page on connect; 1 = the whole log is loaded). 0 = unknown.
@@ -396,6 +582,11 @@ pub struct AppState {
     pub loop_running: RwSignal<bool>,
     pub ctx_used: RwSignal<u64>,
     pub goal: RwSignal<Option<GoalView>>,
+    /// v0.5.53: the sidebar plugin area. `active_plugin` is the id of the
+    /// plugin rendered in `#plugin-view` (registry: `plugins.rs`);
+    /// `plugin_menu_open` toggles the picker dropdown in `#plugin-bar`.
+    pub active_plugin: RwSignal<String>,
+    pub plugin_menu_open: RwSignal<bool>,
     /// None = live view; Some(i) = show only round i (0-based).
     pub view_round: RwSignal<Option<usize>>,
     /// M6: layout mode "main" | "split" | "full", persisted per browser.
@@ -459,6 +650,14 @@ pub struct AppState {
     /// re-viewed since: the sidebar card shows a static green lamp
     /// until the user opens the session; leaving it again clears it.
     pub loop_done_unviewed: RwSignal<std::collections::HashSet<String>>,
+    /// v0.5.55 P1: sessions the user has *viewed* this app session. A
+    /// session's finished-loop green lamp is only re-seeded by the
+    /// `GET /api/loops` poll while the session is NOT in this set — so
+    /// once the user opens a session, its "finished, unviewed" lamp does
+    /// not come back on the next 10 s poll. Cleared on page reload
+    /// (in-memory only; the server-side `loop.last` deletion is what
+    /// keeps a reload from re-lighting it).
+    pub loop_viewed: RwSignal<std::collections::HashSet<String>>,
     /// v0.5.22: theme mode — "auto" (follow the OS color scheme),
     /// "light" or "dark". Persisted per browser (localStorage
     /// "rushi-theme"); the EFFECTIVE theme ("light"/"dark") is written
@@ -547,6 +746,14 @@ pub struct AppState {
     /// reports for the active session's model. One `/api/model` fetch
     /// feeds this together with `model_names`.
     pub model_ctx: RwSignal<std::collections::BTreeMap<String, u64>>,
+    /// Rewind plugin: the active session's projected history tree
+    /// (`GET /api/sessions/{id}/rewind`). None until the first fetch.
+    pub rewind_tree: RwSignal<Option<RewindTree>>,
+    /// Rewind plugin: the confirm dialog's pending target (None = closed).
+    pub rewind_pending: RwSignal<Option<RewindTarget>>,
+    /// Rewind plugin: bumped when a `user_message` / `rewind` event arrives
+    /// (the only structure-changing event types) so the tree refetches.
+    pub rewind_gen: RwSignal<u64>,
 }
 
 // v0.5.23: module-level handle to the live AppState (set once at app
@@ -562,6 +769,8 @@ impl AppState {
             active_session: RwSignal::new(None),
             events: RwSignal::new(Vec::new()),
             ev_gen: RwSignal::new(0),
+            last_ext: RwSignal::new(std::collections::HashMap::new()),
+            cmd_gen: RwSignal::new(0),
             hist_oldest_line: RwSignal::new(0),
             hist_has_more: RwSignal::new(false),
             loading_earlier: RwSignal::new(false),
@@ -572,6 +781,8 @@ impl AppState {
             loop_running: RwSignal::new(false),
             ctx_used: RwSignal::new(0),
             goal: RwSignal::new(None),
+            active_plugin: RwSignal::new("goal".to_string()),
+            plugin_menu_open: RwSignal::new(false),
             view_round: RwSignal::new(None),
             layout_mode: RwSignal::new("split".to_string()),
             menu_session: RwSignal::new(None),
@@ -590,6 +801,7 @@ impl AppState {
             round_active: RwSignal::new(None),
             looping_sessions: RwSignal::new(std::collections::HashSet::new()),
             loop_done_unviewed: RwSignal::new(std::collections::HashSet::new()),
+            loop_viewed: RwSignal::new(std::collections::HashSet::new()),
             theme_mode: RwSignal::new(String::from("auto")),
             sort_mode: RwSignal::new(String::from("output")),
             custom_order: RwSignal::new(Vec::new()),
@@ -599,14 +811,11 @@ impl AppState {
             loop_cmd: RwSignal::new(String::new()),
             loop_cmd_sess: RwSignal::new(None),
             rp_open: RwSignal::new(false),
-            // M11: start with just the Files home tab; tab ids are
-            // connection-scoped (a session switch resets the panel).
-            rp_tabs: RwSignal::new(vec![RpTab {
-                id: 0,
-                kind: RpTabKind::Files,
-                path: String::new(),
-                label: "Files".to_string(),
-            }]),
+            // M13: start with NO tabs — the panel shows the "start"
+            // view (Files / Terminal launcher buttons); tabs are
+            // created on demand and are connection-scoped (a session
+            // switch resets the panel to the empty start view).
+            rp_tabs: RwSignal::new(Vec::new()),
             rp_active: RwSignal::new(0),
             rp_next_id: RwSignal::new(1),
             rp_term_seq: RwSignal::new(1),
@@ -623,6 +832,9 @@ impl AppState {
             model_probe: RwSignal::new(std::collections::HashMap::new()),
             model_names: RwSignal::new(Vec::new()),
             model_ctx: RwSignal::new(std::collections::BTreeMap::new()),
+            rewind_tree: RwSignal::new(None),
+            rewind_pending: RwSignal::new(None),
+            rewind_gen: RwSignal::new(0),
         }
     }
 
@@ -717,13 +929,104 @@ impl AppState {
     /// scroll/pile engine; allowed dead for now.
     #[allow(dead_code)]
     pub fn visible_range(&self) -> Round {
-        let ev = self.events.get();
-        match self.view_round.get() {
+        // v0.5.52: everything under one borrow (was a whole-Vec clone
+        // per call; unused today, but this is the same O(N) shape as the
+        // freeze bug, §9.13).
+        self.events.with(|ev| match self.view_round.get() {
             None => 0..ev.len(),
-            Some(i) => compute_rounds(&ev)
-                .get(i)
-                .cloned()
-                .unwrap_or(0..ev.len()),
+            Some(i) => compute_rounds(ev).get(i).cloned().unwrap_or(0..ev.len()),
+        })
+    }
+
+    // ── v0.5.52: incremental derived state (plan §9.13/§9.14 P2) ────
+    //
+    // The status strip used to re-scan the whole event window (and
+    // rebuild its chip views) on EVERY appended event, and the loop-cmd
+    // chip re-derived itself per event too. Both are now maintained at
+    // the write sites: O(1) per appended event, and a single pass when
+    // the window is REPLACED (history frame / prepend) or cleared
+    // (session switch).
+
+    /// Apply one newly appended event to the derived signals.
+    pub fn note_event(&self, ev: &Value) {
+        note_event_signals(self.last_ext, self.cmd_gen, ev);
+    }
+
+    /// Recompute the derived signals in one pass over the whole window
+    /// (call after `events.set(..)` / a prepend merge).
+    pub fn rebuild_derived(&self) {
+        rebuild_derived_signals(self.events, self.last_ext, self.cmd_gen);
+    }
+
+    /// Drop the derived signals (session switch / cleared window).
+    pub fn clear_derived(&self) {
+        self.last_ext.set(std::collections::HashMap::new());
+        self.cmd_gen.update(|g| *g += 1);
+    }
+}
+
+/// v0.5.52: `AppState::rebuild_derived` as a free function (see
+/// `note_event_signals` for why: the WS closures must stay `'static`).
+pub fn rebuild_derived_signals(
+    events: RwSignal<Vec<Value>>,
+    last_ext: RwSignal<std::collections::HashMap<String, String>>,
+    cmd_gen: RwSignal<u64>,
+) {
+    let map = events.with(|v| {
+        let mut m: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for ev in v.iter() {
+            if ev.get("type").and_then(|t| t.as_str()) != Some("ext_status") {
+                continue;
+            }
+            if let Some(id) = ev.get("id").and_then(|i| i.as_str()) {
+                m.insert(id.to_string(), ext_status_value_str(ev.get("value")));
+            }
         }
+        m
+    });
+    last_ext.set(map);
+    cmd_gen.update(|g| *g += 1);
+}
+
+/// v0.5.52: `AppState::note_event` as a free function taking the two
+/// derived signals directly, so the hot append path can call it from a
+/// closure that must stay `'static` (no `&AppState` capture).
+pub fn note_event_signals(
+    last_ext: RwSignal<std::collections::HashMap<String, String>>,
+    cmd_gen: RwSignal<u64>,
+    ev: &Value,
+) {
+    match ev.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+        "ext_status" => {
+            let Some(id) = ev.get("id").and_then(|v| v.as_str()) else {
+                return;
+            };
+            let val = ext_status_value_str(ev.get("value"));
+            // Compare first: an unchanged value must not wake the strip
+            // (a running hook re-reports the same id a lot).
+            // untracked: called per live event from the WS task, outside
+            // any reactive scope (a tracked read warned once per event).
+            let same = last_ext.with_untracked(|m| m.get(id).map(|x| x == &val).unwrap_or(false));
+            if !same {
+                let id = id.to_string();
+                last_ext.update(|m| {
+                    m.insert(id, val);
+                });
+            }
+        }
+        "user_message" => cmd_gen.update(|g| *g += 1),
+        _ => {}
+    }
+}
+
+/// Render one `ext_status.value` the way the status strip shows it
+/// (legacy briefValue parity: JSON for containers, `null` for null,
+/// empty string when absent).
+pub fn ext_status_value_str(v: Option<&Value>) -> String {
+    match v {
+        Some(Value::Null) => "null".to_string(),
+        Some(x @ Value::Object(_)) | Some(x @ Value::Array(_)) => x.to_string(),
+        Some(x) => x.to_string(),
+        None => String::new(),
     }
 }

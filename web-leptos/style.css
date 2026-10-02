@@ -150,6 +150,12 @@ html[data-theme="dark"] #transcript .load-earlier { box-shadow: 0 1px 2px rgba(0
 html[data-theme="dark"] #transcript .load-earlier:hover {
   background: var(--bg-elev);
 }
+html[data-theme="dark"] #transcript::-webkit-scrollbar-thumb,
+html[data-theme="dark"] #msg-input::-webkit-scrollbar-thumb,
+html[data-theme="dark"] .ev-result::-webkit-scrollbar-thumb,
+html[data-theme="dark"] .ev-args::-webkit-scrollbar-thumb {
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.60), inset 0 1px 0 rgba(255, 235, 200, 0.08);
+} /* v0.5.45: baseline dark scrollbar-thumb relief */
 /* v0.5.27: the mid loop ring no longer rides --border/--text-muted; it now
    resolves --loop-mid, which the dark block sets directly. */
 /* syntax colors: the light values are tuned for rice paper; on the
@@ -202,9 +208,10 @@ body.kb-anim { transition: height 0.22s ease-out; }
    transcript scroll engine idles — see pile::set_main_hidden). The
    sidebar's inner column is centered with a max width so it reads
    as a page, not a stretched 240px rail. */
-#app.layout-full #sidebar { width: 100%; box-shadow: none; }
-#app.layout-full #sidebar-inner { width: 100%; align-items: center; }
-#app.layout-full #sidebar-inner > * { width: 100%; max-width: 720px; }
+/* v0.5.56: layout-full is the Rewind History view now — a brand-new
+   full-window interface (#history-view). The sidebar and #main are out of
+   the layout entirely. */
+#app.layout-full #sidebar { display: none; }
 #app.layout-full #main { display: none; }
 #main { flex: 1; display: flex; flex-direction: column; overflow: hidden; position: relative; }
 #main::before { content: ''; position: absolute; top: var(--band-h); bottom: 0; left: 0; width: 14px; background: linear-gradient(to right, rgba(var(--shadow-tint), 0.16), rgba(var(--shadow-tint), 0)); /* v0.5.45: restore the baseline 14px left-edge relief strip (the 1px divider lines stay dropped) */ /* v0.5.13: the left-edge relief starts BELOW the 14 px corner (v0.5.11 wrapped the corner, but the 0.16 dark tint read as a color patch — "not the same height as the sidebar"). The corner stays plain --bg, continuous with the band and the sidebar. */ -webkit-mask-image: linear-gradient(to bottom, transparent 14px, black 34px); mask-image: linear-gradient(to bottom, transparent 14px, black 34px); pointer-events: none; z-index: 47; /* same z as the z47 deck layer but earlier in tree order, so the deck face still paints on top */ }
@@ -266,9 +273,9 @@ button { font-weight: 700; }
      grid, so all theme states look identical in size & position. */
 #theme-toggle, #sidebar-toggle, #sidebar-expand, #model-settings { display: inline-flex; align-items: center; justify-content: center; height: 26px; min-width: 30px; box-sizing: border-box; }
 #theme-toggle, #model-settings { padding: 0; }
-#theme-toggle svg, #model-settings svg { display: block; width: 16px; height: 16px; }
-#theme-toggle .ln, #model-settings .ln { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
-#theme-toggle .fl, #model-settings .fl, #btn-send .fl { fill: currentColor; }
+#theme-toggle svg, #model-settings svg, #hist-theme svg { display: block; width: 16px; height: 16px; }
+#theme-toggle .ln, #model-settings .ln, #hist-theme .ln { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+#theme-toggle .fl, #model-settings .fl, #btn-send .fl, #hist-theme .fl { fill: currentColor; }
 #model-settings { background: var(--bg-elev); border: none; border-radius: 4px; color: var(--text-muted); cursor: pointer; box-shadow: var(--shadow); }
 #model-settings:hover { box-shadow: var(--shadow-hover); color: var(--text); }
 #model-settings:active { transform: translateY(1px); box-shadow: var(--shadow-pressed); }
@@ -366,20 +373,59 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
 
 /* v0.5.6: the sidebar start/stop buttons were folded into #btn-send,
    so the .running tint on #session-actions buttons is dead. */
-#goal-panel { margin: 0; padding: 10px 12px; background: var(--bg); box-shadow: var(--shadow); border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: 8px; }
-#goal-panel .goal-header { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; color: var(--text-muted); }
-#goal-body { font-size: 13px; line-height: 1.4; }
-#goal-body .goal-text { white-space: pre-wrap; word-break: break-word; margin-bottom: 4px; }
-#goal-body .goal-meta { font-size: 12px; color: var(--text-muted); }
-#goal-body .goal-empty { color: var(--text-muted); font-style: italic; }
-.goal-badge { display: inline-block; padding: 1px 7px; border-radius: 9px; font-size: 11px; font-weight: 700; }
+/* v0.5.53: the sidebar's lower slot is a generic plugin area. #plugin-area
+   is the shared chrome — the height cap (previously on #goal-panel) now
+   lives here, so ANY registered plugin is capped; the thin #plugin-bar
+   (‹ [name ▾] ›) switches between plugins; #plugin-view hosts the active
+   plugin's own view, which manages its layout/scrolling. */
+#plugin-area { margin: 0; padding: 0; background: var(--bg); box-shadow: var(--shadow); border-top: 1px solid var(--border); display: flex; flex-direction: column; min-height: 0; flex: 0 1 auto; max-height: 30%; /* v0.5.53: shared plugin-area cap (extracted from the goal module) - one long plugin prompt can no longer crush the session list */ }
+#plugin-bar { display: flex; align-items: center; gap: 6px; padding: 8px 12px 4px; flex: 0 0 auto; position: relative; }
+#plugin-bar button { background: var(--bg-elev); border: none; color: var(--text-muted); font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; height: 20px; min-width: 26px; padding: 0 8px; border-radius: 9px; cursor: pointer; box-shadow: var(--groove); transition: box-shadow .12s ease, color .12s ease; flex: 0 0 auto; }
+#plugin-bar button:hover:not(:disabled) { color: var(--text); box-shadow: var(--shadow); }
+#plugin-bar button:disabled { opacity: .35; cursor: default; box-shadow: var(--groove); }
+#plugin-list { padding: 0 10px; }
+#plugin-list .plugin-caret { font-size: 9px; margin-left: 4px; color: var(--text-muted); }
+#plugin-menu { position: absolute; top: calc(100% - 2px); left: 12px; z-index: 30; min-width: 120px; background: var(--bg-elev); border: none; border-radius: 10px; box-shadow: var(--shadow-hover); padding: 5px; display: flex; flex-direction: column; gap: 2px; }
+#plugin-menu .plugin-item { display: block; width: 100%; text-align: left; padding: 5px 9px; border: none; background: none; color: var(--text); font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .3px; border-radius: 6px; cursor: pointer; font-family: inherit; }
+#plugin-menu .plugin-item:hover { background: var(--bg); }
+#plugin-menu .plugin-item.on { color: var(--accent); }
+#plugin-view { flex: 0 1 auto; min-height: 0; display: flex; flex-direction: column; gap: 8px; padding: 4px 12px 10px; overflow: hidden; }
+#plugin-view .plugin-empty { color: var(--text-muted); font-style: italic; font-size: 13px; }
+/* the goal plugin's content lives inside #plugin-view; its scroller + pin
+   rules are unchanged (badge/meta/actions pinned, .goal-text scrolls). */
+#goal-body { font-size: 13px; line-height: 1.4; flex: 0 1 auto; min-height: 0; display: flex; flex-direction: column; }
+#goal-body .goal-text { white-space: pre-wrap; word-break: break-word; margin-bottom: 4px; flex: 0 1 auto; min-height: 0; overflow-y: auto; }
+#goal-body .goal-meta { font-size: 12px; color: var(--text-muted); flex: 0 0 auto; }
+#goal-body .goal-empty { color: var(--text-muted); font-style: italic; flex: 0 0 auto; }
+.goal-badge { display: inline-block; padding: 1px 7px; border-radius: 9px; font-size: 11px; font-weight: 700; flex: 0 0 auto; align-self: flex-start; }
 .goal-badge.active { background: var(--accent2); color: var(--on-badge); }
 .goal-badge.paused { background: var(--warn); color: var(--on-badge); }
 .goal-badge.completed { background: var(--accent); color: var(--on-badge); }
 .goal-badge.blocked { background: var(--danger); color: var(--on-danger); }
-.goal-actions { display: flex; flex-wrap: wrap; gap: 4px; }
+.goal-actions { display: flex; flex-wrap: wrap; gap: 4px; flex: 0 0 auto; }
 .goal-actions button { background: var(--bg-elev); border: none; color: var(--text-muted); border-radius: 4px; padding: 2px 7px; font-size: 12px; cursor: pointer; box-shadow: var(--shadow); }
 .goal-actions button:hover { color: var(--text); box-shadow: var(--shadow-hover); }
+
+/* v0.5.54: the essence plugin — read-only session-essence entries inside
+   #plugin-view. Same scroller/pin pattern as the goal plugin: #essence-body
+   is a flex column under the shared #plugin-area cap; .essence-groups is
+   the sole scroller (capsule-in-groove, like .goal-text). */
+#essence-body { font-size: 13px; line-height: 1.4; flex: 0 1 auto; min-height: 0; display: flex; flex-direction: column; }
+#essence-body .essence-groups { flex: 0 1 auto; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
+#essence-body .essence-empty, #essence-body .essence-loading { color: var(--text-muted); font-style: italic; flex: 0 0 auto; }
+.essence-group { display: flex; flex-direction: column; gap: 6px; }
+.essence-group-head { display: flex; align-items: baseline; gap: 6px; }
+.essence-group-label { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; color: var(--text-muted); }
+.essence-group-label.inv { color: var(--accent); }
+.essence-count { font-size: 11px; color: var(--text-muted); font-family: "SF Mono", Consolas, monospace; }
+.essence-entry { background: var(--bg-elev); box-shadow: var(--groove); border-radius: 8px; padding: 6px 9px; display: flex; flex-direction: column; gap: 3px; }
+.essence-entry.on { box-shadow: var(--shadow); }
+.essence-entry-head { display: flex; align-items: center; gap: 6px; }
+.essence-id { font-size: 10px; font-weight: 700; letter-spacing: .4px; color: var(--text-muted); font-family: "SF Mono", Consolas, monospace; }
+.essence-state { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .4px; padding: 0 6px; border-radius: 8px; }
+.essence-state.on { background: var(--accent2); color: var(--on-badge); }
+.essence-state:not(.on) { background: var(--bg); color: var(--text-muted); }
+.essence-text { font-size: 12px; line-height: 1.45; color: var(--text); }
 #input-module { margin: 10px 30px 12px 28px; padding: 10px 14px; background: var(--bg); box-shadow: var(--shadow-hover); border-radius: 8px; display: flex; flex-direction: column; gap: 8px; position: relative; }
 #status-strip { display: flex; gap: 14px; font-size: 13px; color: var(--text-muted); font-family: "SF Mono", Consolas, monospace; min-height: 20px; align-items: center; overflow-x: auto; white-space: nowrap; }
 #status-strip:empty { display: none; }
@@ -747,7 +793,7 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
    drop/rim. Arrows are gone (::-webkit-scrollbar-button). Firefox gets
    the equivalent: scrollbar-width: thin (no arrow buttons) +
    scrollbar-color with the same two tokens. */
-#transcript, #msg-input, .ev-result, .ev-args, #session-list, #sidebar-inner, #status-strip, .ev-tool-args pre, .ev-content pre, #ns-dialog, .ns-browser, #ms-dialog, .ms-fetched, .sess-model-panel, .rp-tree, .rp-code, .rp-img-wrap, .rp-tabbar, .term-host .xterm .xterm-viewport { scrollbar-width: thin; scrollbar-color: var(--scroll-thumb) var(--scroll-track); }
+#transcript, #msg-input, .ev-result, .ev-args, #session-list, #sidebar-inner, #status-strip, .ev-tool-args pre, .ev-content pre, #ns-dialog, .ns-browser, #ms-dialog, .ms-fetched, .sess-model-panel, .rp-tree, .rp-code, .rp-img-wrap, .rp-tabbar, .term-host .xterm .xterm-viewport, #goal-body .goal-text, .essence-groups, #hist-tree, #hist-rail, .rewind-list { scrollbar-width: thin; scrollbar-color: var(--scroll-thumb) var(--scroll-track); }
 /* v0.5.47: FIX — the pseudo-element must be repeated on EVERY selector.
    v0.5.46 wrote each rule as one flat list with :::-webkit-scrollbar(-button/
    -track/-thumb) on the LAST item only; a flat list does not distribute a
@@ -756,10 +802,10 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
    #transcript / #msg-input / #status-strip / #ns-dialog / #ms-dialog, the
    :::-webkit-scrollbar rule pinned them to 10x10px, and the -thumb rule
    painted them --scroll-thumb with a 999px radius. Never write it flat. */
-#transcript::-webkit-scrollbar, #msg-input::-webkit-scrollbar, .ev-result::-webkit-scrollbar, .ev-args::-webkit-scrollbar, #session-list::-webkit-scrollbar, #sidebar-inner::-webkit-scrollbar, #status-strip::-webkit-scrollbar, .ev-tool-args pre::-webkit-scrollbar, .ev-content pre::-webkit-scrollbar, #ns-dialog::-webkit-scrollbar, .ns-browser::-webkit-scrollbar, #ms-dialog::-webkit-scrollbar, .ms-fetched::-webkit-scrollbar, .sess-model-panel::-webkit-scrollbar, .rp-tree::-webkit-scrollbar, .rp-code::-webkit-scrollbar, .rp-img-wrap::-webkit-scrollbar, .rp-tabbar::-webkit-scrollbar, .term-host .xterm .xterm-viewport::-webkit-scrollbar { width: 10px; height: 10px; background: var(--scroll-track); }
-#transcript::-webkit-scrollbar-button, #msg-input::-webkit-scrollbar-button, .ev-result::-webkit-scrollbar-button, .ev-args::-webkit-scrollbar-button, #session-list::-webkit-scrollbar-button, #sidebar-inner::-webkit-scrollbar-button, #status-strip::-webkit-scrollbar-button, .ev-tool-args pre::-webkit-scrollbar-button, .ev-content pre::-webkit-scrollbar-button, #ns-dialog::-webkit-scrollbar-button, .ns-browser::-webkit-scrollbar-button, #ms-dialog::-webkit-scrollbar-button, .ms-fetched::-webkit-scrollbar-button, .sess-model-panel::-webkit-scrollbar-button, .rp-tree::-webkit-scrollbar-button, .rp-code::-webkit-scrollbar-button, .rp-img-wrap::-webkit-scrollbar-button, .rp-tabbar::-webkit-scrollbar-button, .term-host .xterm .xterm-viewport::-webkit-scrollbar-button { display: none; width: 0; height: 0; background: transparent; border: none; }
-#transcript::-webkit-scrollbar-track, #msg-input::-webkit-scrollbar-track, .ev-result::-webkit-scrollbar-track, .ev-args::-webkit-scrollbar-track, #session-list::-webkit-scrollbar-track, #sidebar-inner::-webkit-scrollbar-track, #status-strip::-webkit-scrollbar-track, .ev-tool-args pre::-webkit-scrollbar-track, .ev-content pre::-webkit-scrollbar-track, #ns-dialog::-webkit-scrollbar-track, .ns-browser::-webkit-scrollbar-track, #ms-dialog::-webkit-scrollbar-track, .ms-fetched::-webkit-scrollbar-track, .sess-model-panel::-webkit-scrollbar-track, .rp-tree::-webkit-scrollbar-track, .rp-code::-webkit-scrollbar-track, .rp-img-wrap::-webkit-scrollbar-track, .rp-tabbar::-webkit-scrollbar-track, .term-host .xterm .xterm-viewport::-webkit-scrollbar-track { background: var(--scroll-track); box-shadow: var(--scroll-groove); }
-#transcript::-webkit-scrollbar-thumb, #msg-input::-webkit-scrollbar-thumb, .ev-result::-webkit-scrollbar-thumb, .ev-args::-webkit-scrollbar-thumb, #session-list::-webkit-scrollbar-thumb, #sidebar-inner::-webkit-scrollbar-thumb, #status-strip::-webkit-scrollbar-thumb, .ev-tool-args pre::-webkit-scrollbar-thumb, .ev-content pre::-webkit-scrollbar-thumb, #ns-dialog::-webkit-scrollbar-thumb, .ns-browser::-webkit-scrollbar-thumb, #ms-dialog::-webkit-scrollbar-thumb, .ms-fetched::-webkit-scrollbar-thumb, .sess-model-panel::-webkit-scrollbar-thumb, .rp-tree::-webkit-scrollbar-thumb, .rp-code::-webkit-scrollbar-thumb, .rp-img-wrap::-webkit-scrollbar-thumb, .rp-tabbar::-webkit-scrollbar-thumb, .term-host .xterm .xterm-viewport::-webkit-scrollbar-thumb { background: var(--scroll-thumb); border: 2px solid transparent; background-clip: padding-box; border-radius: 999px; margin: 2px 0; box-shadow: var(--scroll-relief); }
+#transcript::-webkit-scrollbar, #msg-input::-webkit-scrollbar, .ev-result::-webkit-scrollbar, .ev-args::-webkit-scrollbar, #session-list::-webkit-scrollbar, #sidebar-inner::-webkit-scrollbar, #status-strip::-webkit-scrollbar, .ev-tool-args pre::-webkit-scrollbar, .ev-content pre::-webkit-scrollbar, #ns-dialog::-webkit-scrollbar, .ns-browser::-webkit-scrollbar, #ms-dialog::-webkit-scrollbar, .ms-fetched::-webkit-scrollbar, .sess-model-panel::-webkit-scrollbar, .rp-tree::-webkit-scrollbar, .rp-code::-webkit-scrollbar, .rp-img-wrap::-webkit-scrollbar, .rp-tabbar::-webkit-scrollbar, .term-host .xterm .xterm-viewport::-webkit-scrollbar, #goal-body .goal-text::-webkit-scrollbar, .essence-groups::-webkit-scrollbar, #hist-tree::-webkit-scrollbar, #hist-rail::-webkit-scrollbar, .rewind-list::-webkit-scrollbar { width: 10px; height: 10px; background: var(--scroll-track); }
+#transcript::-webkit-scrollbar-button, #msg-input::-webkit-scrollbar-button, .ev-result::-webkit-scrollbar-button, .ev-args::-webkit-scrollbar-button, #session-list::-webkit-scrollbar-button, #sidebar-inner::-webkit-scrollbar-button, #status-strip::-webkit-scrollbar-button, .ev-tool-args pre::-webkit-scrollbar-button, .ev-content pre::-webkit-scrollbar-button, #ns-dialog::-webkit-scrollbar-button, .ns-browser::-webkit-scrollbar-button, #ms-dialog::-webkit-scrollbar-button, .ms-fetched::-webkit-scrollbar-button, .sess-model-panel::-webkit-scrollbar-button, .rp-tree::-webkit-scrollbar-button, .rp-code::-webkit-scrollbar-button, .rp-img-wrap::-webkit-scrollbar-button, .rp-tabbar::-webkit-scrollbar-button, .term-host .xterm .xterm-viewport::-webkit-scrollbar-button, #goal-body .goal-text::-webkit-scrollbar-button, .essence-groups::-webkit-scrollbar-button, #hist-tree::-webkit-scrollbar-button, #hist-rail::-webkit-scrollbar-button, .rewind-list::-webkit-scrollbar-button { display: none; width: 0; height: 0; background: transparent; border: none; }
+#transcript::-webkit-scrollbar-track, #msg-input::-webkit-scrollbar-track, .ev-result::-webkit-scrollbar-track, .ev-args::-webkit-scrollbar-track, #session-list::-webkit-scrollbar-track, #sidebar-inner::-webkit-scrollbar-track, #status-strip::-webkit-scrollbar-track, .ev-tool-args pre::-webkit-scrollbar-track, .ev-content pre::-webkit-scrollbar-track, #ns-dialog::-webkit-scrollbar-track, .ns-browser::-webkit-scrollbar-track, #ms-dialog::-webkit-scrollbar-track, .ms-fetched::-webkit-scrollbar-track, .sess-model-panel::-webkit-scrollbar-track, .rp-tree::-webkit-scrollbar-track, .rp-code::-webkit-scrollbar-track, .rp-img-wrap::-webkit-scrollbar-track, .rp-tabbar::-webkit-scrollbar-track, .term-host .xterm .xterm-viewport::-webkit-scrollbar-track, #goal-body .goal-text::-webkit-scrollbar-track, .essence-groups::-webkit-scrollbar-track, #hist-tree::-webkit-scrollbar-track, #hist-rail::-webkit-scrollbar-track, .rewind-list::-webkit-scrollbar-track { background: var(--scroll-track); box-shadow: var(--scroll-groove); }
+#transcript::-webkit-scrollbar-thumb, #msg-input::-webkit-scrollbar-thumb, .ev-result::-webkit-scrollbar-thumb, .ev-args::-webkit-scrollbar-thumb, #session-list::-webkit-scrollbar-thumb, #sidebar-inner::-webkit-scrollbar-thumb, #status-strip::-webkit-scrollbar-thumb, .ev-tool-args pre::-webkit-scrollbar-thumb, .ev-content pre::-webkit-scrollbar-thumb, #ns-dialog::-webkit-scrollbar-thumb, .ns-browser::-webkit-scrollbar-thumb, #ms-dialog::-webkit-scrollbar-thumb, .ms-fetched::-webkit-scrollbar-thumb, .sess-model-panel::-webkit-scrollbar-thumb, .rp-tree::-webkit-scrollbar-thumb, .rp-code::-webkit-scrollbar-thumb, .rp-img-wrap::-webkit-scrollbar-thumb, .rp-tabbar::-webkit-scrollbar-thumb, .term-host .xterm .xterm-viewport::-webkit-scrollbar-thumb, #goal-body .goal-text::-webkit-scrollbar-thumb, .essence-groups::-webkit-scrollbar-thumb, #hist-tree::-webkit-scrollbar-thumb, #hist-rail::-webkit-scrollbar-thumb, .rewind-list::-webkit-scrollbar-thumb { background: var(--scroll-thumb); border: 2px solid transparent; background-clip: padding-box; border-radius: 999px; margin: 2px 0; box-shadow: var(--scroll-relief); }
 
 /* v0.5.16b: the loop-in-progress marker, in the gap between the last
    card and the input box. Three-ring "breathing" in this theme's
@@ -969,14 +1015,17 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
       raised  = --shadow / --shadow-hover (lift on hover, press-in on :active)
       sunken  = --groove (channels, chips, wells)
       active  = raised surface + `inset 3px 0 0 var(--accent)` bar
-    The panel reads as a raised column; its interior is a sunken "tool"
-    face. Every control follows the same press/hover relief.            */
+    M14: the panel face is ONE flat relief layer - the tab band and the
+    body read as a single continuous surface (like #main below
+    #context-bar); the band's under-shadow and the panel's inset top
+    rim are gone. Only the 14px left-edge channel (#right-panel::before)
+    keeps a recessed treatment. Every control still follows the shared
+    press/hover relief.                                             */
 #right-panel {
   flex: 0 0 420px;
   width: 420px;
   min-width: 0;
   background: var(--bg);
-  box-shadow: inset 0 1px 0 rgba(var(--shadow-rim), 0.40);
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -1001,28 +1050,42 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
 }
 #app.layout-full #right-panel { display: none; }
 
-/* M8: the context-bar toggle button (right edge of #ctx-row). */
+/* M8/M13: the context-bar toggle, redesigned as a 26×26 neomorphic pill
+   carrying a "panel" icon (right column fills with accent when open).
+   Same base treatment as .rp-tab-new so the two controls read as one
+   family; fixed square size keeps the context-bar row tidy. */
 #rp-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  flex: none;
   background: var(--bg-elev);
   border: none;
-  border-radius: 6px;
+  border-radius: 7px;
   color: var(--text-muted);
-  padding: 3px 9px;
-  font-size: 14px;
   cursor: pointer;
-  line-height: 1.3;
-  box-shadow: var(--shadow);
+  box-shadow: var(--groove);
   transition: box-shadow .12s ease, transform .06s ease, color .12s ease;
 }
-#rp-toggle:hover { color: var(--text); box-shadow: var(--shadow-hover); transform: translateY(-1px); }
+#rp-toggle:hover { color: var(--text); box-shadow: var(--shadow); transform: translateY(-1px); }
 #rp-toggle:active { transform: translateY(0); box-shadow: var(--shadow-pressed); }
 #rp-toggle.active { color: var(--accent); }
+/* the panel icon: outline stroke = currentColor; the right column
+   (`.rp-toggle-fill`) is accent-filled only when the panel is open. */
+#rp-toggle svg.rp-toggle-ic { width: 16px; height: 16px; display: block; }
+#rp-toggle svg.rp-toggle-ic .ln { fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+#rp-toggle svg.rp-toggle-ic .rp-toggle-fill { fill: var(--accent); opacity: .9; }
+#rp-toggle svg.rp-toggle-ic .rp-toggle-fill.off { opacity: 0; }
 
-/* M11: the tab bar band — a raised strip that floats over the sunken
-   body below it (mirrors #context-bar on the left). Holds the
-   browser-style tab items and the "+" new-terminal button (M12: the
-   panel's #rp-close was removed; #rp-toggle in the main context bar
-   owns open/close). */
+/* M11/M14: the tab bar band. M14: no longer a "raised strip floating over
+   the sunken body" - the band's under-shadow (`.rp-tabbar::after`) was
+   dropped so the top band and the body below it read as ONE flat relief
+   layer (mirroring #context-bar on the left, whose under-shadow was
+   removed in v0.5.44). Holds the browser-style tab items and the "+"
+   new-tab button (M12: the panel's #rp-close was removed; #rp-toggle in
+   the main context bar owns open/close). */
 .rp-tabbar {
   display: flex;
   align-items: center;
@@ -1033,23 +1096,11 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
   position: relative;
   z-index: 2;
 }
-/* Soft drop-shadow under the band → the header reads as raised.
-   M11: spans the full panel width (the 14px edge strip now starts below
-   the band, mirroring #main::before under the context bar). */
-.rp-tabbar::after {
-  content: '';
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: -8px;
-  height: 8px;
-  background: linear-gradient(to bottom, rgba(var(--shadow-tint), 0.12), rgba(var(--shadow-tint), 0));
-  pointer-events: none;
-  z-index: 1;
-}
 /* M11: the horizontal tab row — every open file/terminal tab. Scrolls
    horizontally when many tabs are open; its own scrollbar is hidden
-   (it is navigation, not a content scroller). */
+   (it is navigation, not a content scroller). M13: a little inner
+   padding so the first/last pill's rounded corners + shadow are not
+   clipped flush against the scroll container's edge. */
 .rp-tabs {
   flex: 1;
   min-width: 0;
@@ -1058,6 +1109,7 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
   gap: 6px;
   overflow-x: auto;
   overflow-y: hidden;
+  padding: 2px 5px;
   scrollbar-width: none;
 }
 .rp-tabs::-webkit-scrollbar { display: none; }
@@ -1132,10 +1184,9 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
 }
 .rp-tab-item:hover .rp-tab-x, .rp-tab-item.active .rp-tab-x { opacity: .9; }
 .rp-tab-x:hover { color: var(--danger); background: rgba(var(--shadow-tint), .10); }
-/* the "+" new-terminal button (disabled until a session is active).
-   M12: sits at the far right of the tab bar (margin-left:auto) — the
-   panel's own #rp-close button was removed; open/close is owned by the
-   main context bar's #rp-toggle. */
+/* the "+" new-tab button (M13: opens a small Files/Terminal dropdown).
+   M12 removed the panel's own #rp-close; open/close is owned by the main
+   context bar's #rp-toggle. */
 .rp-tab-new {
   display: inline-flex;
   align-items: center;
@@ -1156,6 +1207,95 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
 .rp-tab-new:hover { color: var(--accent); box-shadow: var(--shadow); transform: translateY(-1px); }
 .rp-tab-new:active { transform: translateY(0); box-shadow: var(--shadow-pressed); }
 .rp-tab-new:disabled { opacity: .35; cursor: default; box-shadow: var(--groove); transform: none; }
+
+/* M13: the "+" button now owns a small dropdown (Files / Terminal). The
+   wrapper is position:relative so the menu can anchor to it; it keeps the
+   far-right alignment the old #rp-close used to provide. */
+.rp-tabnew-wrap { position: relative; flex: none; margin-left: auto; display: inline-flex; }
+.rp-tabnew-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 40;
+  min-width: 140px;
+  background: var(--bg-elev);
+  border-radius: 10px;
+  padding: 5px;
+  box-shadow: var(--shadow-hover), inset 0 1px 0 rgba(var(--shadow-rim), 0.5);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.rp-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: none;
+  border: none;
+  border-radius: 7px;
+  padding: 6px 9px;
+  color: var(--text-muted);
+  font: 600 12px/1.2 system-ui, -apple-system, sans-serif;
+  cursor: pointer;
+  text-align: left;
+  transition: background .1s ease, color .1s ease;
+}
+.rp-menu-item svg { width: 15px; height: 15px; flex: none; opacity: .9; }
+.rp-menu-item svg .ln { fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.rp-menu-item svg .fl { fill: currentColor; }
+.rp-menu-item:hover { color: var(--text); background: rgba(var(--shadow-tint), 0.08); }
+/* invisible full-viewport click-catcher so a click anywhere closes the
+   menu without blocking the panel's own interactions (z under the menu). */
+.rp-menu-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  background: transparent;
+}
+
+/* M13: the empty "start" view — two launcher cards centered in the panel
+   body. Shown only while no tab is open. */
+.rp-start {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  padding: 20px;
+}
+.rp-start-hint {
+  font: 700 10px/1.4 system-ui, -apple-system, sans-serif;
+  letter-spacing: .8px;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  opacity: .7;
+}
+.rp-start-btn {
+  width: 100%;
+  max-width: 300px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: var(--bg-elev);
+  border: none;
+  border-radius: 12px;
+  padding: 14px 16px;
+  color: var(--text-muted);
+  cursor: pointer;
+  box-shadow: var(--groove);
+  transition: box-shadow .12s ease, transform .06s ease, color .12s ease;
+}
+.rp-start-btn:hover { color: var(--text); box-shadow: var(--shadow); transform: translateY(-1px); }
+.rp-start-btn:active { transform: translateY(0); box-shadow: var(--shadow-pressed); }
+.rp-start-btn:disabled { opacity: .35; cursor: default; box-shadow: var(--groove); transform: none; }
+.rp-start-btn svg { width: 22px; height: 22px; flex: none; }
+.rp-start-btn svg .ln { fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+.rp-start-btn svg .fl { fill: currentColor; }
+.rp-start-txt { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.rp-start-name { font: 700 14px/1.2 system-ui, -apple-system, sans-serif; }
+.rp-start-sub { font: 400 11px/1.3 system-ui, -apple-system, sans-serif; color: var(--text-muted); }
 
 .rp-body { flex: 1; min-height: 0; position: relative; }
 /* M11: every open tab's pane is stacked in the body and kept mounted
@@ -1503,3 +1643,88 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
 .term-exit-btn:active { box-shadow: var(--shadow-pressed); transform: translateY(0); }
 
 
+
+/* ── v0.5.56 Rewind plugin ──────────────────────────────────────────
+   The rebuilt expanded view: a full-window History interface (session rail
+   + the conversation tree), the sidebar plugin panel, and the confirm
+   dialog. Relief tokens only (no omni-directional halos). */
+
+#history-view { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; overflow: hidden; background: var(--bg); }
+#hist-top { flex: 0 0 auto; display: flex; align-items: center; gap: 12px; padding: 12px 18px; }
+#hist-back { border: none; background: var(--bg-elev); color: var(--text-muted); font-size: 12px; font-weight: 700; letter-spacing: .4px; padding: 7px 12px; border-radius: 9px; cursor: pointer; box-shadow: var(--groove); transition: box-shadow .12s ease, color .12s ease; }
+#hist-back:hover { color: var(--text); box-shadow: var(--shadow); }
+#hist-title { flex: 1 1 auto; display: flex; align-items: baseline; gap: 10px; min-width: 0; }
+#hist-title .hist-head { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; color: var(--text-muted); }
+#hist-title .hist-sess { font-size: 15px; font-weight: 600; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#hist-theme { flex: 0 0 auto; border: none; background: var(--bg-elev); color: var(--text-muted); width: 30px; height: 30px; border-radius: 9px; cursor: pointer; box-shadow: var(--groove); display: flex; align-items: center; justify-content: center; }
+#hist-theme:hover { color: var(--text); box-shadow: var(--shadow); }
+#hist-body { flex: 1 1 auto; min-height: 0; display: flex; gap: 14px; padding: 0 18px 10px; }
+#hist-rail { flex: 0 0 200px; min-height: 0; display: flex; flex-direction: column; gap: 10px; padding-right: 4px; }
+.rw-group { display: flex; flex-direction: column; gap: 4px; }
+.rw-group-head { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .6px; color: var(--text-muted); padding: 2px 6px; }
+.rw-sess { border: none; text-align: left; background: var(--bg-elev); color: var(--text-muted); font-size: 13px; padding: 7px 10px; border-radius: 8px; cursor: pointer; box-shadow: var(--groove); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rw-sess:hover { color: var(--text); box-shadow: var(--shadow); }
+.rw-sess.on { color: var(--text); font-weight: 600; box-shadow: var(--shadow); }
+.rw-sess.running::before { content: ''; display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--accent); margin-right: 6px; }
+#hist-tree { flex: 1 1 auto; min-width: 0; min-height: 0; overflow-y: auto; border-radius: 10px; background: var(--bg-elev); box-shadow: var(--groove); padding: 10px 12px; }
+#hist-foot { flex: 0 0 auto; padding: 6px 18px 14px; color: var(--text-muted); font-size: 12px; }
+.rw-empty { color: var(--text-muted); font-size: 13px; padding: 18px 6px; }
+.rw-legend { display: flex; gap: 14px; padding: 2px 4px 10px; font-size: 11px; text-transform: uppercase; letter-spacing: .5px; color: var(--text-muted); }
+.rw-lg.on::before { content: ''; display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); margin-right: 5px; }
+.rw-lg.off::before { content: ''; display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--text-muted); opacity: .5; margin-right: 5px; }
+.rw-lg.fork::before { content: '\21B3'; margin-right: 5px; }
+.rw-nodes { display: flex; flex-direction: column; }
+.rw-node { position: relative; }
+.rw-kids { margin-left: 14px; padding-left: 12px; border-left: 1px dashed var(--border); display: flex; flex-direction: column; }
+.rw-head { display: flex; align-items: baseline; gap: 8px; padding: 6px 8px; border-radius: 8px; cursor: pointer; transition: box-shadow .12s ease, background .12s ease; }
+.rw-head:hover { background: var(--bg); box-shadow: var(--shadow); }
+.rw-node.abandoned .rw-head { opacity: .55; }
+.rw-node.abandoned .rw-sum { text-decoration: line-through; }
+.rw-node.current > .rw-head { background: var(--bg); box-shadow: var(--shadow); }
+.rw-node.locked > .rw-head { cursor: default; }
+.rw-node.locked > .rw-head:hover { background: transparent; box-shadow: none; }
+.rw-dot { flex: 0 0 auto; width: 9px; height: 9px; border-radius: 50%; background: var(--accent); box-shadow: var(--shadow); }
+.rw-node.abandoned .rw-dot { background: var(--text-muted); opacity: .5; box-shadow: none; }
+.rw-node.current .rw-dot { outline: 2px solid var(--accent); outline-offset: 2px; }
+.rw-round { flex: 0 0 auto; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .4px; color: var(--text-muted); }
+.rw-sum { flex: 1 1 auto; min-width: 0; font-size: 13px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rw-meta, .rw-time { flex: 0 0 auto; font-size: 11px; color: var(--text-muted); }
+.rw-here { flex: 0 0 auto; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; color: var(--accent); }
+.rw-badge-retract { flex: 0 0 auto; font-size: 10px; text-transform: uppercase; letter-spacing: .4px; color: var(--text-muted); box-shadow: var(--groove); border-radius: 6px; padding: 1px 5px; }
+.rw-boundaries { padding: 10px 4px 2px; display: flex; flex-direction: column; gap: 4px; }
+.rw-boundary { font-size: 11px; color: var(--text-muted); }
+
+#rw-backdrop { position: fixed; inset: 0; background: rgba(var(--shadow-tint), 0.30); backdrop-filter: blur(2px); z-index: 320; display: flex; align-items: center; justify-content: center; }
+#rw-dialog { width: 400px; max-width: calc(100vw - 48px); background: var(--bg); border-radius: 14px; box-shadow: var(--shadow-hover); border: 1px solid var(--border); padding: 20px; display: flex; flex-direction: column; gap: 8px; }
+.rw-title { font-size: 15px; font-weight: 700; color: var(--text); }
+.rw-body { display: flex; flex-direction: column; gap: 6px; }
+.rw-target { font-size: 12px; color: var(--accent); }
+.rw-note { font-size: 13px; color: var(--text-muted); line-height: 1.5; }
+.rw-err { font-size: 12px; color: #cc0044; }
+.rw-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 6px; }
+
+#rewind-body { flex: 0 1 auto; min-height: 0; display: flex; flex-direction: column; }
+.rewind-meta { flex: 0 0 auto; font-size: 11px; color: var(--text-muted); padding: 2px 2px 6px; }
+.rewind-list { flex: 0 1 auto; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 3px; }
+.rewind-row { display: flex; align-items: baseline; gap: 7px; border: none; background: transparent; text-align: left; padding: 4px 6px; border-radius: 7px; cursor: pointer; color: var(--text-muted); }
+.rewind-row:hover { background: var(--bg-elev); box-shadow: var(--shadow); color: var(--text); }
+.rewind-row.current { color: var(--text); }
+.rewind-row.locked { cursor: default; }
+.rewind-row.locked:hover { background: transparent; box-shadow: none; }
+.rewind-row-round { flex: 0 0 auto; font-size: 10px; font-weight: 700; color: var(--text-muted); }
+.rewind-row-sum { flex: 1 1 auto; min-width: 0; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rewind-row-here { flex: 0 0 auto; font-size: 9px; font-weight: 700; text-transform: uppercase; color: var(--accent); }
+.rewind-actions { flex: 0 0 auto; padding: 6px 0 0; }
+#rewind-open-hist { width: 100%; border: none; background: var(--bg-elev); color: var(--text-muted); font-size: 12px; font-weight: 700; padding: 7px 10px; border-radius: 9px; cursor: pointer; box-shadow: var(--groove); }
+#rewind-open-hist:hover { color: var(--text); box-shadow: var(--shadow); }
+
+/* v0.5.56 Rewind: the loop lamp in the History top bar (same breathing
+   lamp the sidebar session cards use) and the transcript quick button. */
+.rw-lamp { flex: 0 0 auto; width: 9px; height: 9px; border-radius: 50%; background: var(--border); box-shadow: var(--groove); }
+.rw-lamp.running { background: var(--accent); animation: ev-pulse 1.1s ease-in-out infinite; }
+.ev-quick-row { display: flex; justify-content: flex-end; }
+.ev-quickbtn { border: none; background: transparent; color: var(--text-muted); font-size: 13px; line-height: 1; padding: 2px 6px; border-radius: 6px; cursor: pointer; opacity: .35; transition: opacity .12s ease, box-shadow .12s ease, color .12s ease; }
+.event:hover .ev-quickbtn { opacity: .8; }
+.ev-quickbtn:hover { opacity: 1; color: var(--text); box-shadow: var(--groove); }
+.ev-quickbtn:disabled { opacity: .2; cursor: default; }
+.ev-quickbtn:disabled:hover { color: var(--text-muted); box-shadow: none; opacity: .2; }

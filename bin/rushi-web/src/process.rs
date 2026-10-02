@@ -4,6 +4,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
+use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use tokio::sync::{broadcast, RwLock};
 use tracing::{info, warn};
@@ -64,6 +65,56 @@ pub struct LoopEvent {
     /// stderr (`sessions/<id>/loop.stderr`), so the UI can show *why*
     /// the loop died instead of the session going silent.
     pub detail: Option<String>,
+}
+
+/// v0.5.55 P1: the last-exit record for a session, persisted on disk at
+/// `sessions/<id>/loop.last`. It is what lets a client that was closed
+/// or restarted still learn which loops *finished* while it was away
+/// (the green "finished-but-unviewed" lamp). Written by the per-loop
+/// waiter on a normal/observed exit, and by the orphan sweep in
+/// [`LoopsSnapshot::finished`] for loops that died while the server was
+/// stopped (the webui then only knows the process is gone).
+///
+/// Deleted two ways: when a NEW loop for the session starts (a fresh
+/// run supersedes the previous result — see [`LoopManager::start`]), and
+/// when the user *views* the session (the `loop/viewed` endpoint), which
+/// consumes the lamp.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct LoopLast {
+    /// The pid of the loop run that produced this record.
+    pub pid: u32,
+    /// Exit code on a normal exit; `None` when killed by a signal or when
+    /// the record was reconstructed by the orphan sweep (the webui only
+    /// knows the process is gone, not why).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit: Option<i32>,
+    /// `true` when this server's `stop()` killed it.
+    pub stopped: bool,
+    /// Unix seconds (UTC) at which the loop exited.
+    pub ts: u64,
+}
+
+/// A `LoopLast` paired with its session name — the shape the API and the
+/// WS `loops` frame expose (the on-disk file has no name; the directory
+/// does).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct FinishedLoop {
+    pub session: String,
+    pub pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit: Option<i32>,
+    pub stopped: bool,
+    pub ts: u64,
+}
+
+/// v0.5.55 P1: the whole sidebar loop state in one call.
+#[derive(Serialize, Clone, Debug, Default)]
+pub struct LoopsSnapshot {
+    /// Sessions with a live loop process right now.
+    pub running: Vec<String>,
+    /// Sessions whose most recent loop has *finished* and left a
+    /// `loop.last` marker, none of them currently running. Newest first.
+    pub finished: Vec<FinishedLoop>,
 }
 
 /// Tracks running agent-loop processes by session name.
@@ -317,6 +368,17 @@ impl LoopManager {
 
             map.insert(session.to_string(), pid);
 
+            // v0.5.55 P1: a fresh run supersedes the previous run's
+            // "last exit" marker — drop it so the green "finished,
+            // unviewed" lamp does not linger while this loop runs.
+            let _ = std::fs::remove_file(
+                self
+                    .cfg
+                    .sessions_root
+                    .join(session)
+                    .join("loop.last"),
+            );
+
             // Publish "started" before the waiter task is even scheduled,
             // so the exit event can never overtake it in the broadcast.
             let _ = self.events.send(LoopEvent {
@@ -352,12 +414,33 @@ impl LoopManager {
                         warn!(session = %s, pid, stopped, "loop killed by signal");
                     }
                     let _ = events.send(LoopEvent {
-                        session: s,
+                        session: s.clone(),
                         running: false,
                         exit,
                         stopped,
                         detail,
                     });
+                    // v0.5.55 P1: persist the last-exit record so a client
+                    // that is closed or restarted still sees the green
+                    // "finished, not viewed" lamp. The file lands at
+                    // sessions/<s>/loop.last and is consumed by the
+                    // loop/viewed endpoint or superseded on the next start.
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let rec = LoopLast {
+                        pid,
+                        exit,
+                        stopped,
+                        ts,
+                    };
+                    if let Ok(json) = serde_json::to_string(&rec) {
+                        let _ = std::fs::write(
+                            sessions_root.join(&s).join("loop.last"),
+                            json,
+                        );
+                    }
                 });
             }
 
@@ -407,22 +490,129 @@ impl LoopManager {
         Ok(true)
     }
 
-    /// Whether a tracked loop for `session` is still alive.
+    /// Whether a loop for `session` is alive — either tracked in-memory
+    /// (this server started it) or, if this server never started it
+    /// (a restart or the TUI left it running), via its `loop.pid` file.
+    /// Mirrors `stop()`'s stale-pid fallback so the sidebar lamp and the
+    /// `/loop` endpoint agree across a server restart.
     pub async fn is_running(&self, session: &str) -> bool {
         let map = self.inner.read().await;
-        map.get(session).map(|&pid| is_pid_alive(pid)).unwrap_or(false)
+        if let Some(&pid) = map.get(session) {
+            return is_pid_alive(pid);
+        }
+        drop(map);
+        let pid_file = self.cfg.sessions_root.join(session).join("loop.pid");
+        std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|t| t.trim().parse::<u32>().ok())
+            .map_or(false, |pid| is_pid_alive(pid))
     }
 
     /// Names of every session with a live loop process — the
     /// server-side truth for the clients' sidebar lamps, sent as a
     /// `loops` frame on every WS connect so a fresh browser can light
     /// the breathing lamps of sessions it has not seen start.
+    ///
+    /// Combines the in-memory set (loops this server started) with a
+    /// rescan of each session's `loop.pid`, so loops left running by a
+    /// previous server instance or the TUI still light their lamps.
     pub async fn running_sessions(&self) -> Vec<String> {
-        let map = self.inner.read().await;
-        map.iter()
-            .filter(|&(_, &pid)| is_pid_alive(pid))
-            .map(|(s, _)| s.clone())
-            .collect()
+        let mut out: Vec<String> = {
+            let map = self.inner.read().await;
+            map.iter()
+                .filter(|&(_, &pid)| is_pid_alive(pid))
+                .map(|(s, _)| s.clone())
+                .collect()
+        };
+        if let Ok(dirs) = std::fs::read_dir(&self.cfg.sessions_root) {
+            for entry in dirs.flatten() {
+                if !entry.path().is_dir() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                if out.iter().any(|s| s == &name) {
+                    continue;
+                }
+                let pid_file = entry.path().join("loop.pid");
+                if let Ok(t) = std::fs::read_to_string(&pid_file) {
+                    if let Ok(pid) = t.trim().parse::<u32>() {
+                        if is_pid_alive(pid) {
+                            out.push(name);
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// v0.5.55 P1: the whole sidebar loop state in one call.
+    ///
+    /// `running` delegates to [`LoopManager::running_sessions`]. `finished`
+    /// is every session with a `loop.last` marker that is NOT currently
+    /// running — i.e. loops that finished while a client may have been
+    /// away. Before reading the markers, an **orphan sweep** fills in a
+    /// best-effort marker for any session whose `loop.pid` is dead but has
+    /// no `loop.last` yet (a loop that died while this server was stopped,
+    /// or that the TUI started and this webui never observed). This is what
+    /// lets the green "finished, unviewed" lamp catch up within one poll.
+    pub async fn loops_snapshot(&self) -> LoopsSnapshot {
+        let running = self.running_sessions().await;
+        let root = &self.cfg.sessions_root;
+        let mut finished: Vec<FinishedLoop> = Vec::new();
+        if let Ok(dirs) = std::fs::read_dir(root) {
+            for entry in dirs.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                // A running session's lamp is the orange one, not green.
+                if running.iter().any(|s| s == &name) {
+                    continue;
+                }
+                let marker = path.join("loop.last");
+                // Orphan sweep: a dead `loop.pid` with no marker means the
+                // loop finished outside this server's observation. Record
+                // it (unknown exit, not an intentional stop).
+                if !marker.exists() {
+                    let pid_file = path.join("loop.pid");
+                    if let Ok(t) = std::fs::read_to_string(&pid_file) {
+                        if let Ok(pid) = t.trim().parse::<u32>() {
+                            if !is_pid_alive(pid) {
+                                let ts = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0);
+                                let rec = LoopLast {
+                                    pid,
+                                    exit: None,
+                                    stopped: false,
+                                    ts,
+                                };
+                                if let Ok(json) = serde_json::to_string(&rec) {
+                                    let _ = std::fs::write(&marker, json);
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Ok(txt) = std::fs::read_to_string(&marker) {
+                    if let Ok(rec) = serde_json::from_str::<LoopLast>(&txt) {
+                        finished.push(FinishedLoop {
+                            session: name,
+                            pid: rec.pid,
+                            exit: rec.exit,
+                            stopped: rec.stopped,
+                            ts: rec.ts,
+                        });
+                    }
+                }
+            }
+        }
+        // Newest first so a client can render in chronological order.
+        finished.sort_by(|a, b| b.ts.cmp(&a.ts));
+        LoopsSnapshot { running, finished }
     }
 }
 

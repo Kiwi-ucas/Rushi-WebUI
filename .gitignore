@@ -24,3 +24,6 @@ __pycache__/
 
 # Local CDP test probes — intentionally not part of the repo
 e2e/
+
+# Runtime loop pidfile (written by run-webui.sh / the loop supervisor)
+loop.pid

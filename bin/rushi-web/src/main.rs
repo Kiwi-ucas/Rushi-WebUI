@@ -15,10 +15,12 @@ use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 
 mod config;
+mod essence;
 mod files;
 mod goal;
 mod modelcfg;
 mod process;
+mod rewind;
 mod sessions;
 mod term;
 
@@ -236,6 +238,21 @@ async fn post_approval(
     }
 }
 
+/// Read-only history-tree projection (the rewind plugin's data source):
+/// rounds = one user message each, forks at every rewind marker, the active
+/// path + the "you are here" round. Never writes.
+async fn get_rewind_tree(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match st.sessions.events(&id).await {
+        Ok(events) => {
+            (StatusCode::OK, Json(rewind::build(&id, &events))).into_response()
+        }
+        Err(e) => (StatusCode::NOT_FOUND, e.to_string()).into_response(),
+    }
+}
+
 async fn post_rewind(
     State(st): State<AppState>,
     Path(id): Path<String>,
@@ -306,11 +323,53 @@ async fn get_loop(State(st): State<AppState>, Path(id): Path<String>) -> Json<Lo
     Json(LoopState { running })
 }
 
+/// v0.5.55 P0: the running-loop set across ALL sessions, for resyncing
+/// the sidebar's breathing lamps without a live WS connection. The client
+/// calls this on load and on a timer; it is the server-side truth
+/// (in-memory map + `loop.pid` liveness), so it is correct even after a
+/// server restart, when the in-memory map is empty but orphaned loop
+/// processes are still alive.
+///
+/// v0.5.55 P1: also returns `finished` — sessions with a `loop.last`
+/// marker and no live loop, i.e. "loop ended, result not yet viewed".
+async fn get_loops(State(st): State<AppState>) -> Json<process::LoopsSnapshot> {
+    Json(st.loops.loops_snapshot().await)
+}
+
+/// v0.5.55 P1: the user viewed this session, so its "finished, unviewed"
+/// green lamp is consumed. Deleting the `loop.last` marker stops the next
+/// poll / reconnect from re-lighting the lamp. A *stale* `loop.pid`
+/// (dead pid) is cleared too — otherwise the orphan sweep in
+/// `loops_snapshot()` would re-create the marker for this same,
+/// already-viewed exit and the lamp would come back. A *live* `loop.pid`
+/// (a loop running right now) is left alone; its real exit will produce a
+/// fresh marker the user should still be told about.
+async fn post_loop_viewed(State(st): State<AppState>, Path(id): Path<String>) -> Json<serde_json::Value> {
+    let dir = st.sessions.session_dir(&id);
+    let _ = std::fs::remove_file(dir.join("loop.last"));
+    if let Ok(t) = std::fs::read_to_string(dir.join("loop.pid")) {
+        if let Ok(pid) = t.trim().parse::<u32>() {
+            if !process::is_pid_alive(pid) {
+                let _ = std::fs::remove_file(dir.join("loop.pid"));
+            }
+        }
+    }
+    Json(serde_json::json!({ "ok": true }))
+}
+
 // ── Goal panel (web-native equivalent of the TUI goal-ext) ─────────
 
 async fn get_goal(State(st): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     let dir = st.sessions.session_dir(&id);
     let view = goal::read(&dir);
+    (StatusCode::OK, Json(view)).into_response()
+}
+
+/// Read a session's essence entries for the sidebar essence plugin. The
+/// store is owned by the harness's `essence` tool; the server only reads
+/// it, so this is read-only and always 200 (an empty list if absent).
+async fn get_essence(State(st): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
+    let view = essence::read(&st.sessions.session_dir(&id));
     (StatusCode::OK, Json(view)).into_response()
 }
 
@@ -480,13 +539,18 @@ async fn ws_session(socket: WebSocket, st: AppState, session: String) {
 
     // 1b. Sidebar lamp snapshot: which sessions have a live loop
     // right now, so a fresh browser can light the breathing lamps of
-    // sessions it never saw start (v0.5.13).
+    // sessions it never saw start (v0.5.13). v0.5.55 P1: the snapshot
+    // also carries the `finished` set (sessions with a `loop.last`
+    // marker and no live loop) so the green "finished, unviewed" lamps
+    // resync on reconnect too.
     {
-        let running = st.loops.running_sessions().await;
-        let payload = format!(
-            "[{{\"kind\":\"loops\",\"data\":{}}}]",
-            serde_json::to_string(&running).unwrap_or_else(|_| "[]".into())
-        );
+        let snap = st.loops.loops_snapshot().await;
+        let frame = serde_json::json!({
+            "kind": "loops",
+            "running": snap.running,
+            "finished": snap.finished,
+        });
+        let payload = format!("[{frame}]");
         if sock_tx.send(Message::text(payload)).await.is_err() {
             return;
         }
@@ -971,6 +1035,33 @@ fn read_kernel_config(path: &std::path::Path) -> Option<KernelConfig> {
 
 // ── main ────────────────────────────────────────────────────────────
 
+/// Resolve the `--loop-cmd` words at `args[i]` (the flag itself).
+///
+/// The documented form is `--loop-cmd <CMD...>`, so every following word
+/// belongs to the command — whether the shell handed them over as one
+/// quoted element (`--loop-cmd "/k/rushi run"`) or as separate ones
+/// (`--loop-cmd /k/rushi run`). Consuming a single argv element here is
+/// what let a loop command lose its `run` and then die with
+/// `unrecognized subcommand '<session>'` on every start; the stray word
+/// fell into the catch-all arm and vanished.
+///
+/// Returns the words and how many argv elements were consumed (the flag
+/// plus its words).
+fn parse_loop_cmd(args: &[String], i: usize) -> (Vec<String>, usize) {
+    let mut words: Vec<String> = Vec::new();
+    let mut used = 1; // the flag itself
+    let mut next = i + 1;
+    while let Some(w) = args.get(next) {
+        if w.starts_with("--") {
+            break;
+        }
+        words.extend(w.split_whitespace().map(String::from));
+        used += 1;
+        next += 1;
+    }
+    (words, used)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
@@ -1002,10 +1093,11 @@ async fn main() -> anyhow::Result<()> {
                 sessions_root = args.get(i).map(PathBuf::from);
             }
             "--loop-cmd" => {
-                i += 1;
-                if let Some(cmd) = args.get(i) {
-                    loop_cmd = cmd.split_whitespace().map(String::from).collect();
+                let (words, used) = parse_loop_cmd(&args, i);
+                if !words.is_empty() {
+                    loop_cmd = words;
                 }
+                i += used;
             }
             "--config" => {
                 i += 1;
@@ -1027,7 +1119,13 @@ async fn main() -> anyhow::Result<()> {
                 );
                 return Ok(());
             }
-            _ => {
+            other => {
+                // Silently swallowing an argument is how a loop command
+                // lost its `run`: `--loop-cmd /k/rushi run` (unquoted)
+                // left `run` here, the command became just the binary,
+                // and every start died with "unrecognized subcommand
+                // '<session>'". Say so instead.
+                eprintln!("rushi-web: warning: ignoring unrecognized argument {other:?}");
                 i += 1;
                 continue;
             }
@@ -1080,8 +1178,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/sessions/{id}/start", post(post_start))
         .route("/api/sessions/{id}/stop", post(post_stop))
         .route("/api/sessions/{id}/approval", post(post_approval))
-        .route("/api/sessions/{id}/rewind", post(post_rewind))
+        .route("/api/sessions/{id}/rewind", get(get_rewind_tree).post(post_rewind))
         .route("/api/sessions/{id}/goal", get(get_goal).post(post_goal))
+        .route("/api/sessions/{id}/essence", get(get_essence))
         .route("/api/model", get(get_model).post(post_model))
         .route("/api/model/probe", post(post_model_probe))
         .route("/api/model/models", post(post_model_models))
@@ -1090,6 +1189,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/sessions/{id}/rename", post(post_rename))
         .route("/api/sessions/{id}", delete(delete_session))
         .route("/api/sessions/{id}/loop", get(get_loop))
+        .route("/api/sessions/{id}/loop/viewed", post(post_loop_viewed))
+        .route("/api/loops", get(get_loops))
         .route("/ws/sessions/{id}", get(ws_handler))
         .fallback_service(frontend())
         .layer(CorsLayer::permissive())
@@ -1101,4 +1202,43 @@ async fn main() -> anyhow::Result<()> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_loop_cmd;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `--loop-cmd "/k/rushi run"`: the shell handed over one element.
+    #[test]
+    fn loop_cmd_takes_one_quoted_element() {
+        let a = args(&["rushi-web", "--loop-cmd", "/k/rushi run"]);
+        let (words, used) = parse_loop_cmd(&a, 1);
+        assert_eq!(words, vec!["/k/rushi", "run"]);
+        assert_eq!(used, 2);
+    }
+
+    /// `--loop-cmd /k/rushi run`: the shell handed over two. Regression
+    /// guard — taking only the next element is what dropped `run` and
+    /// made every loop start die with
+    /// `unrecognized subcommand '<session>'`.
+    #[test]
+    fn loop_cmd_takes_unquoted_words_up_to_the_next_flag() {
+        let a = args(&["rushi-web", "--loop-cmd", "/k/rushi", "run", "--port", "8480"]);
+        let (words, used) = parse_loop_cmd(&a, 1);
+        assert_eq!(words, vec!["/k/rushi", "run"]);
+        assert_eq!(used, 3);
+        assert_eq!(&a[1 + used], "--port", "parsing resumes at the next flag");
+    }
+
+    #[test]
+    fn loop_cmd_with_no_words_keeps_the_default() {
+        let a = args(&["rushi-web", "--loop-cmd"]);
+        let (words, used) = parse_loop_cmd(&a, 1);
+        assert!(words.is_empty());
+        assert_eq!(used, 1);
+    }
 }
