@@ -112,14 +112,30 @@ read `state.rewind_tree`.
 #history-view
 ├─ #hist-top    ◀ back to chat · HISTORY — <session> · loop lamp · theme
 ├─ #hist-body
-│  ├─ #hist-rail   sessions grouped by project (compact cards; click = select)
-│  └─ #hist-tree   the scroller
+│  ├─ #hist-rail   the dispatch-view session cards, one group per working
+│  │               path (`.dispatch-group` / `.dispatch-card`); click = select
 │     ├─ .rw-legend            active · abandoned (n) · n rewinds
 │     ├─ .rw-node (recursive)  ● round i · summary · N events · time · state
 │     │  └─ .rw-kids           guide line; abandoned = dimmed + strikethrough
 │     └─ .rw-boundaries        compaction floor footnotes
 └─ #hist-foot   "click a node to rewind · disabled while the loop runs"
 ```
+
+The rail is **the M7 dispatch view's card, brought back inside the expanded
+view** (v0.5.56): `ui::session_group_head` (the working directory + card
+count, full path in the title) and `ui::session_card` — the session name, its
+last-output time, **its own loop toggle** (`▶ start` / `■ stop` over REST, for
+any session, live from `/api/loops`) and the `…` rename/delete menu. The
+grouping key is the session's `cwd` marker (`model::dispatch_groups`), so the
+sessions fall under one head per project, with "(no project)" for the ones
+without a marker; the group heads are ordered by the active sort mode.
+
+One behaviour differs from the dispatch view, by design (C2): the cards are
+called with `stay = true`, so clicking one switches the tree's session in
+place instead of dropping back to the `split` layout. The loop toggle is the
+dispatch view's: it starts/stops **that** session's loop even when it is not
+the active one, and it stays available while the tree is read-only (the guard
+only forbids the *rewind*, not the loop control).
 
 Node states are the projection's: **active**, **abandoned** (dimmed,
 strikethrough summary), **current** (ring + `here`), plus the boundary

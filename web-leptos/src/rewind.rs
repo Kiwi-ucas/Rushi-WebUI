@@ -2,8 +2,10 @@
 //!
 //! One data source (`GET /api/sessions/{id}/rewind`) feeds two surfaces:
 //!   * the **full-window History view** — the rebuilt `layout-full` layout:
-//!     a session rail on the left, the recursive round/branch tree on the
-//!     right, one node per user message (one loop round);
+//!     a session rail on the left (the dispatch-view session cards, grouped
+//!     by working path, with their loop start/stop toggle), the recursive
+//!     round/branch tree on the right, one node per user message (one loop
+//!     round);
 //!   * the **sidebar plugin panel** (`#plugin-area`, registered in
 //!     `plugins.rs`) — a compact summary + the active path.
 //!
@@ -160,15 +162,23 @@ fn hist_hint(state: AppState) -> String {
     }
 }
 
-/// The session rail: sessions grouped by project, click = select. Stays in
-/// the History view (no layout switch), so the full-screen flow is unbroken.
+/// The session rail: the dispatch-view **session cards, grouped by working
+/// path** (v0.5.56, the C2 decision keeps the rail inside the full-window
+/// view). It reuses the sidebar's card wholesale — `ui::session_card` (name,
+/// last-output time, the per-session `\u{25B6} start` / `\u{25A0} stop` loop
+/// toggle, the `\u{2026}` rename/delete menu) and `ui::session_group_head`
+/// (the project directory + count) — with `stay = true`, so clicking a card
+/// switches the tree's session in place instead of dropping out of the
+/// History view.
+///
+/// The grouping key is the session's `cwd` marker (its working directory),
+/// i.e. one group per project; sessions without a marker land in
+/// "(no project)".
 fn hist_rail(state: AppState) -> AnyView {
     let sessions = state.sessions;
     let sort_mode = state.sort_mode;
     let custom_order = state.custom_order;
     let output_rank = state.output_rank;
-    let active = state.active_session;
-    let looping = state.looping_sessions;
 
     view! {
         <For
@@ -190,40 +200,17 @@ fn hist_rail(state: AppState) -> AnyView {
                 k
             }
             children=move |g: (String, Vec<SessionInfo>)| {
-                let label = crate::model::dispatch_group_label(&g.0);
+                let key = g.0.clone();
                 let items = g.1;
+                let count = items.len();
                 view! {
-                    <div class="rw-group">
-                        <div class="rw-group-head" title={g.0.clone()}>{ label }</div>
+                    <div class="dispatch-group">
+                        { crate::ui::session_group_head(&key, count) }
                         <For
                             each=move || items.clone()
                             key=|s: &SessionInfo| s.name.clone()
                             children=move |s: SessionInfo| {
-                                let name = s.name.clone();
-                                let cls_name = name.clone();
-                                let cls = move || {
-                                    let mut c = String::from("rw-sess");
-                                    if active.get().as_deref() == Some(cls_name.as_str()) {
-                                        c.push_str(" on");
-                                    }
-                                    if looping.get().contains(cls_name.as_str()) {
-                                        c.push_str(" running");
-                                    }
-                                    c
-                                };
-                                let click_name = name.clone();
-                                let title = name.clone();
-                                view! {
-                                    <button
-                                        class=cls
-                                        title=title
-                                        on:click=move |_| {
-                                            crate::ui::select_session(state, &click_name);
-                                        }
-                                    >
-                                        <span class="rw-sess-name">{ name.clone() }</span>
-                                    </button>
-                                }
+                                crate::ui::session_card(state, s, true)
                             }
                         />
                     </div>

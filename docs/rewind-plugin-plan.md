@@ -69,8 +69,9 @@ split/main:
   "no rounds yet".
 
 This is a brand-new interface: the existing dispatch chrome (30% plugin cap,
-session-list in the sidebar) is not reused inside it; the rail reuses only the
-grouping helper (`dispatch_groups`) and a compact card variant.
+session-list in the sidebar) is not reused inside it; the rail reuses the
+grouping helper (`dispatch_groups`) and, since v0.5.56, the dispatch view's
+session card itself (`ui::session_card` + `ui::session_group_head`, see §9).
 
 ## 4. Tree data model (server projection)
 
@@ -284,6 +285,26 @@ Effort: P1 1d · P2 0.5d · P3 1d · P4 1d · P5 0.5d · P6 0.5d · P7 1d
 | P5 | `rewind_confirm_dialog` (title "Rewind to this point?", the C3 body, Cancel/Rewind, Rewind disabled when locked) → `post_rewind(seq, "on")` + `rewind_gen` bump + refetch | probe: dialog copy (English), cancel = no write, confirm ⇒ appended `{"type":"rewind","target_seq":6,"mode":"on"}`, live `current` move, case C re-entry, 14-line append-only log |
 | P6 | `⟲` on every `.ev-user` card (`transcript.rs` → `quick_rewind_button`, `target_seq = hist_oldest_line + index`), inert on the current tail, same dialog | probe: 4 buttons, `[F,F,F,T]` disabled, tooltips, dialog target |
 | P7 | `docs/rewind-plugin.md`, README section + API row, `plugin-authoring-rules.md`/`plugin-area.md` registry notes, `e2e/rewind_probe.py` | probe 71/71 PASS; `e2e/layout_probe.py` still PASSes (the capsule-scrollbar lists) |
+| R1–R3 | the rail = the dispatch cards, grouped by working path, loop toggle included (§9.1) | probe 88/88 PASS |
+
+### 9.1 v0.5.56b — the rail becomes the dispatch view's cards (user request)
+
+Request: *the expanded view's session cards should be sorted/grouped by
+working path, and the previous placeholder expanded view's card design should
+come back — that one was better, it has buttons to control the loop's
+start/stop.*
+
+| Step | Change |
+|---|---|
+| R1 | `ui.rs`: `dispatch_card` split into `pub(crate) fn session_card(state, s, stay)` + `pub(crate) fn session_group_head(key, count)`; the dispatch view (`dispatch_card`) is a thin wrapper with `stay = false`, so the two surfaces cannot drift |
+| R1 | `rewind.rs::hist_rail` renders `session_group_head` + `session_card(..., stay = true)` per `dispatch_groups` bucket — one group per working path (`cwd` marker), the "(no project)" bucket for markerless sessions, the full path in the head's title, the card count beside it |
+| R1 | `style.css`: the rail is the 250px dispatch column again; the `.rw-sess*` / `.rw-group*` placeholder rules are deleted; rail-scoped compaction of `.dispatch-card` (`.dc-name/.dc-time/.qa/.dc-actions`) |
+| R2 | the card's loop toggle (▶ start / ■ stop over REST) is live in the rail, and the `…` rename/delete menu works there too (`#sess-menu` is `position: fixed` and mounted outside `#sidebar`, so it was never hidden by `layout-full`) |
+| R3 | `e2e/rewind_probe.py`: +17 checks → 88 PASS. The three fixtures get `.cwd` markers (`alpha-project` / `beta-project` / none) so the path grouping is asserted for real, plus the toggle labels/classes/tooltips, and a **real ■ stop click**: the fake `loop.pid` is now started with `setsid` (so the server's `kill(-pid)` group signal lands) and is **reaped before** the server's liveness probe reads it (a zombie keeps `kill(pid, 0)` true — the fixture trap that made the first version of the check fail); the check then reads `/api/loops` (the session left `running`) and reloads to see ▶ start + a clickable tree |
+
+Verified: `cargo test -p rushi-web` 42 passed; `trunk build` clean;
+`e2e/rewind_probe.py` 88/88 PASS; `e2e/layout_probe.py` on the live server
+still PASS (no shell regression from the rail CSS).
 
 Extra (beyond the plan text, decided during implementation):
 

@@ -66,7 +66,10 @@ read-only projection (`GET /api/sessions/{id}/rewind`), the UI, and the guard.
 - **The expanded view is a new full-window interface.** `layout-full` is no
   longer the stretched sidebar: `#history-view` replaces it, with a session
   rail on the left (so switching sessions stays full-screen) and the recursive
-  round/branch tree filling the rest. One node = one user message = one loop
+  round/branch tree filling the rest. The rail is the M7 dispatch view's
+  session card — grouped by the session's **working path**, each with its own
+  `▶ start` / `■ stop` loop toggle and `…` menu (v0.5.56). One node = one user
+  message = one loop
   round; the agent's work folds into the node (summary + event count).
   Abandoned branches are dimmed with a strikethrough summary, the current
   round carries a ring and "here", and compaction boundaries are footnoted.

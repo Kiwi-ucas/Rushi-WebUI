@@ -1659,13 +1659,20 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
 #hist-theme { flex: 0 0 auto; border: none; background: var(--bg-elev); color: var(--text-muted); width: 30px; height: 30px; border-radius: 9px; cursor: pointer; box-shadow: var(--groove); display: flex; align-items: center; justify-content: center; }
 #hist-theme:hover { color: var(--text); box-shadow: var(--shadow); }
 #hist-body { flex: 1 1 auto; min-height: 0; display: flex; gap: 14px; padding: 0 18px 10px; }
-#hist-rail { flex: 0 0 200px; min-height: 0; display: flex; flex-direction: column; gap: 10px; padding-right: 4px; }
-.rw-group { display: flex; flex-direction: column; gap: 4px; }
-.rw-group-head { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .6px; color: var(--text-muted); padding: 2px 6px; }
-.rw-sess { border: none; text-align: left; background: var(--bg-elev); color: var(--text-muted); font-size: 13px; padding: 7px 10px; border-radius: 8px; cursor: pointer; box-shadow: var(--groove); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.rw-sess:hover { color: var(--text); box-shadow: var(--shadow); }
-.rw-sess.on { color: var(--text); font-weight: 600; box-shadow: var(--shadow); }
-.rw-sess.running::before { content: ''; display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--accent); margin-right: 6px; }
+#hist-rail { flex: 0 0 250px; min-height: 0; display: flex; flex-direction: column; gap: 10px; padding-right: 4px; overflow-y: auto; }
+/* v0.5.56: the rail carries the dispatch-view session cards — one group per
+   working path (`.dispatch-group` / `.dispatch-group-head` / `.dispatch-card`
+   from the M7 dispatch view), so the same card style and the same ▶ start /
+   ■ stop loop toggle come back, now inside the expanded (History) view.
+   Only the rail's narrower column needs compaction. */
+#hist-rail .dispatch-group { margin-top: 12px; }
+#hist-rail .dispatch-group:first-child { margin-top: 0; }
+#hist-rail .dispatch-group-head { padding: 0 4px 6px; font-size: 10px; }
+#hist-rail .dispatch-card { padding: 7px 9px 8px; margin-bottom: 5px; }
+#hist-rail .dc-name { font-size: 13px; }
+#hist-rail .dc-time { font-size: 10px; }
+#hist-rail .dc-actions { margin-top: 6px; gap: 5px; }
+#hist-rail .qa { font-size: 10.5px; padding: 3px 8px; }
 #hist-tree { flex: 1 1 auto; min-width: 0; min-height: 0; overflow-y: auto; border-radius: 10px; background: var(--bg-elev); box-shadow: var(--groove); padding: 10px 12px; }
 #hist-foot { flex: 0 0 auto; padding: 6px 18px 14px; color: var(--text-muted); font-size: 12px; }
 .rw-empty { color: var(--text-muted); font-size: 13px; padding: 18px 6px; }

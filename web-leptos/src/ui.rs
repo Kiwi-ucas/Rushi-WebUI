@@ -709,6 +709,22 @@ fn dispatch_time_label(ts: Option<f64>) -> String {
     .unwrap_or_else(|| "no events".to_string())
 }
 
+/// M7 (v0.5.56): the project-group header line — the working directory
+/// (basename as the label, the full path in the title) plus the card count.
+/// Shared by the sidebar's dispatch view and the rewind History rail, which
+/// both group sessions by that path (`model::dispatch_groups`).
+pub(crate) fn session_group_head(group_key: &str, count: usize) -> AnyView {
+    let label = dispatch_group_label(group_key);
+    let title = group_key.to_string();
+    view! {
+        <div class="dispatch-group-head" title=title>
+            { label }
+            <span class="dispatch-group-count">{ count }</span>
+        </div>
+    }
+    .into_any()
+}
+
 /// M7: one project group in the dispatch view (layout "full"): a header
 /// line (project directory, full path in the title, card count) plus one
 /// card per session. The group's membership/order is baked into the For
@@ -719,14 +735,10 @@ fn dispatch_group_block(
     group_key: String,
     group_sessions: Vec<SessionInfo>,
 ) -> impl IntoView {
-    let label = dispatch_group_label(&group_key);
     let count = group_sessions.len();
     view! {
         <div class="dispatch-group">
-            <div class="dispatch-group-head" title={group_key.clone()}>
-                { label.clone() }
-                <span class="dispatch-group-count">{ count }</span>
-            </div>
+            { session_group_head(&group_key, count) }
             <For
                 each=move || group_sessions.clone()
                 key=|s: &SessionInfo| s.name.clone()
@@ -741,6 +753,20 @@ fn dispatch_group_block(
 /// on the action line. Clicking the card enters the session and returns
 /// to the "split" layout.
 fn dispatch_card(state: AppState, s: SessionInfo) -> impl IntoView {
+    session_card(state, s, false)
+}
+
+/// M7 (v0.5.56): the session card itself, shared by the sidebar's dispatch
+/// view and the rewind plugin's History rail. It carries the session name,
+/// the last-output time, the **per-session loop toggle** (`\u{25B6} start` /
+/// `\u{25A0} stop`, over REST, for any session) and the `\u{2026}` menu
+/// (rename / delete).
+///
+/// `stay` is the only behavioural difference: the dispatch view enters the
+/// session and returns to the "split" layout, while the History rail keeps
+/// the full-window view and lets the tree reload for the new session in
+/// place (the C2 decision: switching sessions stays full-screen).
+pub(crate) fn session_card(state: AppState, s: SessionInfo, stay: bool) -> AnyView {
     let name = s.name.clone();
     let ts = s.last_modified;
 
@@ -812,11 +838,12 @@ fn dispatch_card(state: AppState, s: SessionInfo) -> impl IntoView {
         <div
             class=card_cls
             on:click=move |_| {
-                // M7: entering a session from the dispatch view returns
-                // to the split layout.
+                // M7: entering a session from the dispatch view returns to
+                // the split layout; the History rail (stay = true) keeps the
+                // full-window view — only the tree's session changes.
                 select_session(state, &name_click);
                 menu_session.set(None);
-                if layout.get() == "full" {
+                if !stay && layout.get() == "full" {
                     layout.set("split".to_string());
                     set_layout_mode("split");
                 }
@@ -857,6 +884,7 @@ fn dispatch_card(state: AppState, s: SessionInfo) -> impl IntoView {
             </div>
         </div>
     }
+    .into_any()
 }
 
 pub async fn do_send(state: AppState, content: String, queue: String) {
