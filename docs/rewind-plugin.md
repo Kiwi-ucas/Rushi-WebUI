@@ -306,24 +306,40 @@ it supersedes the earlier "list is the default"). `list` stays one click away
 and persisted under `rushi-rw-view`; Style A's probe pins that key explicitly
 so it always tests the style it means to test.
 
-### 3b.6 The orbital view (v0.5.68)
+### 3b.6 The cone: how the flow scene is laid out (v0.5.68 → v0.5.70)
 
-The flow scene is now a **ring**. The session's history stays the horizontal
-axis — the trunk, which never moves — and every **forking branch** is a
-*fin*: a plane hinged on that axis at the column it left, held out at an
-auto-fitted radius and turned around the axis by a ring angle. History length
-grows along x, the fork count grows *around* the line, and the two stop
-competing for screen rows.
+The session's history stays the horizontal **axis** — the trunk, which never
+moves — and every **forking branch** is a straight **ray** leaving its
+parent's bead. History length grows along x, the fork count spreads *away*
+from the line over a cone surface, and the two stop competing for screen
+rows. A branch is one element, one line and its beads; there is no ribbon and
+no elbow, and every connector in the scene is straight (the user's rule:
+"every connector must be a straight line with no bends", "no background
+ribbon per branch").
 
-* **The angle.** `theta = (fin − align) × 30° + (scroll − rest) × (360°/1.5·width)`,
-  clamped to ±60°: three fins are inside the arc, the rest *park* at its ends
+* **The ray.** A branch's container is a zero-size point **on its parent's
+  bead**; it holds one bar (`hypot`/`atan2` over the container's own span and
+  slope) and the beads that branch owns, each one column right and one `q`
+  out. `q = (axis − margin − band/2) / longest branch` is the auto-fit slope:
+  the longest branch's last bead lands on the panel's top edge, and every
+  other branch is steeper-looking or shallower for free — one slope for the
+  whole cone, so branches never cross. The x step stays one column per round
+  (D-cone-3), so a branch never becomes a second time axis.
+* **The angle.** `theta = (slot − align) × 30° + (scroll − rest) × (360°/1.5·width)`,
+  clamped to ±60°: three slots are inside the arc, the rest *park* at its ends
   — pushed back in depth and faded, so they read as a queue and every branch
   takes its turn at the front as the scene pans. Scrolling moves exactly one
   value (`--rw-scroll`); everything else is written at layout time.
+* **A fork off a branch nests.** When a branch's parent is itself on a branch,
+  its container is rendered *inside* the parent's container (D-cone-6), at
+  `−po·q` along the parent's plane, so its line starts on the parent's bead
+  and it fans **relative to its parent** (`slot·30°`, with no second phase —
+  D-cone-7 as the user corrected it). Depth is unbounded.
 * **The alignment.** `align` is the selected round's fin, else the current
   round's fin, else 0, and the *rest* offset is re-anchored whenever the
   layout runs, so "at rest" always means "the current branch is at the
-  front" (click a fin's bead to bring its branch round).
+  front" (click a bead on a branch — nested trees included — to bring that
+  branch round).
 * **The driver, and why the wheel alone was not enough (v0.5.69).** The phase
   reads the scene's pan, and the scene only pans while its track is wider than
   the panel — `--cell` auto-fits, so a track of **17..45 columns fits
@@ -333,10 +349,10 @@ competing for screen rows.
   `scrollLeft + turn`, the *turn* being the part of a gesture the track could
   not take: the wheel accumulates its overshoot at either end, the drag sets
   it from the pointer's own wish. A scene that can pan behaves exactly as
-  before, one value per frame; a scene that cannot, turns the ring where it
+  before, one value per frame; a scene that cannot, turns the cone where it
   stands. The turn resets with `--rw0` at every **layout point** (a new scene,
   a new selection, a resize, a session switch), so rest still means alignment,
-  and a bare re-measure (`on:pointerdown`) leaves the ring alone.
+  and a bare re-measure (`on:pointerdown`) leaves the cone alone.
 * **The projection is taken *live* (v0.5.69).** The server's pop guard is the
   kernel's own — but the kernel only runs it between turns, when every call of
   the previous turn is answered, while the plugin projects on every request.
@@ -346,37 +362,44 @@ competing for screen rows.
   while the agent worked, `4 fins` a moment later). The rule is narrow: a pair
   the *mask* splits still strands, and a dead loop gets the kernel's exact
   behaviour.
-* **The beads.** A fin's rounds ride on its plane, each counter-rotated about
-  its own dot so numbers stay upright; the fin's plane itself is what tips
-  into the screen. Clicking, hover tooltips and `elementFromPoint` all work
-  on a turned fin.
-* **Degenerate cases.** No fork: no fin at all, the flat line the scene always
-  was. One fork: a **swing** (`25°·sin(phase)`) instead of a ring that can
-  park — one CSS line, no server field.
-* **Less motion.** `prefers-reduced-motion: reduce` unfolds the same ring onto
-  rows via `−R·cos` *and* pins the phase, so it is genuinely static; the
-  3D-off-but-still-sliding variant is not "reduced motion". A forced `.flat`
-  class (the probes' affordance) shows the same projection while still
-  following the scroll.
-* **Nested forks.** A fork inside a branch gets its own fin, hinged on a
-  column that belongs to another fin: it renders (no traps, and the rounds
-  are attributed correctly), but it has no drawn link to its parent. The flat
-  lane layout could not draw the shape at all, so this is not a regression —
-  it is the one place the ring is weaker than a lane diagram.
+* **The beads.** A branch's rounds ride its plane, each counter-rotated about
+  its own dot so numbers stay upright; the plane itself is what tips into the
+  screen. Clicking, hover tooltips and `elementFromPoint` all work on a turned
+  branch. Two engine facts are load-bearing here and were measured the hard
+  way: an element with `opacity < 1` becomes a **grouping element** and
+  flattens its 3D children, so the park fade is a *value* (`--fade`) read by
+  the leaves, never the `opacity` property on a container; and a bead must
+  counter-rotate by its plane's **absolute** angle, which the render supplies
+  (`--sroot`/`--sum`) because CSS cannot add an ancestor's variable to its own
+  without a cycle. `hypot()`/`atan2()` are usable but not with container units
+  inside them, so the cell and the slope cross into CSS as px (`--cell`, `--q`).
+* **Degenerate cases.** No fork: no branch at all, the flat line the scene
+  always was. One fork: a **swing** (`25°·sin(phase)`) instead of a cone that
+  can park — one CSS line, no server field.
+* **Less motion.** `prefers-reduced-motion: reduce` unfolds the same local
+  geometry onto rows with the container's `scaleY(cos a − 0.12·sin a)` *and*
+  pins the phase, so it is genuinely static; the 3D-off-but-still-sliding
+  variant is not "reduced motion". A forced `.flat` class (the probes'
+  affordance) shows the same projection while still following the scroll. A
+  nested bead counter-scales by its whole chain's product (`--kup`/`--kown`
+  beside the dynamic `--kroot`), so its dot stays round at any depth.
 
-The old lane-vs-trunk hinge (`.rw3-hinge`) is gone: nothing leaves the axis
-any more, so there is no gap to bridge. Implementation record, the five
-refinements found while building and the pixel measurements are **§12.9 of
+The old lane-vs-trunk hinge (`.rw3-hinge`) and the per-branch ribbon
+(`.rw-fin`) with its elbow bars (`.rw3-elbow`) are **deleted** (D-cone-3);
+the stylesheet mirror's extractor asserts their absence. Implementation
+record, the three engine traps, the one honest limitation (a *parked*
+branch's plane travels with its push, so its spine no longer lands exactly on
+its parent's bead in projection) and the pixel measurements are **§13.6 of
 `rewind-plugin-plan.md`**; the deep probe is `e2e/orbit_probe.py` (L1–L12,
-34 checks, own fixtures) and the live-shape probe is section H of
+**40 checks**, own fixtures) and the live-shape probe is section H of
 `e2e/flow_style_b_probe.py`.
 
-**v0.5.69 open item.** The two defects of §3b.6 (the live projection and the
-frozen phase) are covered by unit tests and were confirmed against the live
-API, but the two new *browser* checks — a ring that turns on a scene that
-fits, and a `loop.pid` toggle for the pending rule — were deferred at the
-user's request (they are reviewing the fix by hand), together with a re-run of
-the four probes.
+**v0.5.69 open item (still open).** The two live defects are covered by unit
+tests and were confirmed against the live API, and the four probes have since
+been re-run green (v0.5.70) — but the two *new* browser checks that would pin
+them (a cone that turns on a scene too narrow to pan, and a `loop.pid` toggle
+for the pending rule) were deferred at the user's request, because they were
+reviewing that fix by hand.
 
 ## 4. Rewind is forbidden while the loop runs (decision 5)
 
@@ -469,6 +492,18 @@ abandoned rounds are still rendered.
   call never drops a marker, a mask-split pair always does
   (**71 tests green**).
 * `trunk build` — the Leptos CSR bundle.
+* `python3 e2e/orbit_probe.py` (v0.5.70) — **40 checks, own fixtures, own
+  server**: the ray (`out = k+1` steps, one column each), the one slope and
+  its auto-fit, the spine's span and its start on the parent's bead, the
+  nested container inside its parent, the arc's queue and its parking order,
+  the turn under scroll (every bead still on the law), the click-to-align of a
+  nested tree, the flat projection (`scaleY` of the same rays, round dots at
+  any depth) and `prefers-reduced-motion` pinning it.
+* `python3 e2e/flow_style_b_probe.py [port]` — **66 checks** (A-I) on a live
+  server, including section H's cone shape and section C's canaries that
+  the ribbon (`.rw-fin`) and the elbow bars (`.rw3-elbow`) are gone.
+* `python3 e2e/flow_check.py [port]` — the flow projection's invariants
+  across **every session on the server** (8 sessions, 0 problems).
 * `python3 e2e/rewind_probe.py [port]` — **140 browser + HTTP assertions**
   over four fixture sessions built by the probe
   (`/tmp/rw-e2e/sessions/rewindprobe`, forked; `rewindprobe2`, a second

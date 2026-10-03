@@ -32,7 +32,7 @@ use crate::api;
 use std::collections::HashMap;
 
 use crate::model::{
-    AppState, FlowNode, Restore, RewindNode, RewindTarget, SessionInfo,
+    AppState, FlowBranch, FlowNode, Restore, RewindNode, RewindTarget, SessionInfo,
 };
 use crate::timeutil;
 
@@ -204,6 +204,55 @@ fn sync_scene_metrics() {
     let _ = st.set_property("--axis", &format!("{axis}px"));
     // px, not a bare number: the CSS reads it as a length
     let _ = st.set_property("--r", &format!("{r}px"));
+    // ── v0.5.70: the cone's slope (plan §13, D-cone-2) ───────────────
+    // Every branch shares one slope, and the *longest* branch sets it: its
+    // farthest bead is the scene's highest point, so `q = span / longest`
+    // puts that bead exactly inside the panel — the same auto-fit the ring's
+    // radius had, per step instead of per branch. The length is read back off
+    // the DOM (each container carries `data-n`), so the slope stays a
+    // layout-time pixel value and the CSS keeps owning the cell.
+    let longest = doc
+        .query_selector_all(".rw-branch")
+        .ok()
+        .map(|list| {
+            (0..list.length())
+                .filter_map(|i| list.item(i))
+                .filter_map(|n| n.dyn_into::<web_sys::Element>().ok())
+                .filter_map(|el| el.get_attribute("data-n"))
+                .filter_map(|s| s.parse::<f64>().ok())
+                .fold(0.0_f64, f64::max)
+        })
+        .unwrap_or(0.0);
+    let q = if longest > 0.0 { r / longest } else { 0.0 };
+    let _ = st.set_property("--q", &format!("{q:.3}px"));
+    // ── v0.5.70: the cell, in plain px, for the spine ───────────────
+    // The spine's angle is `atan2(steps·q, columns·cell)` — and Chromium
+    // refuses a *container unit* inside `atan2()` (measured: `--cell` is
+    // `clamp(26px, calc(100cqw / N - 4px), 64px)`, which `hypot()` accepts
+    // but `atan2()` treats as invalid, leaving the bar unrotated). So the
+    // layout hands the CSS a plain length, *measured* off a segment that
+    // already carries the real cell — never recomputed from a formula the
+    // stylesheet would have to agree with.
+    let cell_px = doc
+        .query_selector(".rw3-seg")
+        .ok()
+        .flatten()
+        .and_then(|e| e.dyn_into::<web_sys::Element>().ok())
+        .and_then(|e| {
+            web_sys::window()
+                .and_then(|w| w.get_computed_style(&e).ok())
+                .flatten()
+        })
+        .and_then(|cs| cs.get_property_value("width").ok())
+        .and_then(|w| w.trim().trim_end_matches("px").parse::<f64>().ok());
+    match cell_px {
+        Some(c) => {
+            let _ = st.set_property("--cellpx", &format!("{c:.3}px"));
+        }
+        None => {
+            let _ = st.remove_property("--cellpx");
+        }
+    }
     // D-orb-8: a fixed angular rate, and `--rw0` = the offset the scene is at
     // when the layout runs, so entering the scene (or picking a round, or a
     // new round arriving) puts the ring back at rest with the aligned fin in
@@ -936,11 +985,6 @@ fn flow_scene(state: AppState) -> AnyView {
                 .filter_map(|b| b.fin.map(|i| (b, i)))
                 .flat_map(|(b, i)| b.seqs.iter().map(move |s| (*s, i)))
                 .collect();
-            let align = selected
-                .get()
-                .and_then(|s| fin_of.get(&s).copied())
-                .or_else(|| t.current_seq.and_then(|s| fin_of.get(&s).copied()))
-                .unwrap_or(0);
 
             // The trunk: the main-line runs. They never turn — the branches
             // orbit around *them* (D-orb-3, user decision) — so the trunk's
@@ -970,80 +1014,96 @@ fn flow_scene(state: AppState) -> AnyView {
             let by_seq: HashMap<u64, FlowNode> =
                 f.nodes.iter().map(|n| (n.seq, n.clone())).collect();
 
-            // One fin per forking branch: a plane hinged on the trunk axis at
-            // the column the branch leaves it (`hinge_x`), held out at the
-            // radius the auto-fit gives the scene and turned by its ring
-            // angle. The branch's own rounds ride on the fin, so the scene is
-            // a *radial* drawing of the same tree: history length grows along
-            // x, the fork count grows around the axis, and the two stop
-            // competing for screen rows (plan §12.3).
-            let fins: Vec<AnyView> = f
+            // ── the branches are a *forest*, not a ring of siblings ─────            // v0.5.70 / D-cone-6/7: a branch leaves its parent's **bead**. A
+            // trunk-parented branch hinges on the axis at its parent's column;
+            // a branch whose parent is itself on a branch is rendered *inside*
+            // its parent's container, so the parent's turn is already in force
+            // and the child's own angle reads as a small fan (±1 slot)
+            // relative to its parent. The relation comes from the reduced edge
+            // (a branch root's parent), never from the lane — a nested fork
+            // shares its parent's lane (v0.5.68).
+            let by_fin: HashMap<u32, &FlowBranch> = f
                 .branches
                 .iter()
-                .filter_map(|b| {
-                    let i = b.fin?;
-                    let hinge = b.hinge_x;
-                    let fin_edges: Vec<AnyView> = f
-                        .edges
-                        .iter()
-                        .filter(|e| fin_of.get(&e.to) == Some(&i))
-                        .map(|e| {
-                            let (fx, _, _) = at.get(&e.from).copied().unwrap_or((0, 0, true));
-                            let lit = at.get(&e.to).map(|t| t.2).unwrap_or(true);
-                            view! {
-                                <div
-                                    class=format!(
-                                        "rw3-elbow fin {}",
-                                        if lit { "active" } else { "abandoned" },
-                                    )
-                                    data-from=e.from.to_string()
-                                    data-to=e.to.to_string()
-                                    style=format!("--x:{fx}; --lane:{}", e.lane)
-                                ></div>
-                            }
-                            .into_any()
-                        })
-                        .collect();
-                    let fin_nodes: Vec<AnyView> = b
-                        .seqs
-                        .iter()
-                        .filter_map(|s| by_seq.get(s))
-                        .map(|n| flow_node_button(state, n.clone()))
-                        .collect();
-                    Some(
-                        view! {
-                            <div
-                                class=format!(
-                                    "rw-fin {}",
-                                    if b.lane < 0 { "up" } else { "down" },
-                                )
-                                data-fin=i.to_string()
-                                data-root=b.root.to_string()
-                                data-hinge=hinge.to_string()
-                                data-lane=b.lane.to_string()
-                                style=format!(
-                                    "--fin:{i}; --hinge:{hinge}; --from:{}; --to:{}; --lane:{}",
-                                    b.from_x,
-                                    b.to_x,
-                                    b.lane,
-                                )
-                            >
-                                { fin_edges }
-                                { fin_nodes }
-                            </div>
-                        }
-                        .into_any(),
-                    )
+                .filter_map(|b| b.fin.map(|i| (i, b)))
+                .collect();
+            let parent_of: HashMap<u64, u64> = f
+                .edges
+                .iter()
+                .filter(|e| !e.main)
+                .map(|e| (e.to, e.from))
+                .collect();
+            let owner: HashMap<u32, Option<u32>> = by_fin
+                .iter()
+                .map(|(i, b)| {
+                    let o = parent_of
+                        .get(&b.root)
+                        .and_then(|p| fin_of.get(p).copied());
+                    (*i, o)
                 })
                 .collect();
+            let mut kids: HashMap<u32, Vec<u32>> = HashMap::new();
+            let mut roots: Vec<u32> = Vec::new();
+            for (&i, o) in owner.iter() {
+                match o {
+                    Some(p) => kids.entry(*p).or_default().push(i),
+                    None => roots.push(i),
+                }
+            }
+            roots.sort_unstable();
+            for v in kids.values_mut() {
+                v.sort_unstable();
+            }
+            // The topmost trunk-parented ancestor of each fin: the one
+            // `--align` turns to the front (D-orb-7) — which brings a nested
+            // fan along with it, since a child's turn composes with its
+            // parent's.
+            let mut top: HashMap<u32, u32> = HashMap::new();
+            for &i in &roots {
+                top.insert(i, i);
+            }
+            for _ in 0..by_fin.len() {
+                let known: Vec<(u32, u32)> = kids
+                    .iter()
+                    .filter_map(|(p, cs)| top.get(p).map(|t| (*t, cs.clone())))
+                    .flat_map(|(t, cs)| cs.into_iter().map(move |c| (c, t)))
+                    .collect();
+                if known.is_empty() {
+                    break;
+                }
+                for (c, t) in known {
+                    top.insert(c, t);
+                }
+            }
+            let align = selected
+                .get()
+                .and_then(|s| fin_of.get(&s).copied())
+                .or_else(|| t.current_seq.and_then(|s| fin_of.get(&s).copied()))
+                .and_then(|i| top.get(&i).copied())
+                .unwrap_or_else(|| roots.first().copied().unwrap_or(0));
+
+            let cone = Cone {
+                state,
+                at: &at,
+                by_seq: &by_seq,
+                by_fin: &by_fin,
+                parent_of: &parent_of,
+                kids: &kids,
+                step: f.orbit.step_deg.max(1),
+                arc: f.orbit.arc_deg.max(1),
+            };
+            let fins: Vec<AnyView> = roots
+                .iter()
+                .map(|&i| cone.branch(i, 0, 0, i as i32, i as i32, 0, 1.0, 0))
+                .collect();
             // how many fins the ring actually has (D-orb-9 reads this)
-            let fins_len = fins.len();
+            let fins_len = by_fin.len();
 
             let trunk_nodes: Vec<AnyView> = f
                 .nodes
                 .iter()
                 .filter(|n| !fin_of.contains_key(&n.seq))
-                .map(|n| flow_node_button(state, n.clone()))
+                .map(|n| flow_node_button(state, n.clone(), 0))
                 .collect();
 
             // Drag the empty space to pan (D4/D7): the wheel drives the same
@@ -1167,9 +1227,191 @@ fn flow_scene(state: AppState) -> AnyView {
     .into_any()
 }
 
+/// One straight run of a branch's **spine** (plan §13, D-cone-4): from the
+/// bead `d0` steps out of the parent, `n` beads / `dx` columns long.
+/// `hypot()` and `atan2()` give the bar its length and angle *in the
+/// branch's own plane*, so the scene bends nowhere and the layout writes only
+/// the slope (`--q`) — one number for the whole cone.
+fn spine_bar(d0: usize, n: usize, dx: u64, live: bool) -> AnyView {
+    view! {
+        <div
+            class=format!(
+                "rw-br-line {}",
+                if live { "active" } else { "abandoned" },
+            )
+            data-from=d0.to_string()
+            data-to=(d0 + n).to_string()
+            style=format!("--d0:{d0}; --n:{n}; --dx:{dx}")
+        ></div>
+    }
+    .into_any()
+}
+
+/// The cone renderer (plan §13). One method, recursing down the branch
+/// *forest*, so a fork off a branch knows its parent's bead and every branch
+/// keeps one straight ray leaving it.
+struct Cone<'a> {
+    state: AppState,
+    at: &'a HashMap<u64, (u64, i32, bool)>,
+    by_seq: &'a HashMap<u64, FlowNode>,
+    by_fin: &'a HashMap<u32, &'a FlowBranch>,
+    parent_of: &'a HashMap<u64, u64>,
+    kids: &'a HashMap<u32, Vec<u32>>,
+    /// The server's ring constants, for the static part of a nested chain.
+    step: i32,
+    arc: i32,
+}
+
+/// Style B's flat projection shrinks a branch's outward step by this factor
+/// (plan §13, D9/L10). It is the same law the stylesheet's `--kroot` uses, so
+/// a nested bead can counter-scale by its chain's product and stay round.
+fn flat_k(deg: f64) -> f64 {
+    let r = deg.to_radians();
+    r.cos() - 0.12 * r.sin()
+}
+
+impl Cone<'_> {
+    /// One branch: a container sitting at (or inside) its parent's bead, one
+    /// straight spine, its rounds, and the branches that fork off it.
+    ///
+    /// `outer` is the hinge of the container this one lives in (0 when it
+    /// lives on the trunk) and `po` its parent bead's step inside that
+    /// container; `slot` is the angle it takes. `sroot` is the slot of the
+    /// topmost trunk-parented ancestor and `sum` the static part of the
+    /// nesting chain — together they give the plane's *absolute* angle, which
+    /// a bead needs to counter-rotate (the CSS cannot add an ancestor's own
+    /// variable to its own without a cycle).
+    #[allow(clippy::too_many_arguments)]
+    fn branch(
+        &self,
+        i: u32,
+        outer: u64,
+        po: u32,
+        slot: i32,
+        sroot: i32,
+        sum: i32,
+        kup: f64,
+        depth: u32,
+    ) -> AnyView {
+        let Some(b) = self.by_fin.get(&i).copied() else {
+            return view! { <div></div> }.into_any();
+        };
+        // this container's own static flat factor (1 at the root: the root's
+        // turn carries the phase, so the stylesheet reads that one from
+        // `--root_a`). The children inherit it through `--kup`.
+        let kown = if depth == 0 {
+            1.0
+        } else {
+            flat_k((slot * self.step).clamp(-self.arc, self.arc) as f64)
+        };
+        let hinge = b.hinge_x;
+        let seqs = &b.seqs;
+        let n = seqs.len();
+        let last_x = seqs
+            .last()
+            .and_then(|s| self.at.get(s))
+            .map(|t| t.0)
+            .unwrap_or(hinge);
+        let dx = last_x.saturating_sub(hinge).max(1);
+        // How far the live path runs into this branch: the spine is one
+        // straight bar per run, so a branch that is lit where it leaves its
+        // parent but buried further along still shows its dead tail as dead.
+        let live = seqs
+            .iter()
+            .take_while(|s| self.at.get(s).map(|t| t.2).unwrap_or(false))
+            .count();
+        let spines: Vec<AnyView> = if live == 0 || live >= n {
+            vec![spine_bar(0, n, dx, live > 0)]
+        } else {
+            vec![
+                spine_bar(0, live, dx.min(live as u64).max(1), true),
+                spine_bar(live, n - live, dx.saturating_sub(live as u64).max(1), false),
+            ]
+        };
+        // the beads: the k-th round of the branch rides `k+1` steps out, so
+        // the first one leaves the parent rather than sitting on it
+        let beads: Vec<AnyView> = seqs
+            .iter()
+            .enumerate()
+            .filter_map(|(k, s)| self.by_seq.get(s).map(|nd| (k as u32 + 1, nd.clone())))
+            .map(|(out, nd)| flow_node_button(self.state, nd, out))
+            .collect();
+        // the branches that fork off this one, as nested containers
+        let child_views: Vec<AnyView> = self
+            .kids
+            .get(&i)
+            .map(|cs| {
+                cs.iter()
+                    .enumerate()
+                    .map(|(k, &c)| {
+                        // the child's parent round is *this* branch's bead at
+                        // that column — where the child's spine must start
+                        let p = self
+                            .by_fin
+                            .get(&c)
+                            .and_then(|cb| self.parent_of.get(&cb.root))
+                            .copied()
+                            .unwrap_or(b.root);
+                        let po = seqs.iter().position(|s| *s == p).map(|q| q as u32 + 1);
+                        // D-cone-7: a nested fork fans *relative to its
+                        // parent* — never a zero offset (which would lay the
+                        // child's ray on top of the parent's next bead) and
+                        // never the ring's absolute slots. The fan is **two**
+                        // slots, not one: measured on the live `rewind`
+                        // session, a +30° child put its first bead 4.5px from
+                        // the parent's own continuation bead and *behind* it
+                        // (z −16px), so the current round hid under a dead
+                        // one. ±60° separates them by ~17px and puts the first
+                        // child in front of the viewer.
+                        let slot = if k % 2 == 0 {
+                            -((k as i32) / 2 + 1) * 2
+                        } else {
+                            ((k as i32 + 1) / 2) * 2
+                        };
+                        let inner = (slot * self.step).clamp(-self.arc, self.arc);
+                        // the child's `--kup` is every *ancestor* level's
+                        // factor — this container's own included, the child's
+                        // own excluded (the child adds that itself)
+                        self.branch(
+                            c,
+                            hinge,
+                            po.unwrap_or(0_u32),
+                            slot,
+                            sroot,
+                            sum + inner,
+                            kup * kown,
+                            depth + 1,
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // the container's own static flat factor (1 at the root: its turn
+        // carries the phase, so the stylesheet reads it from `--root_a`)
+        view! {
+            <div
+                class="rw-branch"
+                data-fin=i.to_string()
+                data-root=b.root.to_string()
+                data-hinge=hinge.to_string()
+                data-n=n.to_string()
+                data-lane=b.lane.to_string()
+                style=format!(
+                    "--slot:{slot}; --hinge:{hinge}; --ph:{outer}; --po:{po}; --n:{n}; \
+                     --dx:{dx}; --sroot:{sroot}; --sum:{sum}; \
+                     --kup:{kup:.5}; --kown:{kown:.5}",
+                )
+            >
+                { spines } { beads } { child_views }
+            </div>
+        }
+        .into_any()
+    }
+}
+
 /// One round: a dot on the line (or on its branch). A click only **selects**
 /// it — the Rewind button in the panel is the only trigger in this style.
-fn flow_node_button(state: AppState, n: FlowNode) -> AnyView {
+fn flow_node_button(state: AppState, n: FlowNode, out: u32) -> AnyView {
     let seq = n.seq;
     let FlowNode {
         x,
@@ -1222,8 +1464,9 @@ fn flow_node_button(state: AppState, n: FlowNode) -> AnyView {
             data-lane=lane.to_string()
             data-main=main.to_string()
             data-current=current.to_string()
+            data-out=out.to_string()
             title=title
-            style=format!("--x:{x}; --lane:{lane}")
+            style=format!("--x:{x}; --lane:{lane}; --out:{out}")
             on:click=move |_| select_node(state, seq)
         >
             <span class="rw3-dot"></span>

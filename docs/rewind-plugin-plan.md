@@ -1471,3 +1471,192 @@ scene fits, and a `loop.pid` toggle proving the pending rule end to end — plus
 a re-run of `rewind_probe` / `orbit_probe` / `flow_style_b_probe` /
 `flow_check`. Until those run, the browser-level verification for this round
 stands at the API-level checks above; the unit tests and the builds are green.
+
+## 13. The cone: a tree-shaped flow scene (proposed 2026-10-04, v0.5.70)
+
+User request, verbatim: *"树状视图做优化 1. 树状图无需一定是横向的直线，一般来说主路径可以是一条到底的直线，但分支可以是在圆锥面分布，更符合树状图的实际意义 2. 节点之间的连线一定是直线，不能有拐弯 3. 每一条支线无需做背景彩带，点线简洁连接即可"* — followed by *"调研现状，列改进计划给我看"*, so this section is
+a **proposal**: the D-cone-* decisions below are open until confirmed.
+
+### 13.1 What the flow scene actually draws (measured, not remembered)
+
+Dumped from the live scene (`rewind`, 24 columns, 4 fins, 1200×418 panel,
+`--axis` 259px, `--r` 230px):
+
+| element | geometry (measured) |
+|---|---|
+| trunk | 23 `.rw3-seg.main` bars + 24 beads, every bead at row 253-259 (= the axis), 46px apart — **a straight bead line**, as asked |
+| a branch | `.rw-fin`: a 26px-tall **plane** with `background: linear-gradient(...)`, hinged at the fork column (`left: (hinge+0.5)·cell`, `transform-origin: 0 50%`), turned by `rotateX(a)` and lifted `translateY(−230px)` |
+| the branch's beads | all on **one row inside that plane** (fin 0: rounds 6998..8867, every bead at y=23) — i.e. every branch runs **parallel to the trunk at a constant radius**: the branches form a **cylinder** around the axis, not a cone |
+| the branch's own runs | `.rw3-elbow` bars inside the plane, e.g. `6670→6998` at `[x=575 (= the parent's column), y=28, w=46]` |
+| parent link | **not drawn at all**: the bar starts at the parent's *column* but travels at the branch's *row*, so the 230px from the trunk bead up to the branch is empty — the branch floats (this is the gap the cone's straight line should fill) |
+| the parked queue | `|eff| > 60°` is clamped to the arc, pushed `−22px` in z per degree over and faded (fin 3: `eff` 90° → parked at 60°, beads 8px instead of 13px) |
+| the light | `.rw3-sheen`, a 7%-opacity vertical gradient pinned to the panel (not per branch) |
+
+So: nothing *bends* today — but nothing links a branch to its parent either,
+and the branch's own shape is a rectangle, which is what makes the picture
+read as a ring of flags rather than as a tree.
+
+### 13.2 The three asks, as geometry
+
+1. **主路径一条到底的直线，分支在圆锥面分布.** Keep the trunk exactly as it is.
+   Replace "a plane parallel to the trunk at radius R" with **a straight ray
+   that leaves the fork bead**: the branch's *i*-th round sits at
+   `(x = column, r = i·q)` — ahead along x and further out from the trunk with
+   every round. Points of that form are collinear in 3D (`r` grows linearly
+   with the round index), so the branch is one straight line on the surface of
+   a cone whose apex is the fork point and whose axis is the trunk.
+2. **连线一定是直线.** One line per branch — and it starts **exactly at the
+   parent's bead** (the container's origin is `(hinge column, axis row)`,
+   which *is* where the parent's bead sits), so the parent link and the
+   branch's own spine are the same straight segment. No elbow, no separate
+   hinge, no bend anywhere.
+3. **去掉支线彩带.** Delete `.rw-fin`'s gradient band and its inset shadow.
+   A branch becomes: **one straight line + its beads**. (`.rw3-sheen` is a
+   panel-wide light, not a per-branch ribbon — D-cone-5.)
+
+### 13.3 The numbers
+
+* `q = (axis − margin − dot_r) / max_branch_len` — the D-orb-1 fit rule,
+  generalised: the **longest** branch's tip just fits the panel, and every
+  shorter branch gets the same slope (so the branches are parallel *in cone
+  terms*, which is what makes them read as one tree).
+* Slope in cells `s = q / cell` (measured example: `axis` 259, `margin` 16,
+  `dot_r` 6.5, longest branch 7 rounds → `q ≈ 34px`, `cell` 46px → `s ≈ 0.73`,
+  a ≈ 36° cone half-angle).
+* Per bead: `--out: <i>` (render) and per branch `--q: <px>` (layout) — the
+  CSS does `translateY(calc(-1 * var(--out) * var(--q)))`, so a scroll frame
+  still writes exactly one value and a layout writes the pixels.
+* Azimuth, turn, park, fade, `--align`, `--phase`, `--eff`: **unchanged**
+  (the branch container keeps `rotateX(a)` about the axis with
+  `transform-origin: 0 <axis row>`).
+* Nested forks: nest the branch containers (a branch inside a branch is a
+  child container positioned at its parent bead's local offset), so a nested
+  branch's line also starts at its parent's bead — today it has no link at all.
+
+### 13.4 Decisions (D-cone-1..7 — **all approved by the user**, 2026-10-04)
+
+The user approved every proposal below verbatim; D-cone-7 was corrected
+during the review (a nested branch fans **relative to its parent**, not in
+its own absolute slot), which is what shipped — see §13.6.
+
+* **D-cone-1** the cone applies to branches only; the trunk stays a straight
+  bead line on the axis. (Proposed: yes.)
+* **D-cone-2** the slope: `R / longest branch` (uniform, auto-fit) or a fixed
+  slope with the far tip clipped? (Proposed: the auto-fit.)
+* **D-cone-3** the branch's x step: keep one column per round (out and along,
+  as today) or compress it so the cone is steeper and eats less width?
+  (Proposed: keep the column — the x axis stays "history", and the tree reads
+  as branches leaning out rather than as a second time axis.)
+* **D-cone-4** the line's start: the **parent's bead** (one straight segment,
+  proposed) or a point on the axis under the fork column?
+* **D-cone-5** `.rw3-sheen`: keep (proposed — it is a light, not a ribbon) or
+  drop it too?
+* **D-cone-6** keep the park-and-queue treatment for `|eff| > arc`, and do the
+  nested containers of D-cone-4's last bullet? (Proposed: yes to both.)
+  *Sibling* branches are the simple case and need nothing special: every
+  branch whose parent is on the **trunk** starts its line at that parent's
+  bead and points in its own slot's direction (`--step` 30° apart, clamped to
+  the ±60° arc). The nested container is about a branch whose **parent is
+  itself on a branch** — measured in the live `rewind` session: fin 1
+  (`8911`, edge `6998→8911`) has its line start at `[621, 71]` while its
+  parent bead `6998` sits at `[621, 29]` on fin 0: today every branch is a
+  flat sibling inside `.rw-orbit`, positioned in **trunk** coordinates, so a
+  nested branch's radius has nothing to do with its parent's (it comes out
+  *inside* it, 42px short, and never touches it). Nesting the container fixes
+  exactly that.
+* **D-cone-7** a nested branch's direction: a small fan **relative to its
+  parent** (proposed — e.g. ±30° off the parent's plane, so a fork off a
+  branch reads as a branch off a branch) or its own absolute slot?
+
+### 13.5 Steps once the decisions land (O-cone-1..6)
+
+1. **O-cone-1** client: per-branch container (nested), per-bead `--out`, one
+   line element per branch, `--q` written by `sync_scene_metrics` (it already
+   computes `--axis`/`--r`; `q` is one more division by the longest `seqs`).
+2. **O-cone-2** CSS: drop `.rw-fin`'s background/shadow and the per-edge
+   `.rw3-elbow` bars; add `.rw-branch`/`.rw-br-line`; keep the beat rules
+   (`--theta`/`--eff`/`--a`/`--over`) verbatim; the flat and reduced-motion
+   blocks drop the 3D but keep the cone's diagonal.
+3. **O-cone-3** labels: unchanged (counter-rotated about the bead, upright).
+4. **O-cone-4** server: **no change needed** — `fin`, `hinge_x`, `seqs` and
+   the orbit constants already carry everything; the slope is pixels.
+5. **O-cone-5** tests: the ring's unit tests keep their logic (fins, hinges,
+   attribution); `orbit_probe`'s geometry section must be rewritten for the
+   ray (it recomputes the old parallel-band law) and `flow_style_b_probe`'s
+   H section's "hinges must be 0" checks stay valid.
+6. **O-cone-6** docs: §3b.6 of the design doc, §12.9's successor here, the
+   mirror's README/TOUCHPOINTS canary list (`.rw-fin` disappears → the
+   extractor's canaries must move to `.rw-orbit .rw-branch .rw3-sheen ...`).
+
+### 13.6 As built (v0.5.70)
+
+All seven decisions shipped; the user approved them in one go ("你的建议我认为
+都是对的，这七条开工"). Client + stylesheet only — **the server is untouched**:
+`fin`/`hinge_x`/`seqs`/`orbit.{step_deg,arc_deg}` were already everything the
+cone needs, because the slope is pixels.
+
+**What is on screen now.** Each branch is a zero-size `.rw-branch` container
+sitting exactly on its parent's bead, holding one straight `.rw-br-line` bar
+(`width: hypot(dx·cell, n·q)`, `rotate(-atan2(n·q, dx·cell))`) and the beads
+that branch owns, each one column right and one `q` out
+(`top: -out * q`). `q = (axis - margin - band/2) / longest` is written by
+`sync_scene_metrics` in **px**, next to `--cell` — both because `atan2()` and
+`hypot()` are usable in this Chromium but **not with container units in
+them** (a `cqw` inside `atan2()` makes the whole `transform` compute to
+`none`; measured, cost an hour). The trunk is bit-identical to v0.5.69, the
+park/queue/`--phase`/`--align` mechanics are the v0.5.68 ones, `.rw3-sheen`
+is kept, and `.rw-fin`, `.rw3-elbow`, `.rw3-hinge` are **deleted** — the
+ribbon and the elbow bars are gone from the DOM, the CSS and the extractor's
+canaries (which now assert their *absence*).
+
+**A fork off a branch nests.** When a branch's parent is itself on a branch,
+its container is rendered *inside* the parent's, at `top: -po * q` — so its
+spine starts on the parent's bead and it fans relative to the parent
+(`--eff: slot · step`, no second phase). Depth is unbounded.
+
+**Three engine traps, all measured, all now load-bearing:**
+
+1. `opacity < 1` on an ancestor makes it a **grouping element**, which
+   flattens 3D children — a bead's own `opacity` turned its 13px dot into
+   7.85×3.05 and moved its centre ~35px off the ray. The park fade is
+   therefore a **value** (`--fade`) read by the leaves (`.rw3-dot`,
+   `.rw3-round`, `.rw-br-line`), never the `opacity` property on a container.
+2. A bead must counter-rotate by its plane's **absolute** angle, and CSS
+   cannot add an ancestor's variable to its own (a self-reference is a
+   cycle). The render writes the chain on every container instead: `--sroot`
+   (the top trunk-parented ancestor's slot) and `--sum` (the static, clamped
+   part of the nesting chain). With `--a` alone a nested bead over-rotated by
+   its parent's turn — same squash, same 35px.
+3. The flat projection scales the *container*, which also scales the bead's
+   content; a nested bead therefore needs the chain's **product**. Same fix,
+   same shape: `--kup`/`--kown` (static, clamped per level) beside the
+   dynamic `--kroot`, so `1 / (kroot · kup · kown)` is exact at any depth.
+   (`--aroot` is the *clamped* root angle — §12.9's refinement, again.)
+
+**One honest limitation.** The park push is part of the container's
+transform, so a *parked* branch's origin travels with its plane and its
+spine no longer lands exactly on the parent's bead in projection (measured
+drift: 225px at slot 3, 494px at slot 6). The plane, the spine and the beads
+move *together* — nothing inside a branch is inconsistent — and the queue is
+faint and far, but `orbit_probe`'s L4a checks the anchor strictly only where
+nothing is parked and reports the drift otherwise. Fixing it would mean
+splitting the push out of the plane, which costs the one-transform
+per-container simplicity this design is built on.
+
+**The four probes, re-run green:**
+
+| probe | before | v0.5.70 |
+| --- | --- | --- |
+| `orbit_probe.py` (own fixtures, L1-L12) | 34 checks (the ring) | **40 passed / 0 failed** (rewritten for the cone) |
+| `flow_style_b_probe.py 8480` (A-I) | 66 / 66 | **66 passed / 0 failed** (C/H moved to the cone's vocabulary) |
+| `flow_check.py 8480` | 8 / 0 | **8 sessions, 0 problems** |
+| `rewind_probe.py` | 140 | **PASS (140 checks)** |
+
+Two probe bugs were fixed on the way and are worth the note, because both
+looked like product bugs first: the geometry model's `rot_x` dropped `z`
+(harmless for one rotation, wrong the moment a container is nested — it
+reported a nested bead 36px off the law when the paint was exact), and
+`flow_style_b_probe`'s K1 hard-coded the longest *live* session at 117
+rounds (it is 118 now, so it reads the length from the API like the rest).
+`cargo test -p rushi-web` stays at 71; the wasm check and `trunk build` are
+clean.

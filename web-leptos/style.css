@@ -1840,125 +1840,199 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
 #rw-flow-track { perspective: 1400px; }
 .rw3-grid { transform-style: preserve-3d; }
 
-/* ── v0.5.68 the orbital scene (plan §12, D-orb-1..10) ────────────────
-   The forking branches are **fins**: planes hinged on the trunk's axis at
-   the column the branch leaves it (`--hinge`), held out at the radius the
-   auto-fit gives the scene (`--r`, written at layout time) and turned by
-   their ring angle. The trunk itself never turns (D-orb-3) — the branches
-   orbit *around* it.
+/* ── v0.5.70 the cone (plan §13, D-cone-1..7) ────────────────────────
+   A forking branch is a **straight ray** off its parent's *bead*, not a
+   band parallel to the trunk: its k-th round sits `k` steps out at
+   `(x = parent column + k, r = k·q)`, and `q` — written at layout time in
+   pixels (`--q`) — is one slope for the whole scene, auto-fit so the
+   longest branch's farthest bead clears the panel (D-cone-1/2/3).
+   The cone's apex is therefore the fork point, and the branch's spine is
+   ONE straight bar per live run: `hypot()` and `atan2()` give it its length
+   and angle *in the branch's own plane*, so it starts exactly at the
+   parent's bead and bends nowhere (D-cone-4). There is no ribbon any more —
+   a dot-line only (the user's third ask, D-cone-5 keeps the sheen, which is
+   a light, not a ribbon).
+   A branch *of* a branch gets a **nested container** (D-cone-6): it lives
+   inside its parent's, so the parent's turn is already in force and the
+   child's own angle (`--slot`, a small ±1, ±2 …) reads as a fan relative to
+   it (D-cone-7), while its spine still starts at its own parent's bead.
+   The trunk never turns (D-orb-3) — the branches turn *around* it.
 
    The one value a scroll frame moves is `--rw-scroll`; `--phase` is that
    offset minus the scene's rest offset (`--rw0`, also layout time) times a
    fixed angular rate (`--dpp`, D-orb-8). Everything else is written once:
-   the render writes `--align`/`--step`/`--arc`/`--fin`/`--hinge`, the
-   layout writes `--r`/`--axis`/`--dpp`/`--rw0` (rewind::sync_scene_metrics). */
+   the render writes `--slot`/`--step`/`--arc`/`--hinge`/`--ph`/`--po`/
+   `--n`/`--dx`, the layout writes `--q`/`--r`/`--axis`/`--dpp`/`--rw0`
+   (rewind::sync_scene_metrics). */
 #rw-flow-track {
   --phase: calc((var(--rw-scroll, 0) - var(--rw0, 0)) * var(--dpp, 0.3));
 }
 .rw-orbit { position: absolute; inset: 0; transform-style: preserve-3d; pointer-events: none; }
 
-.rw-fin {
+.rw-branch {
   position: absolute;
   left: calc((var(--hinge, 0) + 0.5) * var(--cell));
+  /* the parent's bead *centre*: a trunk bead's own `top` is the axis row and
+     its translate lifts the *box*, so its dot — the first child — is centred
+     back on the axis. The container is a point, so the axis row *is* the
+     bead's centre (D-cone-4's start) */
   top: var(--axis, 62%);
-  height: 26px;
-  margin-top: -13px;
-  width: calc((var(--to) - var(--hinge) + 0.5) * var(--cell));
-  transform-origin: 0 50%;
+  width: 0;
+  height: 0;
+  /* the pivot is the parent's bead: the trunk bead's centre for a branch
+     that leaves the trunk, the parent bead's own position otherwise */
+  transform-origin: 0 0;
   transform-style: preserve-3d;
   pointer-events: none;
-  border-radius: 13px;
-  opacity: .9;
-  background: linear-gradient(90deg, color-mix(in srgb, var(--accent) 22%, transparent), transparent 84%);
-  box-shadow: inset 0 1px 0 rgba(var(--shadow-rim), 0.4);
-  /* its own angle = its slot (server order, D-orb-2) + the scroll phase */
-  --theta: calc((var(--fin, 0) - var(--align, 0)) * var(--step, 30));
+  /* its own angle = its slot (server order, D-orb-2) + the scroll phase.
+     `--root_a` is the *top* trunk-parented ancestor's unclamped angle: the
+     render writes `--sroot` (that ancestor's slot) on every container, so
+     `--abs` below works at any nesting depth. */
+  --root_a: calc((var(--sroot, 0) - var(--align, 0)) * var(--step, 30) + var(--phase, 0));
+  --theta: calc((var(--slot, 0) - var(--align, 0)) * var(--step, 30));
   --eff: calc(var(--theta) + var(--phase, 0));
-  /* D-orb-2: a **bounded arc**. Inside it the fin is visible; beyond it the
-     fin is *parked* — clamped to the arc's end, pushed back in depth and
-     faded, so a session with many forks queues at the two ends (in front of
-     and behind the window) instead of crowding the middle. Scrolling slides
-     the queue, so every branch takes its turn at the front. */
+  /* D-orb-2: a **bounded arc**. Inside it the branch is visible; beyond it
+     the branch is *parked* — clamped to the arc's end, pushed back in depth
+     and faded, so a session with many forks queues at the two ends (in front
+     of and behind the window) instead of crowding the middle. Scrolling
+     slides the queue, so every branch takes its turn at the front. */
   --a: clamp(calc(-1 * var(--arc, 60)), var(--eff), var(--arc, 60));
   --over: calc(max(0, var(--eff) - var(--arc, 60)) + max(0, calc(-1 * var(--eff) - var(--arc, 60))));
-  transform: translate3d(0, 0, calc(var(--over) * -22px)) rotateX(calc(var(--a) * 1deg)) translateY(calc(-1 * var(--r, 120px)));
-  opacity: clamp(0.08, calc(1 - var(--over) / 70), 0.92);
+  /* The plane's **absolute** angle: its own turn composed with every ancestor
+     it lives inside. A bead counter-rotates by *this*, not by `--a` — with
+     `--a` alone a nested bead over-rotated by its parent's turn and its dot
+     came out squashed and 35px off the ray (measured). `--sum` is the static
+     part of the chain (the render writes it, clamped per level) and
+     `--root_a` the dynamic part, so no variable ever refers to itself. */
+  --abs: calc(var(--aroot, 0) + var(--sum, 0));
+  /* The park fade is a **value**, never the `opacity` property on this
+     element: `opacity < 1` would flatten the container (measured, v0.5.70:
+     a round 13px dot came out 12.86 x 3.31) and the beads' counter-rotation
+     would stop cancelling the branch's turn. The beads and the spine read it
+     instead — each element keeps its own opacity. */
+  --fade: clamp(0.08, calc(1 - var(--over) / 70), 0.92);
+  /* The flat projection's scale (D9/L10): the outward step shrinks by
+     `cos a − 0.12 sin a`, so the cone folds down onto rows. It is applied to
+     the *container*, which scales the beads' positions and the spine's own
+     angle together — the branch stays one straight line in both projections.
+     `--kroot` is that factor for the top ancestor (dynamic: it carries the
+     phase); `--kup`/`--kown` are what the render writes for a nested chain
+     (static, clamped per level) so a bead can counter-scale by the chain's
+     *product* and keep its dot round. */
+  --aroot: clamp(calc(-1 * var(--arc, 60)), var(--root_a, 0), var(--arc, 60));
+  --kroot: calc(cos(calc(var(--aroot, 0) * 1deg)) - 0.12 * sin(calc(var(--aroot, 0) * 1deg)));
+  transform: translate3d(0, 0, calc(var(--over) * -22px)) rotateX(calc(var(--a) * 1deg));
 }
-.rw-fin.up { box-shadow: inset 0 -1px 0 rgba(var(--shadow-rim), 0.4); }
+/* a branch of a branch (D-cone-6/7): its container sits on its parent's bead
+   inside the parent's container, and it turns by its own small slot only —
+   the parent's turn is already in force, so the two *compose*. The scene's
+   phase is deliberately *not* added here: the parent already carries it, and
+   adding it twice would make a nested fan turn at double the scroll rate. */
+.rw-branch .rw-branch {
+  left: calc((var(--hinge, 0) - var(--ph, 0)) * var(--cell));
+  top: calc(-1 * var(--po, 0) * var(--q, 0px));
+  --theta: calc(var(--slot, 0) * var(--step, 30));
+  --eff: var(--theta);
+}
+
+/* the spine: one straight bar from the bead `--d0` steps out of the parent
+   to the bead `--d0 + --n` — `--dx` columns along, `--n` steps out */
+.rw-br-line {
+  position: absolute;
+  left: calc(var(--d0, 0) * var(--cell));
+  top: calc(-1 * var(--d0, 0) * var(--q, 0px));
+  height: 2px;
+  margin-top: -1px;
+  border-radius: 2px;
+  transform-origin: 0 50%;
+  width: hypot(calc(var(--dx, 1) * var(--cellpx, var(--cell))), calc(var(--n, 1) * var(--q, 0px)));
+  transform: rotate(calc(-1 * atan2(calc(var(--n, 1) * var(--q, 0px)), calc(var(--dx, 1) * var(--cellpx, var(--cell))))));
+  background: var(--accent);
+}
+.rw-br-line.abandoned { background: var(--text-muted); opacity: calc(var(--fade, 1) * 0.35); }
+.rw-br-line.active { opacity: calc(var(--fade, 1) * 0.55); }
 
 /* D-orb-9: a session with a single branch has no ring to queue on, so it
-   gets a *swing* instead — the one fin reads the phase through a sine, so it
-   rocks +-25 degrees and back rather than ever parking at the arc's end.
-   (0 branches needs nothing: with no `.rw-fin` at all the scene is the flat
-   line it always was.) */
-.rw-orbit.solo .rw-fin {
-  --eff: calc(sin(calc(var(--phase, 0) * 1deg)) * 25);
+   gets a *swing* instead — the one branch reads the phase through a sine, so
+   it rocks +-25 degrees and back rather than ever parking at the arc's end.
+   (0 branches needs nothing: with no branch container at all the scene is
+   the flat line it always was.) */
+.rw-orbit.solo .rw-branch {
+  --root_a: calc(sin(calc(var(--phase, 0) * 1deg)) * 25);
+  --eff: var(--root_a);
 }
 
-/* Inside a fin the rounds ride on its plane, and each one is counter-rotated
-   about its own centre so a label (and the dot) always faces the viewer
+/* Inside a branch the rounds ride on its ray (`--out` steps out at the
+   slope, `--x` − `--hinge` columns along), and each one is counter-rotated
+   about its own bead so a label (and the dot) always faces the viewer
    (D-orb-5). The counter-rotation is `--a`, the *clamped* angle, so a parked
    round stays square to the camera too. */
-.rw-fin .rw3-node {
-  /* the round rides ON the fin's band: the fin's centre line is the ring row
-     and the dot sits on it, with its number hanging inside the 26px band —
-     beads on a wire. The counter-rotation (D-orb-5) pivots about that dot,
-     so the bead does not drift as the fin turns. */
-  top: 50%;
+.rw-branch .rw3-node {
+  top: calc(-1 * var(--out, 1) * var(--q, 0px));
   left: calc((var(--x) - var(--hinge)) * var(--cell));
   transform-origin: 50% var(--dot-c, 6.5px);
-  transform: translate(-50%, calc(-1 * var(--dot-c, 6.5px))) rotateX(calc(-1 * var(--a, 0) * 1deg));
+  transform: translate(-50%, calc(-1 * var(--dot-c, 6.5px))) rotateX(calc(-1 * var(--abs, 0) * 1deg));
   pointer-events: auto;
 }
-/* a fork's run, on the fin that owns the child: from the hinge to the child */
-.rw-fin .rw3-elbow {
-  top: 50%;
-  left: calc((var(--x) - var(--hinge)) * var(--cell));
-}
+/* The park fade lives on the *leaves* of a bead, never on the bead or its
+   container: `opacity < 1` makes an element a grouping element, and a
+   grouping element flattens its 3D children — measured, v0.5.70: a bead's
+   own opacity turned its 13px dot into 7.85 x 3.05 and moved its centre
+   35px off the ray. The dot and the label have no 3D children, so they can
+   carry it. */
+.rw-branch .rw3-dot, .rw-branch .rw3-round { opacity: var(--fade, 1); }
 
-/* D-orb-9/10 + the plan's L10: the **flat projection** — the same numbers
-   with no 3D at all. The ring unfolds onto `-R·cos(eff)` rows (the sine term
-   only splits the symmetric pair apart so they can be told apart), nothing
-   is turned, so no label needs counter-rotating. `prefers-reduced-motion`
-   gets this, and so does the probe's forced `.flat` class. */
-#rw-flow-track.flat .rw-fin {
-  transform: translateY(calc(-1 * var(--r, 120px) * cos(calc(var(--a, 0) * 1deg)) + var(--r, 120px) * 0.12 * sin(calc(var(--a, 0) * 1deg))));
-  opacity: clamp(0.25, calc(1 - var(--over) / 90), 0.92);
+/* D-orb-9/10 + the plan's L10: the **flat projection** — the same local
+   geometry with no 3D at all, flattened by scaling the container's outward
+   direction (`--k`). The beads counter-scale about their own centre so a dot
+   stays round and a label stays legible; the spine needs nothing, because a
+   scaled line is still a straight line and it lands on the last bead.
+   `prefers-reduced-motion` gets this, and so does the probe's `.flat`
+   class. */
+#rw-flow-track.flat .rw-branch {
+  --fade: clamp(0.25, calc(1 - var(--over) / 90), 0.92);
+  transform: scaleY(var(--kroot, 1));
 }
-#rw-flow-track.flat .rw3-node { transform: translate(-50%, calc(-1 * var(--dot-c, 6.5px))); }
+#rw-flow-track.flat .rw-branch .rw-branch {
+  transform: scaleY(var(--kown, 1));
+}
+#rw-flow-track.flat .rw3-node {
+  transform: translate(-50%, calc(-1 * var(--dot-c, 6.5px)))
+             scaleY(calc(1 / (var(--kroot, 1) * var(--kup, 1) * var(--kown, 1))));
+}
 
 /* The light: a soft vertical band pinned to the panel (sticky in a
    horizontally scrolling box), so the scene slides under one fixed light
    instead of every dot carrying its own glow. Never in the way of a click. */
 .rw3-sheen { position: sticky; left: 0; top: 0; width: 100cqw; height: 100%; pointer-events: none; opacity: .07; background: linear-gradient(90deg, transparent 22%, var(--accent) 50%, transparent 78%); }
 
-/* D9 (v0.5.68): less motion means the flat projection, held still. Pinning
-   `--phase` to zero is what makes it *still* — the flat row is `-R*cos(a)`
-   and `a` is clamped `theta + phase`, so with no phase the ring keeps the
-   shape its slots give it and the scroll moves nothing. (The media query is
-   mandatory: measured, `prefers-reduced-motion` does nothing by itself.) */
+/* D9 (v0.5.68/70): less motion means the flat projection, held still.
+   Pinning `--phase` to zero is what makes it *still* — the flat rows are
+   `-out·q·(cos a − 0.12 sin a)` and `a` is clamped `theta + phase`, so with
+   no phase the cone keeps the shape its slots give it and the scroll moves
+   nothing. (The media query is mandatory: measured, `prefers-reduced-motion`
+   does nothing by itself.) */
 @media (prefers-reduced-motion: reduce) {
   #rw-flow-track { --phase: 0; }
-  .rw-fin {
-    transform: translateY(calc(-1 * var(--r, 120px) * cos(calc(var(--a, 0) * 1deg)) + var(--r, 120px) * 0.12 * sin(calc(var(--a, 0) * 1deg))));
+  .rw-branch {
+    --fade: clamp(0.25, calc(1 - var(--over) / 90), 0.92);
+    transform: scaleY(var(--kroot, 1));
   }
-  .rw-fin .rw3-node { transform: translate(-50%, calc(-1 * var(--dot-c, 6.5px))); }
+  .rw-branch .rw-branch { transform: scaleY(var(--kown, 1)); }
+  .rw-branch .rw3-node {
+    transform: translate(-50%, calc(-1 * var(--dot-c, 6.5px)))
+               scaleY(calc(1 / (var(--kroot, 1) * var(--kup, 1) * var(--kown, 1))));
+  }
 }
 
-/* the connectors: a `. - .` run for every step on the line, a hinge plus a
-   run for every fork — lit by the child's state (D1) */
+/* the connectors: a `. - .` run for every step on the line — lit by the
+   child's state (D1). A branch has no bars here any more: its whole ray is
+   the one `.rw-br-line` bar above. */
 .rw3-seg { position: absolute; left: calc((var(--x) + 0.5) * var(--cell)); top: calc(var(--axis, 50%) + var(--lane, 0) * var(--rowp)); width: var(--cell); height: 2px; margin-top: -1px; border-radius: 2px; background: var(--accent); }
 .rw3-seg.abandoned { background: var(--text-muted); opacity: .35; }
 .rw3-seg.active { opacity: .65; }
-.rw3-elbow { position: absolute; left: calc((var(--x) + 0.5) * var(--cell)); top: calc(var(--axis, 50%) + var(--lane) * var(--rowp)); width: var(--cell); height: 2px; margin-top: -1px; border-radius: 2px; background: var(--accent); }
-.rw3-elbow.abandoned { background: var(--text-muted); opacity: .3; }
-.rw3-elbow.active { opacity: .5; }
-/* the fork's vertical: at the parent's column, from the parent's lane to
-   the branch's lane (a sibling of the run, so the % basis is the grid) */
-/* v0.5.68: there is no `.rw3-hinge` any more. A forking branch used to
-   leave the axis for a lane row, and the hinge was the vertical run that
-   bridged the gap; now the branch *is* a fin turning about the axis, so
-   nothing leaves the line and there is no gap to bridge. */
+/* v0.5.70: there is no `.rw3-elbow` any more either — a branch leaves its
+   parent's bead as a straight ray, so there is no elbow to draw. */
 
 /* ── v0.5.56 time-inject plugin ────────────────────────────────────
    The sidebar `time` panel: one switch row + a status line, inside
