@@ -563,6 +563,26 @@ pub struct RewindFlow {
     /// The straight line's length in nodes.
     #[serde(default)]
     pub main_len: u64,
+    /// **v0.5.68 (the orbital view)**: the ring's parameters — the angular
+    /// step between neighbouring fins, the half-width of the visible arc and
+    /// how many fins there are. The *pixels* (the radius `--r`, the axis)
+    /// are the client's, because only the DOM knows them.
+    #[serde(default)]
+    pub orbit: FlowOrbit,
+}
+
+/// The orbital scene's server-side ring parameters (plan §12, D-orb-2/8).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct FlowOrbit {
+    /// Degrees between neighbouring fins. Falls back to the server's 30°.
+    #[serde(default)]
+    pub step_deg: i32,
+    /// Half the visible arc; a fin beyond it queues at the arc's end.
+    #[serde(default)]
+    pub arc_deg: i32,
+    /// How many fins the scene has (`branches` with `lane != 0`).
+    #[serde(default)]
+    pub fins: u32,
 }
 
 /// Style B: one round's place in the picture, plus what the detail panel
@@ -622,6 +642,19 @@ pub struct FlowBranch {
     pub from_x: u64,
     #[serde(default)]
     pub to_x: u64,
+    /// **v0.5.68**: this segment's index among the *fins* (`None` on the main
+    /// line) — the ring's slot order.
+    #[serde(default)]
+    pub fin: Option<u32>,
+    /// **v0.5.68**: the column the segment hinges on (its parent's column,
+    /// where it leaves the trunk) — the fin's left edge.
+    #[serde(default)]
+    pub hinge_x: u64,
+    /// **v0.5.68**: the seqs of the rounds in this segment, in order. A fin
+    /// renders exactly these nodes, and a nested fork shares its parent's
+    /// lane, so this list — not the lane — is what groups them.
+    #[serde(default)]
+    pub seqs: Vec<u64>,
 }
 
 /// Style B, B2: one round in full — the *verbatim* user message (the tree

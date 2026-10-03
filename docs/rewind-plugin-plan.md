@@ -1293,3 +1293,113 @@ decisions produce. And no `"before"`-mode or TUI work (still v2).
 | old browsers without `@property` | the proxy *writes* the value per frame, so no property registration is needed at all on that path — registration only matters if we adopt the native timeline (D-orb-4 (b)) | F1, B |
 | cost per frame | the ring's transform is one CSS calc over a value we already write; the fins are static transforms written at layout time | F7, §10.7 |
 | 117-round scene + many fins | the ring adds one wrapper level and one transform per fin; the node count is unchanged | §10.9's measurement |
+
+### 12.9 As built (2026-10-03, v0.5.68)
+
+The ring is in. `bin/rushi-web/src/rewind.rs` emits the ring's numbers and
+`web-leptos` turns them into planes; the decisions D-orb-1..10 all landed,
+with five refinements that only showed up once the thing was turning.
+
+**Server** (`v0.5.68`, 3 new tests, 68 total green)
+
+* `Orbit { step_deg: 30, arc_deg: 60, fins }` on `Flow` (`ORBIT_STEP_DEG`,
+  `ORBIT_ARC_DEG`): the client does not decide how many branches fit the
+  window — `60/30 + 1 = 3` are visible, the rest queue (D-orb-2).
+* `FlowBranch` gained `fin: Option<u32>` (the slot, in branch order; `None`
+  for the trunk — D-orb-2's "bounded arc" needs a *stable* order, and the
+  leftmost branch is the one at the front at rest), `hinge_x` (the column of
+  the round the branch left, i.e. `x` of its parent) and `seqs` (the rounds
+  that belong to *this* branch — the fin's own beads).
+* `place()` now tracks the branch being written, so a nested fork's rounds go
+  to its own branch and not to the trunk's.
+
+**Client** (`web-leptos/src/rewind.rs`)
+
+* The scene is `{ trunk edges } { trunk nodes } <div class="rw-orbit">{ fins }</div>`.
+  A fin is the branch's rounds plus the runs that feed them (`fin_of` maps a
+  round to its fin), so nothing is drawn twice and nothing is left out.
+* `sync_scene_metrics` (layout time: mount, tree, selection, resize) writes
+  `--axis` (0.62 × height), `--r` (auto-fit: `axis − 16px − 13px`, floor 34),
+  `--dpp` (360 / 1.5 × width — D-orb-8) and `--rw0` (the layout-time
+  `scrollLeft`, which is what makes "rest" mean "aligned" — D-orb-7).
+* `flow_scene` writes `--align` (selected round's fin → current round's fin →
+  0) and `--step`/`--arc` from the server; each fin carries `--fin`/`--hinge`.
+* `.rw-orbit.solo` when there is exactly one fin (D-orb-9, below).
+
+**CSS** (one section, in `style.css`)
+
+* `--phase: calc((var(--rw-scroll, 0) - var(--rw0, 0)) * var(--dpp, 0.3))` —
+  a pure CSS calc over the one value a scroll frame writes (D-orb-4). No
+  `@property`, no `animation-timeline`: the proxy path is the only path, and
+  the native timeline was not adopted (it would have needed a second source
+  of truth for a value we already have).
+* A fin is `transform: translate3d(0, 0, over·−22px) rotateX(a)
+  translateY(−r)` about the hinge point on the axis, with
+  `--a: clamp(-arc, theta + phase, arc)` and
+  `--over: max(0, eff − arc) + max(0, −eff − arc)`.
+* `.rw-orbit.solo .rw-fin { --eff: calc(sin(phase·1deg) · 25) }` — the
+  D-orb-9 swing, one line, no server field.
+* `#rw-flow-track.flat` and `@media (prefers-reduced-motion: reduce)` unfold
+  the same ring onto rows: `translateY(−R·cos a + 0.12·R·sin a)` (the sine
+  term only splits the symmetric pair so the two ends can be told apart).
+  The media query additionally pins `--phase: 0`, which is what makes it
+  *static*: without it the rows would still slide with the scroll.
+
+**Five things the plan got wrong, and what we did instead**
+
+1. **The arc alone is not enough.** Clamping `theta` to ±60° piles every
+   parked branch onto one row: they overlapped into mush. The parked fins
+   are therefore also pushed back in depth by `over·22px` and faded by
+   `1 − over/70`, which leaves a receding stack at each end of the arc —
+   D-orb-2's queue, now visible.
+2. **`--eff` is the wrong angle for the flat projection.** The first build
+   unfolded `cos(eff)` (unclamped) while the 3D build used `cos(a)`
+   (clamped), so parked fins landed *below* the axis (measured: −189px off,
+   exactly `R`). Flat uses `--a`.
+3. **The node's own transform had to move.** Style B centred the whole node
+   box (dot + number) on the row, which floated every bead 6.5px above the
+   run it sits on — invisible until the beads had to sit *on* a ring. The
+   base rule is now `translate(-50%, -calc(dot/2))` with the counter-rotation
+   pivoting on that bead, and C7/C9/C10 read the bead, not the box.
+4. **A `prefers-reduced-motion` block that only drops the 3D is not
+   static.** Pinning the phase is the actual mechanism.
+5. **`.rw3-hinge` is dead.** Nothing leaves the axis any more, so there is no
+   lane gap to bridge; the rule is gone and the mirror's canaries now look
+   for `.rw-orbit`/`.rw-fin`.
+
+**Verification** (`e2e/`, local only)
+
+* The deep checks live in a **new, self-contained probe**,
+  `e2e/orbit_probe.py` (34 checks, L1–L12), not as section L of
+  `flow_style_b_probe.py` as §12.6 assumed: the live sessions cannot exercise
+  the ring at all (only `Time inject` forks, its one branch is four columns
+  long and the scene never scrolls), so the probe writes its own fixtures and
+  starts its own server — seven fins off six early rounds plus a nested fork,
+  a sixty-round trunk, a one-fork and a no-fork session. It recomputes the
+  browser's own projection (rotateX + the perspective divide) and compares it
+  to the rects the browser painted, to 3px.
+* `flow_style_b_probe.py` keeps A–K green and gained a shorter section H
+  (structure + the live one-fin swing) — 66/66.
+* `flow_check.py` now asserts the ring's invariants against every live
+  session: `orbit.fins == numbered fins`, slots `0..n-1`, the trunk is not a
+  fin, `hinge_x` is the parent's column, the trunk branch carries exactly the
+  main line, no round is on two fins — 8 sessions, 0 problems.
+* `cargo test -p rushi-web` 68; wasm `cargo check` clean; `trunk build` clean;
+  `rewind_probe.py` 140; `layout_probe.py` PASS.
+
+**Measured on the live app** (what the laws predicted, to the pixel)
+
+| what | measured |
+|---|---|
+| every fin's centre row | `axis − R·cos(theta)`, then the perspective divide — **within 0.0px** for all six fixture fins |
+| the trunk through a full turn | beads bit-identical, transforms still plain 2D matrices (D-orb-3) |
+| the arc's queue | 3 fins inside ±60°, the rest parked, ordered by depth, dimmer and smaller |
+| a rotated bead | `elementFromPoint` returns the bead itself (D-orb-5/§12.2 F5) |
+| the flat projection | rows to `<1px` of `−R·cos`, no 3D anywhere |
+| reduced motion | rows do not move while the scene scrolls |
+| a lone branch | flagged `.solo`, swings on `25·sin(phase)` |
+| a nested fork | renders as its own fin (no traps) — the one shape with no drawn link to its parent, because its hinge is a column inside another fin |
+
+**Non-goals, kept.** No WebGL, no per-round rotation, no orbit in the list
+style, no new route, and the wheel contract (D7) untouched: the orbit reads
+the same `--rw-scroll` the pan already produced.

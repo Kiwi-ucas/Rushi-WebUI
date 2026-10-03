@@ -299,23 +299,55 @@ the button explains itself by being disabled.
   History sat on "loading…" (v0.5.65 fixed this for four of the eight
   sessions on this host).
 
-### 3b.5 The default style, and the orbital scene (planned)
+### 3b.5 The default style
 
 The History view opens in **`flow`** by default since v0.5.67 (user decision;
 it supersedes the earlier "list is the default"). `list` stays one click away
 and persisted under `rushi-rw-view`; Style A's probe pins that key explicitly
 so it always tests the style it means to test.
 
-The next step for this scene is the **orbital view**: the branches rotating in
-3D around the session's main axis, driven by the scene's scroll, so that many
-forks and a long history stop competing for screen rows. It is *planned, not
-built*: research (web + measured spikes), design, ten open decisions
-(`D-orb-1..10`), the step plan and the probe plan are **§12 of
-`rewind-plugin-plan.md`**. Two facts from the spikes are worth stating here
-because they constrain the implementation: the browser paints and hit-tests
-the **nearer** fin of two overlapping fins and the order swaps when the ring
-turns 180° (no manual sorting needed), and `prefers-reduced-motion: reduce`
-does nothing by itself — a flat projection must be written explicitly.
+### 3b.6 The orbital view (v0.5.68)
+
+The flow scene is now a **ring**. The session's history stays the horizontal
+axis — the trunk, which never moves — and every **forking branch** is a
+*fin*: a plane hinged on that axis at the column it left, held out at an
+auto-fitted radius and turned around the axis by a ring angle. History length
+grows along x, the fork count grows *around* the line, and the two stop
+competing for screen rows.
+
+* **The angle.** `theta = (fin − align) × 30° + (scroll − rest) × (360°/1.5·width)`,
+  clamped to ±60°: three fins are inside the arc, the rest *park* at its ends
+  — pushed back in depth and faded, so they read as a queue and every branch
+  takes its turn at the front as the scene pans. Scrolling moves exactly one
+  value (`--rw-scroll`); everything else is written at layout time.
+* **The alignment.** `align` is the selected round's fin, else the current
+  round's fin, else 0, and the *rest* offset is re-anchored whenever the
+  layout runs, so "at rest" always means "the current branch is at the
+  front" (click a fin's bead to bring its branch round).
+* **The beads.** A fin's rounds ride on its plane, each counter-rotated about
+  its own dot so numbers stay upright; the fin's plane itself is what tips
+  into the screen. Clicking, hover tooltips and `elementFromPoint` all work
+  on a turned fin.
+* **Degenerate cases.** No fork: no fin at all, the flat line the scene always
+  was. One fork: a **swing** (`25°·sin(phase)`) instead of a ring that can
+  park — one CSS line, no server field.
+* **Less motion.** `prefers-reduced-motion: reduce` unfolds the same ring onto
+  rows via `−R·cos` *and* pins the phase, so it is genuinely static; the
+  3D-off-but-still-sliding variant is not "reduced motion". A forced `.flat`
+  class (the probes' affordance) shows the same projection while still
+  following the scroll.
+* **Nested forks.** A fork inside a branch gets its own fin, hinged on a
+  column that belongs to another fin: it renders (no traps, and the rounds
+  are attributed correctly), but it has no drawn link to its parent. The flat
+  lane layout could not draw the shape at all, so this is not a regression —
+  it is the one place the ring is weaker than a lane diagram.
+
+The old lane-vs-trunk hinge (`.rw3-hinge`) is gone: nothing leaves the axis
+any more, so there is no gap to bridge. Implementation record, the five
+refinements found while building and the pixel measurements are **§12.9 of
+`rewind-plugin-plan.md`**; the deep probe is `e2e/orbit_probe.py` (L1–L12,
+34 checks, own fixtures) and the live-shape probe is section H of
+`e2e/flow_style_b_probe.py`.
 
 ## 4. Rewind is forbidden while the loop runs (decision 5)
 
@@ -397,12 +429,14 @@ abandoned rounds are still rendered.
 | Window vs. full log | The tree is the server's full-log projection; the card button uses `hist_oldest_line + index` for rendered cards only. |
 | No session / no rounds | "select a session" / "no rounds yet". |
 | Performance | One file read + parse per structure-changing event; a multi-MB log is a one-off parse. |
-| A very long chain (32+ rounds) | **Use the flow style.** The list style renders one DOM level per round and exhausts the wasm stack at roughly 32–80 rounds (the app survives, the tree does not paint, the console says `memory access out of bounds`); the flow style's flat projection draws every session measured here, up to 117 rounds. |
+| A very long chain (32+ rounds) | **Use the flow style.** The list style renders one DOM level per round and exhausts the wasm stack at roughly 32–80 rounds (the app survives, the tree does not paint, the console says `memory access out of bounds`); the flow style's scene draws every session measured here, up to 117 rounds. |
+| A fork inside a branch (a nested fork) | Its rounds are attributed to their own branch and it gets its own fin, hinged on a column inside another fin — it renders, but no connector is drawn between the two. |
 
 ## 6. Verification
 
 * `cargo test -p rushi-web` — the projection against the kernel fixtures,
-  the flow layout and the per-round detail (**65 tests green**).
+  the flow layout, the ring's fin/hinge/round attribution and the per-round
+  detail (**68 tests green**).
 * `trunk build` — the Leptos CSR bundle.
 * `python3 e2e/rewind_probe.py [port]` — **140 browser + HTTP assertions**
   over four fixture sessions built by the probe
@@ -420,20 +454,34 @@ abandoned rounds are still rendered.
   dialog), the `#plugin-area` entry, the loop-running guard (with a live
   `loop.pid`: every node locked, no dialog, footer explains, card buttons
   disabled), the `409` refusals, the ignored markers and the tail notice.
-* `python3 e2e/flow_style_b_probe.py [port]` — **60 browser assertions**, the
+* `python3 e2e/orbit_probe.py` — **34 browser assertions** (L1–L12) over
+  fixtures the probe writes and serves itself (a sixty-round trunk with six
+  forks off six early rounds plus a fork *inside* one of them, a one-fork
+  session, a forkless one): the ring's structure, the geometry law
+  recomputed in Python against the painted rects (rotateX **and** the
+  perspective divide, to 3px), the bounded arc and its depth-ordered queue,
+  the trunk unmoved and untransformed through a full turn, the phase riding
+  on `--rw-scroll` alone, click-to-align, hit-testing a turned bead, the
+  flat `−R·cos` projection, reduced motion genuinely static, the zero- and
+  one-fork cases, the nested fin, and no wasm traps.
+* `python3 e2e/flow_style_b_probe.py [port]` — **66 browser assertions**, the
   Style B surfaces end to end on the live sessions: the switch and its
   persistence; the 1:2 split and the x-only scroller; the scene (a dot per
-  round, runs and hinges on the right lane, the lit live path, lane geometry,
-  no dot overlap, the pitch floor and cap); the panel (D5 pre-select, the
-  verbatim text, the button inert on the current round, a click that selects
-  and opens **no** dialog); the button → the one dialog → cancel writes
-  nothing; the 117-round session (pan, wheel, a horizontal delta left
-  native); persistence and the list untouched afterwards; the 3D (a ribbon
-  per branch, a real `perspective` + `preserve-3d` context, the proxy's maths
-  checked against the computed transform at two offsets, flat under the
-  light, `prefers-reduced-motion` → no transform); and the **paint** —
-  accent pixels counted from real screenshots in the light *and* dark
-  palettes (this is what caught the missing `--lane` on the line's runs).
+  round, a run per main-line step and a run per forking branch, the lit live
+  path, lane geometry, no dot overlap, the pitch floor and cap); the panel
+  (D5 pre-select, the verbatim text, the button inert on the current round, a
+  click that selects and opens **no** dialog); the button → the one dialog →
+  cancel writes nothing; the 117-round session (pan, wheel, a horizontal
+  delta left native, the flat list); persistence; the orbit section
+  (`.rw-orbit` inside a real perspective, one fin per fork, the trunk on the
+  axis and never turned, a turned fin as a real `matrix3d` with
+  counter-rotated beads, the rest radius, the phase moving and re-anchoring,
+  the flat projection, `prefers-reduced-motion` holding still); and the
+  **paint** — accent pixels counted from real screenshots in the light *and*
+  dark palettes (this is what caught the missing `--lane` on the line's runs).
 * `python3 e2e/flow_check.py [port]` — the flow projection over every session
   the server knows (`main` chain, cols/lanes, each node's column and lane,
-  the edge list): 8 sessions, 0 problems on this host.
+  the edge list, and since v0.5.68 the ring's own invariants: `orbit.fins`
+  against the numbered fins, slots `0..n-1`, the trunk not numbered, `hinge_x`
+  the parent's column, the trunk branch carrying exactly the main line, no
+  round on two fins): 8 sessions, 0 problems on this host.

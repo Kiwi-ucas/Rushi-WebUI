@@ -124,6 +124,9 @@ pub struct Flow {
     pub lanes: i32,
     /// The main line's length in nodes.
     pub main_len: u64,
+    /// **v0.5.68**: the orbital view's ring parameters (the angular step, the
+    /// visible arc, the fin count).
+    pub orbit: Orbit,
 }
 
 /// One node's place in the flow picture, with everything the detail panel
@@ -169,6 +172,37 @@ pub struct FlowBranch {
     pub parent_lane: i32,
     pub from_x: u64,
     pub to_x: u64,
+    /// **v0.5.68 (the orbital view)**: this segment's index among the
+    /// *fins* — the branches that are not the main line — or `None` on the
+    /// main line. It is the ring's slot order: the client turns it into an
+    /// angle (`(fin - align) * step`), so the server owns the ordering (and
+    /// its test) while the client owns the pixels.
+    pub fin: Option<u32>,
+    /// **v0.5.68**: the column the segment hinges on — its **parent's**
+    /// column, i.e. where the branch leaves the trunk. This is the fin's
+    /// left edge and the origin of its `rotateX`, so the fin is a radial
+    /// drawing of the same tree rather than a floating card.
+    pub hinge_x: u64,
+    /// **v0.5.68**: the seqs of the rounds in this segment, in walk order.
+    /// The client groups the flat `nodes` list into fins with this (a nested
+    /// fork shares its parent's lane, so the lane alone cannot group them).
+    pub seqs: Vec<u64>,
+}
+
+/// **v0.5.68**: the orbital view's logical geometry — the numbers the client
+/// cannot invent and the unit tests can pin. The *pixels* (`--r`, the panel
+/// size) stay client-side, because only the DOM knows them (see the plan's
+/// §12.3: logical geometry server-side, layout client-side).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Orbit {
+    /// Degrees between neighbouring fins on the ring.
+    pub step_deg: i32,
+    /// Half-width of the **visible arc**: a fin whose effective angle is
+    /// beyond it queues at the arc's end (D-orb-2, user decision — a bounded
+    /// arc with the extra branches parked at the ends, not a full ring).
+    pub arc_deg: i32,
+    /// How many fins the scene has (`branches` with `lane != 0`).
+    pub fins: u32,
 }
 
 /// One round in full, for the flow view's top panel (B2). The tree and the
@@ -434,6 +468,15 @@ pub fn node_detail(events: &[Value], seq: u64) -> Option<NodeDetail> {
 
 /// Build the flow picture: the main line, the lanes, the connectors.
 /// Pure — every rule is covered by the tests at the end of this module.
+/// **v0.5.68 (D-orb-2/8, user decisions)**: the angular step between
+/// neighbouring fins. With a 30° step the visible arc below holds five fins.
+const ORBIT_STEP_DEG: i32 = 30;
+/// Half the visible arc. Fins whose effective angle leaves `[-60, +60]` are
+/// *parked*: clamped to the arc's end and stacked behind it, so a session
+/// with many forks queues instead of crowding (and the scroll brings each
+/// one round).
+const ORBIT_ARC_DEG: i32 = 60;
+
 fn flow(
     rounds: &[Round],
     active: &[usize],
@@ -449,6 +492,11 @@ fn flow(
             cols: 0,
             lanes: 0,
             main_len: 0,
+            orbit: Orbit {
+                step_deg: ORBIT_STEP_DEG,
+                arc_deg: ORBIT_ARC_DEG,
+                fins: 0,
+            },
         };
     }
     let active_set: HashSet<usize> = active.iter().copied().collect();
@@ -527,8 +575,24 @@ fn flow(
             parent_lane: 0,
             from_x,
             to_x,
+            fin: None,
+            // the trunk itself hinges on its own first column
+            hinge_x: from_x,
+            seqs: Vec::new(),
         });
-        place(rounds, &x, &extent, &primary, &mut lane, &mut taken, &mut branches, r, 0, 0);
+        let cur = branches.len() - 1;
+        place(
+            rounds, &x, &extent, &primary, &mut lane, &mut taken, &mut branches, r, 0, 0, cur,
+        );
+    }
+    // The fins: every branch that is not the main line, in branch order.
+    // The ring's slot order is this order, so it is stable across reloads.
+    let mut fins = 0u32;
+    for b in branches.iter_mut() {
+        if b.lane != 0 {
+            b.fin = Some(fins);
+            fins += 1;
+        }
     }
 
     // 5. The flat list (round order = log order) and the connectors.
@@ -568,6 +632,11 @@ fn flow(
         cols: x.iter().copied().max().unwrap_or(0) + 1,
         lanes: lane.iter().map(|l| l.abs()).max().unwrap_or(0),
         main_len: main_chain.len() as u64,
+        orbit: Orbit {
+            step_deg: ORBIT_STEP_DEG,
+            arc_deg: ORBIT_ARC_DEG,
+            fins,
+        },
         nodes,
         edges,
         branches,
@@ -623,11 +692,13 @@ fn place(
     i: usize,
     l: i32,
     parent_lane: i32,
+    cur: usize,
 ) {
     lane[i] = l;
+    branches[cur].seqs.push(rounds[i].seq);
     for &c in &rounds[i].children {
         if Some(c) == primary[i] {
-            place(rounds, x, extent, primary, lane, taken, branches, c, l, parent_lane);
+            place(rounds, x, extent, primary, lane, taken, branches, c, l, parent_lane, cur);
             continue;
         }
         let (from_x, to_x) = (x[c], extent[c]);
@@ -639,8 +710,12 @@ fn place(
             parent_lane: l,
             from_x,
             to_x,
+            fin: None,          // assigned after the walk (the ring's order)
+            hinge_x: x[i],      // where it leaves the trunk: its parent's column
+            seqs: Vec::new(),
         });
-        place(rounds, x, extent, primary, lane, taken, branches, c, nl, l);
+        let next = branches.len() - 1;
+        place(rounds, x, extent, primary, lane, taken, branches, c, nl, l, next);
     }
 }
 
@@ -1768,6 +1843,104 @@ mod tests {
             .collect();
         assert_eq!(segs, vec![(1, 0, 0, 0, 2), (3, -1, 0, 2, 2)]);
         assert_flow_is_collision_free(&tree);
+    }
+
+    // ── v0.5.68: the orbital view's logical geometry ────────────────
+    //
+    // The ring's *angles* are the client's business (they depend on the
+    // selection, which lives in the DOM), but the numbers a test can pin are
+    // here: how many fins exist, in which order, where each hinges, and which
+    // rounds belong to which fin.
+
+    #[test]
+    fn orbit_counts_the_fins_and_leaves_the_trunk_out_of_the_ring() {
+        // a straight log has nothing to orbit
+        let line = build("s", &[um("a"), um("b")]);
+        assert_eq!(line.flow.orbit.fins, 0);
+        assert_eq!((line.flow.orbit.step_deg, line.flow.orbit.arc_deg), (30, 60));
+        assert!(line.flow.branches.iter().all(|b| b.fin.is_none()));
+
+        // one fork → exactly one fin; the main line never takes a slot, and
+        // the fin hinges on its *parent's* column (where it leaves the trunk)
+        let tree = build("s", &[um("one"), um("two"), um("three"), rw(2, "on"), um("four")]);
+        assert_eq!(tree.flow.orbit.fins, 1);
+        assert!(tree
+            .flow
+            .branches
+            .iter()
+            .filter(|b| b.lane == 0)
+            .all(|b| b.fin.is_none()));
+        let fork = tree.flow.branches.iter().find(|b| b.lane != 0).unwrap();
+        assert_eq!(fork.fin, Some(0));
+        assert_eq!(fork.root, 3);
+        assert_eq!(fork.hinge_x, 1); // round 2 sits at column 1 …
+        assert_eq!(fork.from_x, 2); // … and its fork is the next column
+        assert_eq!(fork.seqs, vec![3]);
+        assert_eq!(tree.flow.orbit.fins, 1);
+    }
+
+    #[test]
+    fn orbit_gives_every_fin_a_slot_in_branch_order() {
+        let events = vec![
+            um("a"),
+            um("b"),
+            um("c1"),
+            rw(2, "on"),
+            um("c2"),
+            rw(2, "on"),
+            um("c3"),
+        ];
+        let tree = build("s", &events);
+        let slots: Vec<(u32, u64)> = tree
+            .flow
+            .branches
+            .iter()
+            .filter_map(|b| b.fin.map(|f| (f, b.root)))
+            .collect();
+        // two forks off round 2 → two fins, and the ring's order is the
+        // server's branch order (so it is stable across reloads)
+        assert_eq!(slots, vec![(0, 3), (1, 5)]);
+        assert_eq!(tree.flow.orbit.fins, 2);
+    }
+
+    #[test]
+    fn orbit_groups_every_round_into_exactly_one_branch() {
+        // the nested case: the 2nd fin forks out of the 1st one, and both sit
+        // in the same walk — the lane alone could not tell them apart, the
+        // seqs can.
+        let events = vec![
+            um("r1"),
+            um("r2"),
+            um("r3"),
+            rw(2, "on"),
+            um("r4"),
+            rw(3, "on"),
+            um("r5"),
+            rw(3, "on"),
+            um("r6"),
+            rw(5, "on"),
+            um("r7"),
+            um("r8"),
+        ];
+        let tree = build("s", &events);
+        let mut seen: HashSet<u64> = HashSet::new();
+        for b in &tree.flow.branches {
+            for s in &b.seqs {
+                assert!(seen.insert(*s), "seq {s} lands in two branches");
+            }
+        }
+        let all: Vec<u64> = tree.flow.nodes.iter().map(|n| n.seq).collect();
+        assert_eq!(seen.len(), all.len(), "a round belongs to no branch");
+        assert!(all.iter().all(|s| seen.contains(s)));
+
+        let trunk = tree.flow.branches.iter().find(|b| b.lane == 0).unwrap();
+        assert_eq!(trunk.fin, None);
+        assert_eq!(trunk.seqs, vec![1, 2, 5, 11, 12]);
+        let outer = tree.flow.branches.iter().find(|b| b.root == 3).unwrap();
+        assert_eq!((outer.fin, outer.hinge_x, &outer.seqs), (Some(0), 1, &vec![3, 7]));
+        let nested = tree.flow.branches.iter().find(|b| b.root == 9).unwrap();
+        assert_eq!((nested.fin, nested.hinge_x, &nested.seqs), (Some(1), 2, &vec![9]));
+        assert_eq!(tree.flow.orbit.fins, 2);
     }
 
     /// The 1st branch off the line goes up, the 2nd down (§10.2) — they

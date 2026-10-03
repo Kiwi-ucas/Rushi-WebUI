@@ -137,6 +137,22 @@ thread_local! {
 /// (`--halfpw`, `--denom`). Numbers, never lengths: CSS cannot divide a
 /// length by a length, and this way the proxy costs one `setProperty` per
 /// scroll event and never reads layout while scrolling.
+/// **v0.5.68 (D-orb-1, user decision)**: where the trunk sits in the scene,
+/// as a fraction of its height. The ring is drawn *above* the trunk (the
+/// bounded arc of D-orb-2 lives on the upper half), so the axis is below the
+/// middle and the fins get the room.
+const SCENE_AXIS_FRAC: f64 = 0.62;
+/// Half the fin band in px (the CSS gives `.rw-fin` a 26px band).
+const FIN_HALF_PX: f64 = 13.0;
+/// Air between the farthest fin's end and the panel's edge.
+const FIN_MARGIN_PX: f64 = 16.0;
+/// A ring smaller than this reads as a squashed line; below it the fit gives
+/// way rather than the geometry.
+const FIN_MIN_RADIUS_PX: f64 = 34.0;
+/// **D-orb-8**: one full turn per 1.5 scene widths of scrolling — a fixed
+/// angular rate, so the gesture feels the same in every session.
+const ORBIT_DEG_PER_WIDTH: f64 = 360.0 / 1.5;
+
 fn sync_scene_metrics() {
     let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
         return;
@@ -149,27 +165,31 @@ fn sync_scene_metrics() {
     else {
         return;
     };
-    let half = scroll.client_width() as f64 / 2.0;
+    let w = scroll.client_width().max(1) as f64;
+    let h = scroll.client_height().max(1) as f64;
+    let half = w / 2.0;
     let st = scroll.style();
     let _ = st.set_property("--halfpw", &format!("{half}"));
     let _ = st.set_property("--denom", &format!("{}", half * 1.1));
     let _ = st.set_property("--rw-scroll", &format!("{}", scroll.scroll_left()));
-    let Ok(ribbons) = doc.query_selector_all(".rw3-ribbon") else {
-        return;
-    };
-    for i in 0..ribbons.length() {
-        let Some(el) = ribbons
-            .item(i)
-            .and_then(|n| n.dyn_into::<HtmlElement>().ok())
-        else {
-            continue;
-        };
-        // `offsetParent` is the scene grid, which starts at the scroller's
-        // content origin — so this is content px, the same space as
-        // `scrollLeft`.
-        let cx = el.offset_left() as f64 + el.offset_width() as f64 / 2.0;
-        let _ = el.style().set_property("--bx", &format!("{cx}"));
-    }
+
+    // ── the orbital scene's pixels (the server owns the angles) ─────
+    // The axis, and the radius the auto-fit gives it: the farthest fin is
+    // the one at the front of the arc (its projected row is `-R`, z = 0, so
+    // the perspective does not stretch it), and its end is half a fin above
+    // that. `R = axis - margin - band/2` puts it exactly inside the panel —
+    // D-orb-1 asked for the far end to *just* fit.
+    let axis = (h * SCENE_AXIS_FRAC).round();
+    let r = (axis - FIN_MARGIN_PX - FIN_HALF_PX).max(FIN_MIN_RADIUS_PX);
+    let _ = st.set_property("--axis", &format!("{axis}px"));
+    // px, not a bare number: the CSS reads it as a length
+    let _ = st.set_property("--r", &format!("{r}px"));
+    // D-orb-8: a fixed angular rate, and `--rw0` = the offset the scene is at
+    // when the layout runs, so entering the scene (or picking a round, or a
+    // new round arriving) puts the ring back at rest with the aligned fin in
+    // front — "the alignment rule always wins at rest".
+    let _ = st.set_property("--dpp", &format!("{}", ORBIT_DEG_PER_WIDTH / w));
+    let _ = st.set_property("--rw0", &format!("{}", scroll.scroll_left()));
 }
 
 /// Style B's two effects, registered once from `lib.rs` next to
@@ -822,6 +842,8 @@ fn summarize_label(text: &str) -> String {
 /// the panel down to a floor, D4).
 fn flow_scene(state: AppState) -> AnyView {
     let tree = state.rewind_tree;
+    // the scene draws the ring's alignment from the selection (D-orb-7)
+    let selected = state.rw_selected;
     view! {
         { move || {
             let Some(t) = tree.get() else {
@@ -838,6 +860,10 @@ fn flow_scene(state: AppState) -> AnyView {
             let f = t.flow.clone();
             let cells = f.cols.max(1).to_string();
             let lanes = f.lanes.max(1).to_string();
+            // the ring's angular step and the visible arc, from the server
+            // (one source of truth for the constants, tested there)
+            let step = f.orbit.step_deg.max(1).to_string();
+            let arc = f.orbit.arc_deg.max(1).to_string();
             // Where each node sits, and whether it is on the live path: the
             // connectors are drawn from the parent's dot, and an edge is lit
             // by the child's state (D1 — the *path* is highlighted, so the
@@ -848,110 +874,125 @@ fn flow_scene(state: AppState) -> AnyView {
                 .map(|n| (n.seq, (n.x, n.lane, n.state == "active")))
                 .collect();
 
-            let edges: Vec<AnyView> = f
-                .edges
-                .iter()
-                .map(|e| {
-                    let (fx, flane, _) = at.get(&e.from).copied().unwrap_or((0, 0, true));
-                    let lit = at.get(&e.to).map(|t| t.2).unwrap_or(true);
-                    let from = e.from.to_string();
-                    let to = e.to.to_string();
-                    if e.main {
-                        // the `. - .` run between two rounds on the line
-                        view! {
-                            <div
-                                class=format!(
-                                    "rw3-seg main {}",
-                                    if lit { "active" } else { "abandoned" },
-                                )
-                                data-from=from
-                                data-to=to
-                                style=format!("--x:{fx}; --lane:0")
-                            ></div>
-                        }
-                        .into_any()
-                    } else {
-                        // the fork: the run at the child's lane, plus the
-                        // hinge back to the parent's lane. A fork nested
-                        // *inside* a branch shares its lane — there is no
-                        // gap to bridge, so it gets no hinge at all.
-                        let st = format!(
-                            "--x:{fx}; --lane:{}; --lane-from:{flane}",
-                            e.lane,
-                        );
-                        let elbow = view! {
-                            <div
-                                class=format!(
-                                    "rw3-elbow {}",
-                                    if lit { "active" } else { "abandoned" },
-                                )
-                                data-from=from.clone()
-                                data-to=to.clone()
-                                style=st.clone()
-                            ></div>
-                        }
-                        .into_any();
-                        if e.lane == flane {
-                            elbow
-                        } else {
-                            view! {
-                                { elbow }
-                                <div
-                                    class=format!(
-                                        "rw3-hinge {}",
-                                        if lit { "active" } else { "abandoned" },
-                                    )
-                                    data-from=from
-                                    data-to=to
-                                    style=st
-                                ></div>
-                            }
-                            .into_any()
-                        }
-                    }
-                })
-                .collect();
-
-            // B7: one ribbon per forking branch (branch 0 of the server's
-            // list *is* the main line, which the segments already draw). A
-            // ribbon hinges at its fork column and turns as the line moves
-            // under the light; the dots above it never turn, so a label is
-            // always readable.
-            let ribbons: Vec<AnyView> = f
+            // **v0.5.68**: which fin each round belongs to, server-grouped
+            // (`branch.seqs` — a nested fork shares its parent's lane, so the
+            // lane cannot group them), and which fin sits at the front at
+            // rest. D-orb-7: the selected round's branch, else the current
+            // round's, else the first — so the picture answers "where am I"
+            // without reading a word.
+            let fin_of: HashMap<u64, u32> = f
                 .branches
                 .iter()
-                .filter(|b| b.lane != 0)
-                .map(|b| {
+                .filter_map(|b| b.fin.map(|i| (b, i)))
+                .flat_map(|(b, i)| b.seqs.iter().map(move |s| (*s, i)))
+                .collect();
+            let align = selected
+                .get()
+                .and_then(|s| fin_of.get(&s).copied())
+                .or_else(|| t.current_seq.and_then(|s| fin_of.get(&s).copied()))
+                .unwrap_or(0);
+
+            // The trunk: the main-line runs. They never turn — the branches
+            // orbit around *them* (D-orb-3, user decision) — so the trunk's
+            // rect is bit-identical before and after a scroll.
+            let trunk_edges: Vec<AnyView> = f
+                .edges
+                .iter()
+                .filter(|e| e.main)
+                .map(|e| {
+                    let (fx, _, _) = at.get(&e.from).copied().unwrap_or((0, 0, true));
+                    let lit = at.get(&e.to).map(|t| t.2).unwrap_or(true);
                     view! {
                         <div
                             class=format!(
-                                "rw3-ribbon {} {}",
-                                if b.lane < 0 { "up" } else { "down" },
-                                // a branch is drawn dim when its round is
-                                // off the live path (D1)
-                                if at.get(&b.root).map(|t| t.2).unwrap_or(true) {
-                                    "active"
-                                } else {
-                                    "abandoned"
-                                },
+                                "rw3-seg main {}",
+                                if lit { "active" } else { "abandoned" },
                             )
-                            data-root=b.root.to_string()
-                            data-lane=b.lane.to_string()
-                            style=format!(
-                                "--from:{}; --to:{}; --lane:{}",
-                                b.from_x,
-                                b.to_x,
-                                b.lane,
-                            )
+                            data-from=e.from.to_string()
+                            data-to=e.to.to_string()
+                            style=format!("--x:{fx}; --lane:0")
                         ></div>
                     }
                     .into_any()
                 })
                 .collect();
 
-            let nodes: Vec<AnyView> = f
+            let by_seq: HashMap<u64, FlowNode> =
+                f.nodes.iter().map(|n| (n.seq, n.clone())).collect();
+
+            // One fin per forking branch: a plane hinged on the trunk axis at
+            // the column the branch leaves it (`hinge_x`), held out at the
+            // radius the auto-fit gives the scene and turned by its ring
+            // angle. The branch's own rounds ride on the fin, so the scene is
+            // a *radial* drawing of the same tree: history length grows along
+            // x, the fork count grows around the axis, and the two stop
+            // competing for screen rows (plan §12.3).
+            let fins: Vec<AnyView> = f
+                .branches
+                .iter()
+                .filter_map(|b| {
+                    let i = b.fin?;
+                    let hinge = b.hinge_x;
+                    let fin_edges: Vec<AnyView> = f
+                        .edges
+                        .iter()
+                        .filter(|e| fin_of.get(&e.to) == Some(&i))
+                        .map(|e| {
+                            let (fx, _, _) = at.get(&e.from).copied().unwrap_or((0, 0, true));
+                            let lit = at.get(&e.to).map(|t| t.2).unwrap_or(true);
+                            view! {
+                                <div
+                                    class=format!(
+                                        "rw3-elbow fin {}",
+                                        if lit { "active" } else { "abandoned" },
+                                    )
+                                    data-from=e.from.to_string()
+                                    data-to=e.to.to_string()
+                                    style=format!("--x:{fx}; --lane:{}", e.lane)
+                                ></div>
+                            }
+                            .into_any()
+                        })
+                        .collect();
+                    let fin_nodes: Vec<AnyView> = b
+                        .seqs
+                        .iter()
+                        .filter_map(|s| by_seq.get(s))
+                        .map(|n| flow_node_button(state, n.clone()))
+                        .collect();
+                    Some(
+                        view! {
+                            <div
+                                class=format!(
+                                    "rw-fin {}",
+                                    if b.lane < 0 { "up" } else { "down" },
+                                )
+                                data-fin=i.to_string()
+                                data-root=b.root.to_string()
+                                data-hinge=hinge.to_string()
+                                data-lane=b.lane.to_string()
+                                style=format!(
+                                    "--fin:{i}; --hinge:{hinge}; --from:{}; --to:{}; --lane:{}",
+                                    b.from_x,
+                                    b.to_x,
+                                    b.lane,
+                                )
+                            >
+                                { fin_edges }
+                                { fin_nodes }
+                            </div>
+                        }
+                        .into_any(),
+                    )
+                })
+                .collect();
+            // how many fins the ring actually has (D-orb-9 reads this)
+            let fins_len = fins.len();
+
+            let trunk_nodes: Vec<AnyView> = f
                 .nodes
                 .iter()
+                .filter(|n| !fin_of.contains_key(&n.seq))
                 .map(|n| flow_node_button(state, n.clone()))
                 .collect();
 
@@ -1040,12 +1081,20 @@ fn flow_scene(state: AppState) -> AnyView {
                 >
                     <div
                         id="rw-flow-track"
-                        style=format!("--cols:{cells}; --lanes:{lanes}")
+                        style=format!(
+                            "--cols:{cells}; --lanes:{lanes}; --align:{align}; --step:{step}; \
+                             --arc:{arc}",
+                        )
                     >
                         <div class="rw3-grid">
-                            { edges }
-                            { ribbons }
-                            { nodes }
+                            { trunk_edges }
+                            { trunk_nodes }
+                            // D-orb-9: a lone branch is a *swing*, not a ring
+                            // that can park — the class lets the stylesheet
+                            // read the phase through a sine instead.
+                            <div class={move || {
+                                if fins_len == 1 { "rw-orbit solo" } else { "rw-orbit" }
+                            }}>{ fins }</div>
                         </div>
                         <div class="rw3-sheen"></div>
                     </div>
