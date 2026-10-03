@@ -286,17 +286,36 @@ the button explains itself by being disabled.
 * A scene that **fits** its panel has nothing to pan, so its branches keep
   the static turn their position under the light implies (a short, forked
   tree is the visible case). Long sessions pan and turn as designed.
-* **Style A's** recursive list renders one DOM level per round and traps the
-  wasm stack past roughly 32–80 rounds (`Webui` 117, `alpha` 82: the app
-  survives, the tree does not paint, the console shows
-  `RuntimeError: memory access out of bounds`). Style B draws all of them —
-  the flat projection is exactly why. Changing Style A's markup is a
-  decision, not done here.
+* ~~**Style A's** recursive list renders one DOM level per round and traps the
+  wasm stack past roughly 32–80 rounds.~~ **Fixed (v0.5.67)**: a chain is no
+  longer recursive — a node with a single child continues as a sibling, so the
+  recursion depth is the number of *forks*, not rounds. Measured after: all
+  eight live sessions render in the list style, `Webui` **117** nodes and
+  `alpha` **82**, zero traps (pre-fix: 6 nodes each, 5 and 8 traps). A run is
+  now one flat column (one DOM level per fork). See plan §10.9.
 * Both rewind reads parse **past serde_json's 128-level limit**
   (`api::parse_deep`, `unbounded_depth`): the tree nests one `children`
   array per round, so without it every long session failed the parse and
   History sat on "loading…" (v0.5.65 fixed this for four of the eight
   sessions on this host).
+
+### 3b.5 The default style, and the orbital scene (planned)
+
+The History view opens in **`flow`** by default since v0.5.67 (user decision;
+it supersedes the earlier "list is the default"). `list` stays one click away
+and persisted under `rushi-rw-view`; Style A's probe pins that key explicitly
+so it always tests the style it means to test.
+
+The next step for this scene is the **orbital view**: the branches rotating in
+3D around the session's main axis, driven by the scene's scroll, so that many
+forks and a long history stop competing for screen rows. It is *planned, not
+built*: research (web + measured spikes), design, ten open decisions
+(`D-orb-1..10`), the step plan and the probe plan are **§12 of
+`rewind-plugin-plan.md`**. Two facts from the spikes are worth stating here
+because they constrain the implementation: the browser paints and hit-tests
+the **nearer** fin of two overlapping fins and the order swaps when the ring
+turns 180° (no manual sorting needed), and `prefers-reduced-motion: reduce`
+does nothing by itself — a flat projection must be written explicitly.
 
 ## 4. Rewind is forbidden while the loop runs (decision 5)
 

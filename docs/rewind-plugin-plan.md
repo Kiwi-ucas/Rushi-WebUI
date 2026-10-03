@@ -715,6 +715,82 @@ two offsets, flat under the light, `prefers-reduced-motion` → no transform)
 · **I** the paint (accent pixels counted from real screenshots in **both**
 palettes).
 
+### 10.9 Round 2, part 1 — the flat list and the `flow` default (as built, v0.5.67)
+
+Two of the round-2 items are landed and verified; the third — the orbital
+scene — is **§12, a plan** (research, design, D-questions, steps), because it
+needs the D-orb answers before it is worth building.
+
+**1. Style A's wasm-stack blowup: a chain is now flat, not recursive.**
+The list nested one `children` container per round (`node_view` recursed into
+`.rw-kids`), so a straight chain of N rounds cost ~2N DOM levels. Measured on
+the live app at v0.5.66:
+
+| session | list-style `.rw-node` DOM nodes, pre-fix | post-fix | traps |
+|---|---|---|---|
+| `Webui` (117 rounds) | **6** | **117** | 5 → **0** |
+| `alpha` (82 rounds) | **6** | **82** | 8 → **0** |
+| `rewind` (32 rounds / 33 nodes) | 33 | 33 | 0 |
+| `issue` (30) | 30 | 30 | 0 |
+| `webui_extend` (27) | 27 | 27 | 0 |
+| `theme` (16) | 16 | 16 | 0 |
+| `Time inject` (11) | 11 | 11 | 0 |
+| `essence` (6) | 6 | 6 | 0 |
+
+All eight measured in the same sweep after the fix (8/8 full count, **zero**
+`memory access out of bounds`); the six short sessions were already fine
+before it, unchanged. The "before" numbers for `Webui`/`alpha` are the ones
+that made the defect visible.
+
+The failure was `RuntimeError: memory access out of bounds`: the app survived
+but the tree kept the **previous** session on screen, i.e. History looked like
+a stale copy. The cut sat between 32 and 82 rounds and did **not** track
+payload size (the four serde-broken sessions included a 16-round one) — it was
+a per-round DOM/stack cost.
+
+**Fix**: `nodes_view(state, sess, Vec<RewindNode>) -> Vec<AnyView>` — a node
+with a **single** child hoists that child to be the next *sibling* in the same
+container, so recursion depth is the number of **forks** along a path, not the
+number of rounds. `node_view` keeps rendering one node plus its fork children
+(through `nodes_view`), so a forked tree's shape is unchanged, one indent level
+per fork.
+
+A pure chain therefore stops drawing as a staircase: every round of a run
+shares one container, so a run is one flat column (the probe measures a single
+left offset across 117 nodes) at one DOM level per fork.
+
+The `byte-for-byte` pin from §9/§10 is **waived for this fix** at the user's
+word ("按你说的修法做").
+
+**2. The default History style is `flow`** (user: "默认值改为flow"), which
+supersedes D2's "the list is the default". `read_view_mode` maps anything but
+the stored `"tree"` to `flow`; the `[ list | flow ]` switch's active state and
+the `rushi-rw-view` restore follow automatically, and `list` stays one click
+away and persisted per browser. The rationale is exactly the two defects Style
+B existed to fix: the scene draws every session measured, the recursive list
+could not draw the long ones at all.
+
+`e2e/rewind_probe.py` (Style A's probe) now pins `rushi-rw-view=tree` for
+itself: a probe must *choose* the style it tests instead of inheriting a
+default. `e2e/flow_style_b_probe.py` gained section **K** for the long chain
+(117 rounds in the list style, no trap, nesting depth ≤ 5, one left offset,
+the current round still marked).
+
+#### Verification (v0.5.67)
+
+| what | command | result |
+|---|---|---|
+| server logic | `cargo test -p rushi-web` | **65 passed** |
+| frontend | wasm `cargo check` + `trunk build` | clean |
+| Style A (pins the list style) | `e2e/rewind_probe.py` | **140/140** |
+| Style B + the long chain (section K) | `e2e/flow_style_b_probe.py` | **66/66** |
+| the scene payload | `e2e/flow_check.py` | 8 sessions / 0 problems |
+| layout | `e2e/layout_probe.py` | PASS |
+
+---
+
+---
+
 ## 11. Rewind × compaction — the plugin side (plan, 2026-10-03)
 
 Context: the kernel defect this plan depends on is fixed in
@@ -919,3 +995,301 @@ still PASSes.
 | frontend | `trunk build` | clean |
 | probes | `e2e/rewind_probe.py`, `e2e/layout_probe.py` | **140 checks PASS**, layout PASS |
 | end-to-end (kernel) | rewind this session to 6670 and to 6998, dump `bin/assemble` | framing = `handoff/v3.md`; `6211..<target>` present; no seq in `6671..9087` — proved with the kernel fix (`rushi/docs/rewind-fork-design.md` 11.4) |
+
+## 12. The orbital flow view (plan, 2026-10-03)
+
+**Goal (user):** *"scroll-driven character orbit rotation … 我需要树状图的分叉可以围绕会话主轴旋转"* — in the History scene the **branches must orbit around the session's main axis**, driven by scrolling, so that a session with many forks and a long history does not have to be crammed into one flat plane.
+
+**Status: plan. Nothing in this section is built.** §12.2 is research (web + measured spikes in our own Chromium against the live app), §12.3 the design, §12.4 the decisions we need from the user, §12.5 the step plan, §12.6 how each step is verified, §12.7 non-goals, §12.8 risks.
+
+### 12.1 The problem, concretely
+
+Today's scene (§10.2, §10.8) is a **flat lane layout**: the main line is one
+row (`--lane: 0`), every fork gets its own screen row (`--lane ±k`, pitch = a
+percentage of the scene height), the rounds spread along **x** (`--cell`,
+`--bx`), and the scene is a long horizontal strip. It reads well up to a
+handful of forks. What does not scale is the **branch count**: lanes divide the
+scene's height, so 20 forks means 21 rows of a few pixels each, and the
+vertical extent of the picture — not the history — becomes the limit. The
+history's length is already handled (x-scroll); the fork count is not, and it
+is the dimension the user is pointing at.
+
+The want, restated as a rendering problem: keep the trunk (the session's main
+axis, and the thing that scrolls with the history) **exactly where it is**,
+and give the forked chains a dimension that is not a screen row — an **angle**
+around that trunk.
+
+### 12.2 Findings
+
+#### A. Measured in our Chromium, against the live app (spikes, 2026-10-03)
+
+Spike sources (throwaway, local): `/tmp/orbit_spike.py`, `orbit_spike2.py`,
+`orbit_spike3.py`; screenshots `/tmp/orbit-spike-*.png`.
+
+**F1 — the native scroll-timeline machinery resolves, and the pivot is a registered custom property.** With `@property --phase { syntax: "<angle>"; inherits: true; initial-value: 0deg }` and `@keyframes { from { --phase: 0deg } to { --phase: 360deg } }` spread over `animation-timeline: scroll(nearest inline)` + `animation-range: cover`, the ring's `--phase` tracked the scroll exactly (`0deg` → `180deg` → `360deg` as `scrollLeft` went 0 → 50% → 100%), and its computed `transform` was the matching `matrix3d`. **Both** timeline arrangements work: `scroll(nearest inline)` (anonymous) and a named `scroll-timeline-name` + `scroll-timeline-axis: x`.
+
+**F2 — the timeline must belong to the element or an *ancestor*.** The first spike failed because the scroller was a **sibling** of the animated element: the name resolved to nothing and nothing moved. Consequence for us: `#rw-flow-scroll` is already an ancestor of the track, so either form is available without disturbing §10.8's rule "the scroller is not the perspective element".
+
+**F3 — two gotchas, both measured.** `animation-fill-mode: both` is **required**: at 100% the value held at `360deg` with `both` and snapped back to `0deg` with `none`. And `prefers-reduced-motion: reduce` does **nothing by itself** — the ring kept rotating under media emulation, so an explicit `@media` block is mandatory (this is the sharper version of D9).
+
+**F4 — the geometry law for `rotateX(θ) translateY(-R)`** (a fin hinged on the axis, held out at radius R), measured on a 6-fin prototype:
+
+| θ | projected row (`y`) | projected height | depth `z` |
+|---|---|---|---|
+| 0° | `-R` (above the axis) | 26px (full) | 0 |
+| 60° | `-0.5R` | 11px (`26·cos60°`) | `-0.87R` (behind) |
+| 90° | 0 (on the axis) | 0 (edge-on) | `-R` (behind) |
+| 180° | `+R` (below) | 26px | 0 |
+| 300° | `-0.5R` | 16px | `+0.87R` (**in front**) |
+
+i.e. row = `-R·cos θ`, height ≈ `h·|cos θ|`, depth = `-R·sin θ`, with CSS's
+`+z` **toward the viewer** — the near half of the ring is θ ∈ (180°, 360°).
+
+**F5 — depth sorting and hit testing are the browser's job, and they are honest.** With two fins overlapping on screen at different depths (θ = 120° green vs θ = 240° orange, 90px tall, overlapping band 175×34px): at phase 0 the overlap painted **orange** and `elementFromPoint` returned the orange fin, with projected heights 39 vs 53; **rotating the ring 180° swapped both** (53 vs 39, painted green, hit green). A dot on a rotated fin is still hit-testable. So the orbit needs no z-index bookkeeping, no manual sorting, and clicks keep working.
+
+**F6 — the flat projection is a one-line difference.** With the ring flattened, `transform: translateY(calc(-1 * var(--r) * cos(var(--th))))` put the same fins on the expected rows with full height (both fins at the same row for θ = 120°/240°, `cos` = −0.5). A reduced-motion / no-3D fallback is therefore a *projection of the same numbers*, not a second layout.
+
+**F7 — the existing driver already exists.** §10.7/§10.8's `--rw-scroll` is written by exactly one write per frame (wheel, drag, `on:scroll`). The orbit's phase can be *derived* from it in pure CSS (`calc(var(--rw-scroll) * var(--deg-per-px))`), so the fallback path costs **no new JS per frame** and the native timeline becomes an optional replacement of the *source*, not of the transforms.
+
+#### B. Browser support (MDN browser-compat-data, fetched 2026-10-03)
+
+| feature | Chrome | Safari | Firefox |
+|---|---|---|---|
+| `animation-timeline` / `animation-range` / `scroll-timeline*` | 115 | 26 | **`preview`** (not stable) |
+| `@property` (registered custom properties) | 85 | 16.4 | 128 |
+| CSS `sin()` / `cos()` / `atan2()` | 111 | 15.4 | 108 |
+| `perspective`, `transform-style`, `backface-visibility` | 36 | 9 / 9 / 15.4 | 16 |
+
+Read together: **the native scroll-timeline path is a Chromium + Safari enhancement; Firefox needs the JS proxy** (this is the crisp, current version of D9 — a blog claiming "Firefox shipped it in 132" is wrong, BCD says `preview`, and the plan trusts BCD over blogs). The **trig is broader than the timelines**, so any projection computed with `sin`/`cos` is safe as the *base* layer.
+
+#### C. Prior art
+
+A 3D carousel is `perspective` on a stage, a ring of items each
+`rotateY(θ) translateZ(R)`, and the ring's own rotation driven by scroll or a
+timer (SitePoint's classic build; the "scroll rotate gallery" pattern). Ours is
+the same construction rotated 90°: the items orbit around the **x** axis
+(`rotateX`), because our turntable's axis is the horizontal trunk, not a
+vertical one — and the axis is shared by every branch, which is exactly the
+user's "围绕会话主轴旋转".
+
+Sources: MDN `animation-timeline` / `animation-range` / `transform-style`;
+`mdn/browser-compat-data` (raw JSON for `animation-timeline`,
+`animation-range`, `scroll-timeline`, `scroll-timeline-axis`,
+`at-rules/property`, `types/sin`, `types/cos`); WebKit's animation-range
+cheatsheet (Jul 2025); web.dev on CSS trig; SitePoint "Building a 3D rotating
+carousel with CSS and JavaScript"; the `scroll(nearest inline)` +
+`animation-range` + `prefers-reduced-motion` tutorial the user pasted.
+
+#### D. What the payload already gives us (no server change)
+
+`Flow.branches` has, per segment, `root`, `lane`, `parent_lane`, `from_x`,
+`to_x` (the main line included, `lane` 0), and `Flow.nodes` has `x`, `lane`,
+`main`, `seq`, `current`. So the client can compute every number the orbit
+needs — the hinge column (`from_x`), the fin's own x span (`from_x..to_x`),
+the branch list (everything with `lane ≠ 0`), and which branch holds the
+current node — **from the response it already fetches**. The orbit is a
+client-side projection of the same `flow` object, which keeps §10.2's
+"one fetch, one cache, one invalidation path" intact. If a later step wants
+server-side correctness (unit-testable geometry), the *server* could also emit
+`--theta` per branch — that is a D-orb question, not a requirement.
+
+### 12.3 Design — the orbital scene
+
+**The stage.** Unchanged from today: `#rw-flow-scroll` scrolls **x only** and
+is not the perspective element; `#rw-flow-track` is the perspective stage. New
+inside it:
+
+```
+#rw-flow-track                 perspective: 1400px;  transform-style: preserve-3d
+  .rw3-trunk                   the main line: runs, dots, the current marker — untouched
+  .rw-orbit                    transform-style: preserve-3d;
+                               transform: rotateX(var(--phase))
+    .rw-fin (per branch)       transform-origin: 0 50%;
+                               left: <fork column x>;  transform: rotateX(var(--theta)) translateY(calc(-1 * var(--r)))
+      .rw-fin-body             the branch's own run/dots, along the fin's x span
+      .rw-fin-label            counter-rotated (see "labels")
+```
+
+**The numbers.** `R` (the ring radius) and the per-fin `--theta` are written at
+**layout** time by `sync_scene_metrics`, next to today's `--bx`/`--halfpw`/
+`--denom` (mount, tree change, selection, resize) — never during a scroll.
+`--theta_i = (i − align) · 360/N` for the N branch fins, ordered as
+`Flow.branches` already orders them (left to right by fork column, stable
+across reloads). A scroll frame keeps writing **exactly one value** — the
+existing `--rw-scroll` — and `--phase` is pure CSS on top of it:
+
+```css
+.rw-orbit { transform: rotateX(calc(var(--rw-scroll) * var(--deg-per-px))); }
+```
+
+so the *rotation* costs no JS at all and the scene keeps its single-write
+contract.
+
+**Why this fixes the density problem.** The two growing dimensions are
+decoupled: **history length → x** (the trunk's own scroll, exactly as today)
+and **branch count → angle** (the ring's N slots). A 117-round session with 30
+forks no longer needs 30 screen rows; it needs one ring, and the scroll brings
+any fin to the front. That is the honest answer to "长历史不必挤在一个平面里".
+
+**Where the fins hinge.** At the trunk column where the branch forks
+(`from_x`), so the ring is a *radial* drawing of the same tree: a fin starts on
+the trunk and extends outward. Fins from different forks do not share a column,
+so they overlap in x only when their spans overlap — and when they do, F5 says
+the browser paints and hit-tests the nearer one correctly.
+
+**Depth cues** (what makes it read as 3D — all of them free):
+perspective already scales the near fins up and the far ones down (measured 53
+vs 39 px); we add a `cos`-derived opacity (`--depth: cos(var(--theta) +
+var(--phase))`) so the front-facing fins are bright and the far ones dim, and
+we let the browser sort painting and hit testing (F5). No `z-index` games.
+
+**Labels.** Two rules, because a rotated label is unreadable: (a) the branch
+**label layer counter-rotates** — `rotateX(calc(-1 * (var(--theta) +
+var(--phase))))` — so its text is always flat to the viewer; (b) the fin at the
+front is the readable one, and the panel below (`#rw-detail`, D6) remains the
+text surface for everything else. Note that (a) needs `--phase` as a **value**,
+which is why the D-orb-4 recommendation favours the value-driven phase: the
+purely-transform native path can rotate the ring but cannot counter-rotate a
+label.
+
+**Alignment at rest.** The **current branch** (the branch holding the node with
+`current: true`, else the selected node's branch) sits at the front, i.e. its
+effective angle is 0°; `--phase`'s zero is set from that. Clicking any fin's
+dot re-aligns it to the front (and selects the node, as today). So the picture
+always answers "where am I" without reading any text.
+
+**Many branches.** N ≤ 6 → slots of ≥ 60° are comfortable. Beyond that the
+ring still works, but adjacent fins crowd; the front-alignment rule (scroll or
+click) is what keeps it usable, plus the tangential dimming. The degenerate
+cases are the interesting ones: **0 branches** → nothing to orbit, the ring
+stays flat and the scene is exactly today's scene (no regression for the short
+sessions §10.8 measured); **1 branch** → a degenerate ring; the proposal is a
+gentle ±25° swing rather than a full turn (D-orb-9).
+
+**The flat projection** (`prefers-reduced-motion: reduce`, or a forced `.flat`
+class for probes) is F6's one-liner: ring `transform: none`, each fin
+`translateY(calc(-1 * var(--r) * cos(var(--theta))))`, full height, upright
+labels, depth dimming kept (it is a `cos`, so it still works). Non-goal: no
+attempt to animate anything in this mode.
+
+### 12.4 D-questions (each with a recommendation in bold)
+
+**These block O2.** O1 (registering the phase plumbing) can start before the
+answers. I recommend answering them in one pass, as we did for D1–D9.
+
+* **D-orb-1 — the radius `R`.** A percentage of the scene's height (like the
+  lane pitch today), a fixed px, or auto-fit so a fin's far end just fits?
+  **Recommendation: a CSS var written at layout time, `R ≈ 0.36 × scene
+  height`, capped by the auto-fit rule; no user control (D4 keeps auto-fit +
+  drag-to-pan, no slider).**
+* **D-orb-2 — the angular law.** Full 360° ring with evenly spaced slots vs a
+  bounded arc (e.g. ±70°) with the extra branches queued behind the front.
+  **Recommendation: the full ring (it is what "orbit" means and it scales to
+  many branches); evenly spaced slots, order = `Flow.branches`.**
+* **D-orb-3 — what turns.** Branches only (the trunk fixed) as the user asked,
+  or a small camera tilt for extra depth cueing? **Recommendation: branches
+  only; the trunk is the one stable thing in the scene, and stability is what
+  makes the orbit legible.**
+* **D-orb-4 — the phase driver.** (a) derive `--phase` from the existing
+  `--rw-scroll` proxy (works everywhere, one write per frame, can drive label
+  counter-rotation); (b) a native `animation-timeline` + `@property`
+  (compositor-smooth, Chromium/Safari only, cannot counter-rotate labels);
+  (c) both behind `@supports`. **Recommendation: (a) as the base and (c)
+  afterwards only for a per-fin `view(x)` reveal if it earns its keep — one
+  driver, one meaning, the same rule as D7.**
+* **D-orb-5 — labels.** Counter-rotate (always flat, needs the phase as a
+  value) vs let them turn with their fin (simpler, unreadable at steep
+  angles). **Recommendation: counter-rotate the label layer only; the fin's
+  geometry keeps turning.**
+* **D-orb-6 — the far side.** Keep the whole ring visible (dimmed) vs hide the
+  back half. **Recommendation: keep it visible, dimmed by `cos` — the ring
+  turning into view is the whole point of a scroll-driven orbit.**
+* **D-orb-7 — alignment.** Current branch at the front (recommended), a fixed
+  ring with only the scroll turning it, or click-to-align. **Recommendation:
+  current branch at rest + click-to-align; the scroll only adds phase on top.
+  This is the same "stay anchored to the current node" rule as D5.**
+* **D-orb-8 — the scroll mapping.** One full turn per scene width? per N
+  fins? per fixed px? **Recommendation: a fixed angular rate per px
+  (`--deg-per-px` ≈ 360° / (1.5 × scene width)), so the gesture feels the
+  same in every session, with the alignment rule always winning at rest.**
+* **D-orb-9 — degenerate sessions.** 0 branches (nothing to orbit) and 1
+  branch (a ring of one). **Recommendation: 0 → flat, exactly today's scene;
+  1 → a gentle ±25° swing so the scene still feels alive but stays readable.**
+* **D-orb-10 — where it lives in the UI.** The flat lane layout as the
+  reduced-motion projection (recommended: the orbit replaces the lane layout,
+  the lane layout becomes the fallback), vs a third style next to `[ list |
+  flow ]`, vs a per-session preference. **Recommendation: keep two top-level
+  styles — `list` and `flow` — and make the orbit *inside* flow the only
+  layout; the lane layout survives only as the flat projection, so the switch
+  keeps meaning "text or tree", not "3D or not".** If the user wants to
+  compare, a `.flat` toggle is a one-line probe affordance, not a UI switch.
+
+### 12.5 Step plan
+
+| step | what | why in this order |
+|---|---|---|
+| **O1** | the phase plumbing, no visual change: `@property --phase` (and the `--theta`/`--r`/`--deg-per-px` vars) written at layout time in `sync_scene_metrics`; `--phase` derived from `--rw-scroll` in CSS; still no ring | it can be verified numerically (computed styles) while the scene looks exactly as it does now |
+| **O2** | the ring: `.rw-orbit` wrapper with `preserve-3d`, fins hinged at `from_x`, radius `R`, `--theta` per branch; the lane layout demoted to the flat projection | the first visible step; decidable only after D-orb-1/2/3/10 |
+| **O3** | the alignment rule: `--phase`'s zero = the current branch at the front; clicking a fin re-aligns | answers "where am I" without text |
+| **O4** | depth cues: `cos` opacity, the far-side policy, `backface-visibility` if the far fins' backs look wrong | the measured pieces (F4/F5) |
+| **O5** | labels: the counter-rotated label layer, the panel as the text surface | needs the phase as a value (D-orb-4/5) |
+| **O6** | the flat projection + `@media (prefers-reduced-motion: reduce)`, and — only if it pays — `@supports (animation-timeline: view(x))` for the per-fin reveal | §12.2 F3 says the media query is mandatory; the `@supports` bit is optional |
+| **O7** | probes, docs (this section's as-built record + `docs/rewind-plugin.md`), mirror sync | same discipline as B9 |
+
+Every step is a build + probe cycle; each one is independently revertible
+(the orbit is behind its own wrapper and vars).
+
+### 12.6 Verification
+
+**Commands (each step):** `cargo test -p rushi-web` (server, 65 today —
+unchanged unless D-orb-2's server-side variant is chosen), wasm
+`cargo check`, `trunk build`, then the probes on the live app.
+
+**Probe plan** — a new section **L** in `e2e/flow_style_b_probe.py`, plus the
+existing A–K kept green:
+
+| # | check | how |
+|---|---|---|
+| L1 | the ring exists and is a 3D context | `getComputedStyle(.rw-orbit).transformStyle == preserve-3d`, the stage's `perspective != none` |
+| L2 | one fin per non-main branch | fin count == `branches.filter(lane != 0).length` |
+| L3 | the geometry law (F4) | the θ≈0 fin's box is **above** the axis, the θ≈180 one **below**, and their `|y − axis|` are within a few % |
+| L4 | the depth law | the near fin's projected height > the far fin's, by the measured ratio (~53/39) |
+| L5 | scrolling turns the ring | after a wheel/proxy scroll, `--phase` changed and L4's ordering **swapped** when the phase passed 180° |
+| L6 | the trunk does not move | the trunk's rect and the main-line runs are bit-identical before/after the scroll |
+| L7 | the current branch is at the front at rest | its effective angle ≈ 0 (±5°) after entering the scene |
+| L8 | clicking a fin aligns it and selects its node | the fin's root node becomes `selected`, the ring re-aligns |
+| L9 | dots on rotated fins are clickable | `elementFromPoint` at a rotated dot returns the dot (F5) |
+| L10 | the flat projection | with `.flat`, each fin's row ≈ `-R·cos θ` (exact, no perspective), full height, no transform on the ring |
+| L11 | reduced motion | with `Emulation.setEmulatedMedia(prefers-reduced-motion: reduce)` the ring's transform is `none` and nothing changes while scrolling |
+| L12 | the long chain + many branches | open `Webui` (117 rounds) and the fork fixture: fin count, no traps, node count unchanged, a paint check in both palettes (like section I) |
+
+**What would falsify the design** (kept explicit, so the probe can prove us
+wrong): if L4/L5's height ordering does not invert when the ring passes 180°,
+the ring is not a real 3D context; if L6 fails, the trunk is being transformed
+with the ring; if L9 fails, the orbit has cost us the primary interaction; if
+L10 cannot be computed from `cos`, the flat fallback needs a second layout
+(and D-orb-4's option (b) gets less attractive).
+
+### 12.7 Non-goals
+
+No WebGL, no three.js — this is CSS 3D plus one number, or it is not worth it.
+No 3D in the **list** style (Style A stays a flat text tree; the flattening fix
+above is the whole of its round-2 work). No rotation of individual **rounds**
+inside a branch — the unit that orbits is a **branch** (a fin); its own rounds
+stay on its fin. No new server route or payload field unless D-orb-2 asks for
+it. No change to auto-fit/pan/zoom (D4), to the detail panel (D6/D8), or to
+the wheel contract (D7): the orbit *consumes* the same single value those
+decisions produce. And no `"before"`-mode or TUI work (still v2).
+
+### 12.8 Risks and mitigations
+
+| risk | mitigation | evidence |
+|---|---|---|
+| labels unreadable while rotated | counter-rotated label layer + front alignment; the panel is the text surface | F1 (the property path), D6 |
+| many branches crowd the ring | slots + `cos` dimming + front-alignment on scroll/click | F4/F5 (the ordering stays true at any N) |
+| the 3D fights the x-scroller | the scroller stays *outside* the perspective element (unchanged §10.8 rule); the rotation lives on the ring | F2 (ancestor timeline) |
+| painting/hit-test surprises | none expected: the browser sorts by depth and hit-tests accordingly | F5 (measured, including the 180° swap) |
+| Firefox | the base path is the JS-driven value, which Firefox has | §12.2 B (BCD: Firefox is `preview` for timelines) |
+| old browsers without `@property` | the proxy *writes* the value per frame, so no property registration is needed at all on that path — registration only matters if we adopt the native timeline (D-orb-4 (b)) | F1, B |
+| cost per frame | the ring's transform is one CSS calc over a value we already write; the fins are static transforms written at layout time | F7, §10.7 |
+| 117-round scene + many fins | the ring adds one wrapper level and one transform per fin; the node count is unchanged | §10.9's measurement |
