@@ -1013,7 +1013,7 @@ pub struct AppState {
     /// (the only structure-changing event types) so the tree refetches.
     pub rewind_gen: RwSignal<u64>,
     /// Style B: which History style is showing — `"tree"` (style A, the
-    /// default, D2) or `"flow"`. Persisted as `rushi-rw-view`; the plugin
+    /// (v0.5.67) or `"tree"`. Persisted as `rushi-rw-view`; the plugin
     /// owns it, like every other display-only preference.
     pub rw_view: RwSignal<String>,
     /// Style B: the selected round's log line (`None` = nothing selected).

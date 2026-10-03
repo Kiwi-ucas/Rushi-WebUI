@@ -65,9 +65,10 @@ fn App() -> impl IntoView {
     // path's basename, and the path itself is never modified.
     state.project_labels.set(ui::read_project_labels());
 
-    // v0.5.65 (Style B): which History style is showing. The list style is
-    // the default (D2) — the new "flow" style is opt-in from the top bar,
-    // and the choice survives a reload like every other display preference.
+    // v0.5.65 (Style B): which History style is showing. The **flow** scene
+    // is the default since v0.5.67 (user decision, superseding D2's list
+    // default) — the list stays one click away in the top bar, and the
+    // choice survives a reload like every other display preference.
     state.rw_view.set(crate::rewind::read_view_mode());
 
     // v0.5.38: keep the loop-cmd chip's `loop_cmd` signal fresh from

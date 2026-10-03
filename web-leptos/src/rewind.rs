@@ -78,7 +78,7 @@ pub fn register_tree_effect(state: AppState) {
 
 // ── Style B (the "flow" view): which style, and what is selected ───
 //
-// D2: the list style (A) stays the default; the new one is opt-in from the
+// v0.5.67: the flow style is the default; the list is opt-in from the
 // History top bar and the choice survives a reload. D5: opening it selects
 // the round the session is at, so the detail panel is never empty. The
 // selection is client-only and lives with the rest of the plugin state
@@ -603,8 +603,8 @@ fn node_view(state: AppState, sess: String, node: RewindNode) -> AnyView {
 // ── Style B: the "flow" view (plan section 10, steps B4-B8) ───────
 //
 // The History view's second style. Style A (the recursive list) is
-// untouched and stays the default (D2); this one is opt-in from the top
-// bar and remembers the choice.
+// untouched but no longer the default (v0.5.67); this one is the default
+// and remembers the choice.
 //
 // The right-hand side splits 1 : 2 (D3): the **detail panel** on top (the
 // selected round in full + the Rewind button, the only place a rewind can
