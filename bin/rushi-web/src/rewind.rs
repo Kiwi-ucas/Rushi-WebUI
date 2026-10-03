@@ -240,12 +240,25 @@ struct Round {
 /// one element per non-empty log line — element `i` is 1-based line `i + 1`,
 /// which is the kernel's `seq`).
 pub fn build(session: &str, events: &[Value]) -> RewindTree {
+    build_live(session, events, false)
+}
+
+/// [`build`] for a *live* session (v0.5.69, round-3 defect 1).
+///
+/// `live` is whether the session's loop is alive right now. While it
+/// is, a tool call whose result is not in the log yet is **pending**,
+/// not stranded: the projection a user sees must not collapse because
+/// the agent happens to be inside a tool call at that instant (the
+/// kernel never assembles the context in that state — see
+/// [`strands_pair`]). `live = false` is the exact kernel rule.
+pub fn build_live(session: &str, events: &[Value], live: bool) -> RewindTree {
     let total = events.len() as u64;
     // R2: the markers the kernel's projection drops. Computed first —
     // the scan needs them to know where the *effective* cursor sits (a
     // dropped marker does not move the active path; the kernel pops it
     // and re-projects linear).
-    let ignored = ignored_markers(events);
+    let pending = pending_ids(events, live);
+    let ignored = ignored_markers_with(events, pending.as_ref());
     let mut rounds: Vec<Round> = Vec::new();
     let mut markers: Vec<RewindMarker> = Vec::new();
     let mut tree_boundaries: Vec<Boundary> = Vec::new();
@@ -374,7 +387,7 @@ pub fn build(session: &str, events: &[Value]) -> RewindTree {
     let bounds = boundaries(events);
     let restores: Vec<Restore> = rounds
         .iter()
-        .map(|r| restore_with(events, r.seq, &ms, &bounds))
+        .map(|r| restore_with(events, r.seq, &ms, &bounds, pending.as_ref()))
         .collect();
     // The tail notice (D-C): the log's last marker is one the kernel
     // dropped — "your rewind did not take effect".
@@ -954,11 +967,46 @@ pub fn boundary_on_active_path(
         .cloned()
 }
 
+/// The tool ids that appear on **one side only, anywhere in the whole
+/// log** — a call whose result has not been written yet (the agent is
+/// inside a tool call as this projection runs), or a result whose call
+/// is not in the log at all. Popping a rewind marker cannot repair
+/// either: un-masking events can only bring back a counterpart that is
+/// *in* the log. See [`strands_pair`].
+fn unpaired_ids(events: &[Value]) -> HashSet<String> {
+    let calls: HashSet<&str> = events
+        .iter()
+        .filter_map(|ev| ev.get("tool_calls").and_then(|c| c.as_array()))
+        .flatten()
+        .filter_map(|c| c.get("id").and_then(|i| i.as_str()))
+        .collect();
+    let results: HashSet<&str> = events
+        .iter()
+        .filter(|ev| ev.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+        .filter_map(|ev| ev.get("id").and_then(|i| i.as_str()))
+        .collect();
+    calls
+        .symmetric_difference(&results)
+        .map(|s| s.to_string())
+        .collect()
+}
+
 /// The pair-stranding invariant (the kernel's
 /// `context_strands_pairs`): the id of the first tool call whose
 /// result is missing, or of the first result whose call is missing.
 /// `None` when every pair is complete.
-fn strands_pair(events: &[&Value]) -> Option<String> {
+///
+/// **v0.5.69 (round-3 defect 1)**: `pending` — the whole log's
+/// [`unpaired_ids`] — names the ids that are unpaired *everywhere*,
+/// and those are not strands at all while the session's loop is alive.
+/// The kernel only ever runs this check from `bin/assemble`, which
+/// assembles **between** turns: at that moment every call of the
+/// previous turn has its result. A projection taken *while the agent
+/// is working* would otherwise see the in-flight call as a strand,
+/// pop every rewind marker, and draw the whole history linear — which
+/// is exactly what the live sessions did. `None` restores the exact
+/// kernel rule (a dead loop, or a settled log).
+fn strands_pair(events: &[&Value], pending: Option<&HashSet<String>>) -> Option<String> {
     let result_ids: HashSet<&str> = events
         .iter()
         .filter(|ev| ev.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
@@ -971,13 +1019,14 @@ fn strands_pair(events: &[&Value]) -> Option<String> {
         .flatten()
         .filter_map(|c| c.get("id").and_then(|i| i.as_str()))
         .collect();
+    let is_pending = |id: &str| pending.is_some_and(|p| p.contains(id));
     for ev in events {
         match ev.get("type").and_then(|t| t.as_str()) {
             Some("assistant_message") => {
                 if let Some(calls) = ev.get("tool_calls").and_then(|c| c.as_array()) {
                     for c in calls {
                         if let Some(id) = c.get("id").and_then(|i| i.as_str()) {
-                            if !result_ids.contains(id) {
+                            if !result_ids.contains(id) && !is_pending(id) {
                                 return Some(id.to_string());
                             }
                         }
@@ -986,7 +1035,7 @@ fn strands_pair(events: &[&Value]) -> Option<String> {
             }
             Some("tool_result") => {
                 if let Some(id) = ev.get("id").and_then(|i| i.as_str()) {
-                    if !call_ids.contains(id) {
+                    if !call_ids.contains(id) && !is_pending(id) {
                         return Some(id.to_string());
                     }
                 }
@@ -1021,9 +1070,30 @@ pub enum RewindVerdict {
 /// The R1 verdict for appending `rewind { target_seq, mode }` to this
 /// log now (the candidate sits at `events.len() + 1`).
 pub fn rewind_verdict(events: &[Value], target_seq: u64, mode: &str) -> RewindVerdict {
+    rewind_verdict_live(events, target_seq, mode, false)
+}
+
+/// [`rewind_verdict`] for a live session: the same rule, but a tool
+/// call whose result is not in the log yet is pending rather than
+/// stranded (v0.5.69 — a user rewinding *while* the agent works must
+/// not be refused for the agent's own in-flight call; see
+/// [`strands_pair`]).
+pub fn rewind_verdict_live(
+    events: &[Value],
+    target_seq: u64,
+    mode: &str,
+    live: bool,
+) -> RewindVerdict {
     let ms = markers(events);
     let bounds = boundaries(events);
-    verdict_with(events, target_seq, mode, &ms, &bounds)
+    let pending = pending_ids(events, live);
+    verdict_with(events, target_seq, mode, &ms, &bounds, pending.as_ref())
+}
+
+/// The ids to treat as pending for this projection: the whole log's
+/// unpaired ids, but only while `live`.
+fn pending_ids(events: &[Value], live: bool) -> Option<HashSet<String>> {
+    live.then(|| unpaired_ids(events))
 }
 
 /// The R3 annotation for one log line, over the whole log. The tree
@@ -1033,7 +1103,7 @@ pub fn rewind_verdict(events: &[Value], target_seq: u64, mode: &str) -> RewindVe
 pub fn restore_at(events: &[Value], node_seq: u64) -> Restore {
     let ms = markers(events);
     let bounds = boundaries(events);
-    restore_with(events, node_seq, &ms, &bounds)
+    restore_with(events, node_seq, &ms, &bounds, None)
 }
 
 /// [`rewind_verdict`] with the parsed markers/boundaries supplied (the
@@ -1044,6 +1114,7 @@ fn verdict_with(
     mode: &str,
     ms: &[Marker],
     bounds: &[BoundaryRef],
+    pending: Option<&HashSet<String>>,
 ) -> RewindVerdict {
     let marker_seq = events.len() as u64 + 1;
     if target_seq < 1 || target_seq >= marker_seq {
@@ -1086,7 +1157,7 @@ fn verdict_with(
         })
         .map(|(_, ev)| ev)
         .collect();
-    match strands_pair(&kept) {
+    match strands_pair(&kept, pending) {
         Some(missing) => RewindVerdict::StrandsPair { missing },
         None => RewindVerdict::Ok,
     }
@@ -1120,8 +1191,10 @@ fn restore_with(
     node_seq: u64,
     ms: &[Marker],
     bounds: &[BoundaryRef],
+    pending: Option<&HashSet<String>>,
 ) -> Restore {
-    if let RewindVerdict::StrandsPair { missing } = verdict_with(events, node_seq, "on", ms, bounds)
+    if let RewindVerdict::StrandsPair { missing } =
+        verdict_with(events, node_seq, "on", ms, bounds, pending)
     {
         return Restore::Unresumable { missing };
     }
@@ -1158,6 +1231,17 @@ pub struct IgnoredMarker {
 /// effect (the kernel printed its warning on the loop's stderr; this
 /// is the same fact in the tree).
 pub fn ignored_markers(events: &[Value]) -> Vec<IgnoredMarker> {
+    ignored_markers_with(events, None)
+}
+
+/// [`ignored_markers`] with the whole log's pending ids supplied
+/// (v0.5.69): while the session's loop is alive, a call whose result
+/// is nowhere in the log is pending, not a strand — see
+/// [`strands_pair`].
+pub fn ignored_markers_with(
+    events: &[Value],
+    pending: Option<&HashSet<String>>,
+) -> Vec<IgnoredMarker> {
     let end = events.len() as u64;
     let mut ms = markers(events);
     // The projection picks its boundary **once**, before the pops
@@ -1176,7 +1260,7 @@ pub fn ignored_markers(events: &[Value]) -> Vec<IgnoredMarker> {
             })
             .map(|(_, ev)| ev)
             .collect();
-        let Some(missing) = strands_pair(&kept) else {
+        let Some(missing) = strands_pair(&kept, pending) else {
             break;
         };
         if ms.is_empty() {
@@ -1545,10 +1629,10 @@ mod tests {
         let ms = markers(&events);
         let bounds = boundaries(&events);
         assert_eq!(
-            restore_with(&events, 6, &ms, &bounds),
+            restore_with(&events, 6, &ms, &bounds, None),
             Restore::Framed { version: 1, from_seq: 4, to_seq: 6 }
         );
-        assert_eq!(restore_with(&events, 1, &ms, &bounds), Restore::Raw);
+        assert_eq!(restore_with(&events, 1, &ms, &bounds, None), Restore::Raw);
         // And the tree carries it.
         let tree = build("s", &events);
         let mut nodes = Vec::new();
@@ -1699,6 +1783,90 @@ mod tests {
                 missing: "c1".to_string()
             }
         );
+    }
+
+    /// v0.5.69 (round-3 defect 1): while the session's loop is alive, a
+    /// tool call whose result is **nowhere in the log** — the agent is
+    /// inside that call as the projection runs — is pending, not
+    /// stranded. Without the exemption the pop loop drops every rewind
+    /// marker of the log and the tree goes linear, which is exactly what
+    /// the live sessions did.
+    #[test]
+    fn an_in_flight_call_does_not_drop_markers_while_the_loop_is_live() {
+        let events = vec![
+            um("round one"),   // 1
+            um("round two"),   // 2
+            rw(1, "on"),       // 3 — back to round one
+            um("round three"), // 4 — the branch that rewind made
+            call("c2"),        // 5 — in flight: no result anywhere
+        ];
+        // The kernel's rule, blind to time (a dead loop): the open call
+        // strands, the marker is dropped, the history is one line.
+        let dead = build_live("s", &events, false);
+        assert_eq!(
+            dead.ignored,
+            vec![IgnoredMarker {
+                seq: 3,
+                target_seq: 1,
+                mode: "on".to_string(),
+                missing: "c2".to_string(),
+            }]
+        );
+        assert_eq!(dead.flow.orbit.fins, 0, "linear, as the kernel would project it");
+        // The live rule: the call is pending, so the rewind stands and
+        // round one keeps two children — the fork survives.
+        let live = build_live("s", &events, true);
+        assert!(live.ignored.is_empty(), "an in-flight call is not a strand");
+        assert_eq!(live.tail_ignored, None);
+        assert_eq!(live.flow.orbit.fins, 1);
+        assert_eq!(live.flow.lanes, 1);
+        assert_eq!(active_seqs(&live), vec![1, 4]);
+    }
+
+    /// The exemption is narrow: a pair the **mask** splits — the call is
+    /// kept, its result sits in the log but outside the active ranges —
+    /// is still a strand while the loop is live. That is the kernel's
+    /// own rule and the plugin's parity promise.
+    #[test]
+    fn a_masked_but_logged_pair_still_strands_while_live() {
+        let events = vec![
+            um("round one"), // 1
+            call("c1"),      // 2
+            um("steer"),     // 3 — the pick that lands mid-step
+            res("c1"),       // 4 — in the log, but masked by the rewind
+            rw(2, "on"),     // 5
+            um("round two"), // 6
+            call("c2"),      // 7 — in flight
+        ];
+        assert_eq!(ignored_markers(&events)[0].missing, "c1");
+        let live = build_live("s", &events, true);
+        assert_eq!(live.ignored.len(), 1);
+        assert_eq!(live.ignored[0].missing, "c1");
+        assert_eq!(
+            live.flow.orbit.fins, 0,
+            "the pair the mask split still strands: only *unpaired* ids are pending"
+        );
+    }
+
+    /// A pick is not refused because of the agent's own in-flight call
+    /// (v0.5.69): the same pick that a dead loop would call
+    /// `StrandsPair` is `Ok` while the loop is alive.
+    #[test]
+    fn a_pick_is_not_refused_for_an_in_flight_call_while_live() {
+        let events = vec![
+            um("round one"), // 1
+            call("c2"),      // 2 — in flight
+            um("round two"), // 3
+        ];
+        assert!(matches!(
+            rewind_verdict(&events, 3, "on"),
+            RewindVerdict::StrandsPair { .. }
+        ));
+        assert_eq!(rewind_verdict_live(&events, 3, "on", true), RewindVerdict::Ok);
+        assert!(matches!(
+            rewind_verdict_live(&events, 3, "on", false),
+            RewindVerdict::StrandsPair { .. }
+        ));
     }
 
     /// R3 on a mid-step pick: the node is annotated `Unresumable`, so

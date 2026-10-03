@@ -248,7 +248,12 @@ async fn get_rewind_tree(
 ) -> impl IntoResponse {
     match st.sessions.events(&id).await {
         Ok(events) => {
-            (StatusCode::OK, Json(rewind::build(&id, &events))).into_response()
+            // v0.5.69 (round-3 defect 1): while this session's loop is
+            // alive, a tool call whose result is not written yet is
+            // pending, not stranded — otherwise the projection would
+            // drop every rewind marker for as long as the agent works.
+            let live = st.loops.is_running(&id).await;
+            (StatusCode::OK, Json(rewind::build_live(&id, &events, live))).into_response()
         }
         Err(e) => (StatusCode::NOT_FOUND, e.to_string()).into_response(),
     }
@@ -288,7 +293,10 @@ async fn post_rewind(
     Json(body): Json<PostRewind>,
 ) -> impl IntoResponse {
     let verdict = match st.sessions.events(&id).await {
-        Ok(events) => rewind::rewind_verdict(&events, body.target_seq, &body.mode),
+        Ok(events) => {
+            let live = st.loops.is_running(&id).await;
+            rewind::rewind_verdict_live(&events, body.target_seq, &body.mode, live)
+        }
         Err(e) => return (StatusCode::NOT_FOUND, e.to_string()).into_response(),
     };
     // A pick the kernel would ignore is refused here, so the log never

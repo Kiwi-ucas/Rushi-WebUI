@@ -324,6 +324,28 @@ competing for screen rows.
   round's fin, else 0, and the *rest* offset is re-anchored whenever the
   layout runs, so "at rest" always means "the current branch is at the
   front" (click a fin's bead to bring its branch round).
+* **The driver, and why the wheel alone was not enough (v0.5.69).** The phase
+  reads the scene's pan, and the scene only pans while its track is wider than
+  the panel — `--cell` auto-fits, so a track of **17..45 columns fits
+  exactly** and neither the wheel nor the drag could move anything at all
+  (measured: `scrollLeft/clientWidth/scrollWidth` = `0/1200/1200` on a 4-fin
+  session, `--rw-scroll` `"0"` for ever). `--rw-scroll` is therefore
+  `scrollLeft + turn`, the *turn* being the part of a gesture the track could
+  not take: the wheel accumulates its overshoot at either end, the drag sets
+  it from the pointer's own wish. A scene that can pan behaves exactly as
+  before, one value per frame; a scene that cannot, turns the ring where it
+  stands. The turn resets with `--rw0` at every **layout point** (a new scene,
+  a new selection, a resize, a session switch), so rest still means alignment,
+  and a bare re-measure (`on:pointerdown`) leaves the ring alone.
+* **The projection is taken *live* (v0.5.69).** The server's pop guard is the
+  kernel's own — but the kernel only runs it between turns, when every call of
+  the previous turn is answered, while the plugin projects on every request.
+  A tool call whose result is not in the log yet is therefore **pending**, not
+  stranded, while `is_running(session)`; without that rule a running session's
+  tree dropped every marker and flattened to one line (measured: `0 fins`
+  while the agent worked, `4 fins` a moment later). The rule is narrow: a pair
+  the *mask* splits still strands, and a dead loop gets the kernel's exact
+  behaviour.
 * **The beads.** A fin's rounds ride on its plane, each counter-rotated about
   its own dot so numbers stay upright; the fin's plane itself is what tips
   into the screen. Clicking, hover tooltips and `elementFromPoint` all work
@@ -348,6 +370,13 @@ refinements found while building and the pixel measurements are **§12.9 of
 `rewind-plugin-plan.md`**; the deep probe is `e2e/orbit_probe.py` (L1–L12,
 34 checks, own fixtures) and the live-shape probe is section H of
 `e2e/flow_style_b_probe.py`.
+
+**v0.5.69 open item.** The two defects of §3b.6 (the live projection and the
+frozen phase) are covered by unit tests and were confirmed against the live
+API, but the two new *browser* checks — a ring that turns on a scene that
+fits, and a `loop.pid` toggle for the pending rule — were deferred at the
+user's request (they are reviewing the fix by hand), together with a re-run of
+the four probes.
 
 ## 4. Rewind is forbidden while the loop runs (decision 5)
 
@@ -435,8 +464,10 @@ abandoned rounds are still rendered.
 ## 6. Verification
 
 * `cargo test -p rushi-web` — the projection against the kernel fixtures,
-  the flow layout, the ring's fin/hinge/round attribution and the per-round
-  detail (**68 tests green**).
+  the flow layout, the ring's fin/hinge/round attribution, the per-round
+  detail, and (v0.5.69) the two live-projection rules: a pending in-flight
+  call never drops a marker, a mask-split pair always does
+  (**71 tests green**).
 * `trunk build` — the Leptos CSR bundle.
 * `python3 e2e/rewind_probe.py [port]` — **140 browser + HTTP assertions**
   over four fixture sessions built by the probe

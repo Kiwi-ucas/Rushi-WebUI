@@ -1403,3 +1403,71 @@ with five refinements that only showed up once the thing was turning.
 **Non-goals, kept.** No WebGL, no per-round rotation, no orbit in the list
 style, no new route, and the wheel contract (D7) untouched: the orbit reads
 the same `--rw-scroll` the pan already produced.
+
+### 12.10 Two defects the live app found (2026-10-04, v0.5.69)
+
+The user's report — *"rewind 视图怎么转动？滚动没用"*, then *"rewind 会话有很多条分支啊"* —
+was two independent bugs, and both were invisible in every probe, because the
+probes' own fixtures are neither short nor half-written.
+
+**Defect 1 — the P4 guard fires on an in-flight call, so a running session's
+tree went flat.** `build`/`ignored_markers` are an exact port of
+`bin/assemble`'s `mask_active_path`, which pops the outermost rewind marker
+while the masked context strands a tool pair. The kernel only ever assembles
+**between** turns — by then every call of the previous turn has its result —
+while the plugin projects **on every request**. So for the whole time the
+agent is inside a tool call (i.e. nearly always, when a user looks) the
+in-flight call read as a strand, the loop popped *every* marker, and the log
+was re-projected linear: the branches vanished from the screen while the
+kernel's own context kept them.
+
+Evidence, on the session named `rewind` (4 markers: 8910→6998, 8990→6670,
+9087→6670, 14080→6670): with one of *my* tool calls in flight it projected
+`37 rounds · 0 fins · ignored 4`; truncating the log to just before that call
+projected `4 fins · 5 branches` (trunk 1..20; 6998 lane −1, 8911 lane −2,
+8991 lane +1, 9088 lane +2 — all four off round seq 6670) with `ignored: []`.
+The branches the user remembered were real; both my readings and their view
+had been taken mid-call.
+
+Fix: `build_live` / `rewind_verdict_live` (the handlers pass
+`st.loops.is_running(id).await`). An id that is unpaired **anywhere in the
+whole log** is *pending*, not stranded, while the loop is alive — a pop can
+only bring back a counterpart that exists. The exemption is narrow: a pair
+the **mask** splits (the call kept, its result in the log but outside the
+active ranges) still strands, and with a dead loop (crash, settled log) the
+projection is the kernel's rule again, bit for bit. **3 new tests**
+(`an_in_flight_call_does_not_drop_markers_while_the_loop_is_live`,
+`a_masked_but_logged_pair_still_strands_while_live`,
+`a_pick_is_not_refused_for_an_in_flight_call_while_live`) → `cargo test -p
+rushi-web` **71**.
+
+**Defect 2 — most scenes cannot scroll at all, so the phase was frozen.**
+`--phase` reads `--rw-scroll` = `scrollLeft`, and `#rw-flow-track` is
+`(cols+1) × clamp(26px, 100cqw/cols − 4px, 64px)` wide: it overflows its
+panel only for `cols ≤ 16` (the proportional regime) or `cols ≥ ~46` (the 26px
+floor). For **17..45 columns the track fits exactly**, so `scrollLeft` is
+pinned at 0 for ever and the wheel *and* the drag were dead, not subtle.
+Measured with a real `Input.dispatchMouseEvent` wheel on a 4-fin / 21-round
+session: `scroll [0, 1200, 1200]`, `--rw-scroll` `"0"`, and all four fins'
+`transform` and `--eff` unchanged after 4× `dy=+120` and 2× `dx=+120`. The
+live forked sessions sit exactly in that band (`Time inject` 8 columns,
+`rewind` 37); only `alpha` (82) and `Webui` (117) can scroll, and neither has
+a fin — which is why the ring looked dead everywhere.
+
+Fix (`web-leptos/src/rewind.rs`): `--rw-scroll` is `scrollLeft + turn`, the
+*turn* being the part of a gesture the track could not take — accumulated from
+the wheel's overshoot at either end, set continuously from the pointer's own
+wish while dragging. A scene that can pan takes the whole delta (nothing
+changes: the pan and the ring are still the same number, one value per frame);
+a scene that cannot pan now turns the ring on the spot, which is what D-orb-4
+needed all along. The turn resets with `--rw0` at every **layout point**
+(`relayout_scene()`: new scene, new selection, resize, session switch), so
+"at rest = aligned" (D-orb-7) still holds — and a re-measure that is *not* a
+layout point (`on:pointerdown`) no longer moves the ring.
+
+**Open, deferred at the user's request** (they are checking the result by
+hand): the two new probe checks — a fixture where the wheel turns a ring whose
+scene fits, and a `loop.pid` toggle proving the pending rule end to end — plus
+a re-run of `rewind_probe` / `orbit_probe` / `flow_style_b_probe` /
+`flow_check`. Until those run, the browser-level verification for this round
+stands at the API-level checks above; the unit tests and the builds are green.

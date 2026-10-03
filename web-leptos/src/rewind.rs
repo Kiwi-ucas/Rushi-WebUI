@@ -19,7 +19,7 @@
 //! quick button is disabled and the tree stays viewable but not clickable
 //! ([`rewind_allowed`]).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 
 use leptos::prelude::*;
@@ -126,6 +126,24 @@ thread_local! {
     /// The one `resize` listener Style B installs. A resize is a layout
     /// point (not a scroll frame), so the scene re-measures itself here.
     static SCENE_RESIZE: RefCell<Option<Closure<dyn Fn()>>> = const { RefCell::new(None) };
+    /// **v0.5.69 (round-3 defect 2)**: the turn a gesture could not spend
+    /// on panning — see [`pan_and_turn`]. `--rw-scroll` is
+    /// `scrollLeft + this`, so a scene narrower than its panel (which is
+    /// what a track of 17..45 columns is, `#rw-flow-track`'s `--cell`
+    /// makes it fit exactly) still turns the ring even though it has no
+    /// scroll range at all. Reset at every layout, like `--rw0`.
+    static RW_TURN: Cell<f64> = const { Cell::new(0.0) };
+}
+
+/// The scene's turn accumulator (px, the same unit as `scrollLeft`).
+fn turn() -> f64 {
+    RW_TURN.with(|c| c.get())
+}
+fn add_turn(d: f64) {
+    RW_TURN.with(|c| c.set(c.get() + d));
+}
+fn set_turn(v: f64) {
+    RW_TURN.with(|c| c.set(v));
 }
 
 /// B7's numbers, written once per **layout** so that a scroll frame writes
@@ -171,7 +189,9 @@ fn sync_scene_metrics() {
     let st = scroll.style();
     let _ = st.set_property("--halfpw", &format!("{half}"));
     let _ = st.set_property("--denom", &format!("{}", half * 1.1));
-    let _ = st.set_property("--rw-scroll", &format!("{}", scroll.scroll_left()));
+    // the same value `mark_scroll` writes, turn included: a re-measure must
+    // never move the ring
+    mark_scroll(&scroll);
 
     // ── the orbital scene's pixels (the server owns the angles) ─────
     // The axis, and the radius the auto-fit gives it: the farthest fin is
@@ -190,6 +210,16 @@ fn sync_scene_metrics() {
     // front — "the alignment rule always wins at rest".
     let _ = st.set_property("--dpp", &format!("{}", ORBIT_DEG_PER_WIDTH / w));
     let _ = st.set_property("--rw0", &format!("{}", scroll.scroll_left()));
+}
+
+/// A **layout point** (v0.5.69): re-measure the scene and put the ring back
+/// at rest. The turn resets with `--rw0`, so what the user sees on entering
+/// the view, on picking a round, or on a resize is the aligned fin at the
+/// front (the D-orb-7 rule). A bare [`sync_scene_metrics`] is only a
+/// re-measure (`on_down`) and must leave the ring exactly where it is.
+fn relayout_scene() {
+    set_turn(0.0);
+    sync_scene_metrics();
 }
 
 /// Style B's two effects, registered once from `lib.rs` next to
@@ -212,14 +242,14 @@ pub fn register_flow_effects(state: AppState) {
     // first pass runs after the render that produced them.
     Effect::new(move || {
         let _ = (view.get(), tree.get(), selected.get());
-        sync_scene_metrics();
-        gloo_timers::callback::Timeout::new(0, sync_scene_metrics).forget();
+        relayout_scene();
+        gloo_timers::callback::Timeout::new(0, relayout_scene).forget();
     });
     SCENE_RESIZE.with(|slot| {
         if slot.borrow().is_some() {
             return;
         }
-        let cb = Closure::<dyn Fn()>::new(sync_scene_metrics);
+        let cb = Closure::<dyn Fn()>::new(relayout_scene);
         if let Some(w) = web_sys::window() {
             let _ = w.add_event_listener_with_callback("resize", cb.as_ref().unchecked_ref());
         }
@@ -820,9 +850,29 @@ fn flow_detail(state: AppState) -> AnyView {
 /// `--turn` calc reads. Never `scrollLeft` itself, so nothing reads layout
 /// while scrolling, and `--halfpw`/`--denom`/`--bx` stay from the layout.
 fn mark_scroll(el: &HtmlElement) {
-    let _ = el
-        .style()
-        .set_property("--rw-scroll", &format!("{}", el.scroll_left()));
+    let v = el.scroll_left() as f64 + turn();
+    let _ = el.style().set_property("--rw-scroll", &format!("{v}"));
+}
+
+/// **v0.5.69 (round-3 defect 2)**: move the scene by `delta` px along the
+/// line — as far as the track allows — and keep the rest as *turn*, so
+/// the ring's `--phase` keeps moving when the trunk cannot.
+///
+/// `--phase` reads `--rw-scroll` (the wheel = the line = the ring, one
+/// value per frame, D7/D-orb-4). That only ever worked while the scene
+/// could scroll: `#rw-flow-track` is `(cols+1)` cells wide and `--cell`
+/// auto-fits down to a 26px floor, so a session of 17..45 rounds fits its
+/// panel **exactly** — `scrollLeft` is pinned at 0 for ever and the ring
+/// froze (the live `rewind` and `Time inject` sessions are both in that
+/// band). Now the gesture pans first and turns afterwards: with a track
+/// that can move, the pan takes the whole delta (nothing changes from
+/// before) and only the overshoot at either end becomes turn.
+fn pan_and_turn(el: &HtmlElement, delta: f64) {
+    let before = el.scroll_left() as f64;
+    el.set_scroll_left((before + delta) as i32);
+    let after = el.scroll_left() as f64;
+    add_turn((before + delta) - after);
+    mark_scroll(el);
 }
 
 /// Short label for the dialog's title line ("round 3 \u{00b7} first chars\u{2026}").
@@ -999,7 +1049,7 @@ fn flow_scene(state: AppState) -> AnyView {
             // Drag the empty space to pan (D4/D7): the wheel drives the same
             // scroll offset natively (an x-only scroller takes the vertical
             // delta), the dots are excluded so a click is never eaten.
-            let drag = StoredValue::new((false, 0.0, 0.0));
+            let drag = StoredValue::new((false, 0.0, 0.0, 0.0));
             let el_of = |ev: &PointerEvent| -> Option<HtmlElement> {
                 ev.current_target()?.dyn_into::<HtmlElement>().ok()
             };
@@ -1015,18 +1065,30 @@ fn flow_scene(state: AppState) -> AnyView {
                 if on_node {
                     return;
                 }
-                drag.set_value((true, ev.client_x() as f64, el.scroll_left() as f64));
+                drag.set_value((
+                    true,
+                    ev.client_x() as f64,
+                    el.scroll_left() as f64,
+                    turn(),
+                ));
                 let _ = el.set_pointer_capture(ev.pointer_id());
                 let _ = el.class_list().add_1("dragging");
             };
             let on_move = move |ev: PointerEvent| {
-                let (down, x0, sl) = drag.get_value();
+                let (down, x0, sl, t0) = drag.get_value();
                 if !down {
                     return;
                 }
                 let Some(el) = el_of(&ev) else { return };
                 let dx = ev.client_x() as f64 - x0;
-                el.set_scroll_left((sl - dx) as i32);
+                // The pointer's *absolute* wish (the drag is anchored at
+                // the press), and the part of it the track refuses becomes
+                // the turn — continuous, so dragging past the end keeps
+                // turning the ring instead of stopping dead.
+                let want = sl - dx;
+                el.set_scroll_left(want as i32);
+                let got = el.scroll_left() as f64;
+                set_turn(t0 + (want - got));
                 mark_scroll(&el);
             };
             let on_up = move |ev: PointerEvent| {
@@ -1034,7 +1096,7 @@ fn flow_scene(state: AppState) -> AnyView {
                     let _ = el.release_pointer_capture(ev.pointer_id());
                     let _ = el.class_list().remove_1("dragging");
                 }
-                drag.set_value((false, 0.0, 0.0));
+                drag.set_value((false, 0.0, 0.0, 0.0));
             };
             // Any scroll (this is also the fallback for a scrollbar drag we
             // never see, a keyboard scroll, or a programmatic `scrollLeft`
@@ -1065,8 +1127,7 @@ fn flow_scene(state: AppState) -> AnyView {
                     return;
                 }
                 ev.prevent_default();
-                el.set_scroll_left(el.scroll_left() + dy as i32);
-                mark_scroll(&el);
+                pan_and_turn(&el, dy);
             };
 
             view! {
