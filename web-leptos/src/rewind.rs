@@ -20,6 +20,7 @@
 //! ([`rewind_allowed`]).
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -87,8 +88,11 @@ pub fn register_tree_effect(state: AppState) {
 /// The localStorage key holding the History style ("tree" | "flow").
 const VIEW_KEY: &str = "rushi-rw-view";
 
-/// The persisted style: `"flow"` or `"tree"` (the default, D2). Anything
-/// unknown falls back to the list style.
+/// The persisted style: `"flow"` or `"tree"`. **`flow` is the default**
+/// (user decision 2026-10-03, superseding D2's "list is the default"): the
+/// scene draws every session measured, while the recursive list cannot
+/// render the long ones at all (see `nodes_view`). Anything unknown falls
+/// back to the flow style.
 pub fn read_view_mode() -> String {
     let stored = web_sys::window()
         .and_then(|w| w.local_storage().ok())
@@ -96,8 +100,8 @@ pub fn read_view_mode() -> String {
         .and_then(|s| s.get_item(VIEW_KEY).ok())
         .flatten();
     match stored.as_deref() {
-        Some("flow") => "flow".to_string(),
-        _ => "tree".to_string(),
+        Some("tree") => "tree".to_string(),
+        _ => "flow".to_string(),
     }
 }
 
@@ -455,7 +459,7 @@ fn hist_tree(state: AppState) -> AnyView {
                         <span class="rw-lg fork">{ format!("{rewinds} rewind{}", if rewinds == 1 { "" } else { "s" }) }</span>
                     </div>
                     <div class="rw-nodes">
-                        { nodes.into_iter().map(|n| node_view(state, sess.clone(), n)).collect_view() }
+                        { nodes_view(state, sess, nodes) }
                     </div>
                     { boundaries_view }
                 }.into_any()
@@ -465,8 +469,34 @@ fn hist_tree(state: AppState) -> AnyView {
     .into_any()
 }
 
-/// One round node + its children (recursive). Abandoned branches keep their
-/// dimmed styling; the current one carries the "here" marker.
+/// One DOM level per **fork** (v0.5.67).
+///
+/// The list used to nest one `children` container per round, so a straight
+/// chain of N rounds cost ~2N DOM levels and the wasm stack gave out
+/// somewhere past ~32–80 rounds: `Webui` (117) and `alpha` (82) drew six
+/// nodes and threw `RuntimeError: memory access out of bounds` (the app
+/// survived, the tree never painted). A node with a **single** child now
+/// continues as a sibling in the same container, so the recursion depth is
+/// the number of *forks* along the path instead of the number of rounds —
+/// and a pure chain draws as one flat list rather than a staircase.
+fn nodes_view(state: AppState, sess: String, nodes: Vec<RewindNode>) -> Vec<AnyView> {
+    let mut out: Vec<AnyView> = Vec::with_capacity(nodes.len());
+    let mut queue: VecDeque<RewindNode> = nodes.into();
+    while let Some(mut n) = queue.pop_front() {
+        if n.children.len() == 1 {
+            // the run continues: hoist the only child to be the next sibling
+            if let Some(child) = n.children.pop() {
+                queue.push_front(child);
+            }
+        }
+        out.push(node_view(state, sess.clone(), n));
+    }
+    out
+}
+
+/// One round node + its fork children (via [`nodes_view`]). Abandoned
+/// branches keep their dimmed styling; the current one carries the "here"
+/// marker.
 fn node_view(state: AppState, sess: String, node: RewindNode) -> AnyView {
     let seq = node.seq;
     let round = node.round;
@@ -540,6 +570,13 @@ fn node_view(state: AppState, sess: String, node: RewindNode) -> AnyView {
     };
     let restore_text = restore_label.clone();
 
+    let kids_view: AnyView = if kids.is_empty() {
+        ().into_any()
+    } else {
+        let sess_kids = sess.clone();
+        view! { <div class="rw-kids">{ nodes_view(state, sess_kids, kids) }</div> }.into_any()
+    };
+
     view! {
         <div class=node_cls data-seq=seq.to_string() data-round=round.to_string()>
             <div class="rw-head" title=title on:click=on_click>
@@ -557,9 +594,7 @@ fn node_view(state: AppState, sess: String, node: RewindNode) -> AnyView {
                     <span class="rw-here">{ "here" }</span>
                 </Show>
             </div>
-            <div class="rw-kids">
-                { kids.into_iter().map(|k| node_view(state, sess.clone(), k)).collect_view() }
-            </div>
+            { kids_view }
         </div>
     }
     .into_any()
