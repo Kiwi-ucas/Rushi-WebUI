@@ -1854,15 +1854,18 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
    a light, not a ribbon).
    A branch *of* a branch gets a **nested container** (D-cone-6): it lives
    inside its parent's, so the parent's turn is already in force and the
-   child's own angle (`--slot`, a small ±1, ±2 …) reads as a fan relative to
-   it (D-cone-7), while its spine still starts at its own parent's bead.
+   child's own angle reads as a fan relative to it (D-cone-7), while its spine
+   still starts at its own parent's bead.
    The trunk never turns (D-orb-3) — the branches turn *around* it.
 
    The one value a scroll frame moves is `--rw-scroll`; `--phase` is that
    offset minus the scene's rest offset (`--rw0`, also layout time) times a
    fixed angular rate (`--dpp`, D-orb-8). Everything else is written once:
-   the render writes `--slot`/`--step`/`--hinge`/`--ph`/`--po`/
-   `--n`/`--dx`, the layout writes `--q`/`--r`/`--axis`/`--dpp`/`--rw0`
+   the render writes each branch's **angles in degrees** — `--th` (its own
+   angle inside its parent's plane) and `--rdeg` (the top trunk-parented
+   ancestor's angle) — plus `--slot`/`--step` (its rank and its fan's spacing,
+   informational), `--hinge`/`--ph`/`--po`/`--n`/`--dx`/`--sum`/`--kup`/
+   `--kown`, and the layout writes `--q`/`--r`/`--axis`/`--dpp`/`--rw0`
    (rewind::sync_scene_metrics). */
 #rw-flow-track {
   --phase: calc((var(--rw-scroll, 0) - var(--rw0, 0)) * var(--dpp, 0.3));
@@ -1884,12 +1887,14 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
   transform-origin: 0 0;
   transform-style: preserve-3d;
   pointer-events: none;
-  /* its own angle = its slot (server order, D-orb-2) + the scroll phase.
-     `--root_a` is the *top* trunk-parented ancestor's unclamped angle: the
-     render writes `--sroot` (that ancestor's slot) on every container, so
-     `--abs` below works at any nesting depth. */
-  --root_a: calc((var(--sroot, 0) - var(--align, 0)) * var(--step, 30) + var(--phase, 0));
-  --theta: calc((var(--slot, 0) - var(--align, 0)) * var(--step, 30));
+  /* its own angle: the render writes it as degrees (`--th`, plan §13.9
+     D-fan-1/2 — the step is `360/k` of *this branch's own fan*, so the
+     stylesheet can no longer derive it from a slot and one global step) plus
+     the scroll phase. `--rdeg` is the *top* trunk-parented ancestor's angle:
+     the render writes it on every container, so `--abs` below works at any
+     nesting depth. */
+  --root_a: calc(var(--rdeg, 0) + var(--phase, 0));
+  --theta: var(--th, 0);
   --eff: calc(var(--theta) + var(--phase, 0));
   /* **D-cone-8 (user decision, v0.5.71): the branch turns a full circle.** The
      angle is `--eff` wrapped into (-180, 180], so 360 degrees brings the branch
@@ -1933,15 +1938,16 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
   --kroot: calc(cos(calc(var(--aroot, 0) * 1deg)) - 0.12 * sin(calc(var(--aroot, 0) * 1deg)));
   transform: rotateX(calc(var(--a) * 1deg));
 }
-/* a branch of a branch (D-cone-6/7): its container sits on its parent's bead
-   inside the parent's container, and it turns by its own small slot only —
-   the parent's turn is already in force, so the two *compose*. The scene's
-   phase is deliberately *not* added here: the parent already carries it, and
-   adding it twice would make a nested fan turn at double the scroll rate. */
+/* a branch of a branch (D-cone-6/7, D-fan-4): its container sits on its
+   parent's bead inside the parent's container, and it turns by its own angle
+   only — the render's `--th`, which for a nested fan is spread over the full
+   circle centred *below* the parent — because the parent's turn is already in
+   force, so the two *compose*. The scene's phase is deliberately *not* added
+   here: the parent already carries it, and adding it twice would make a nested
+   fan turn at double the scroll rate. */
 .rw-branch .rw-branch {
   left: calc((var(--hinge, 0) - var(--ph, 0)) * var(--cell));
   top: calc(-1 * var(--po, 0) * var(--q, 0px));
-  --theta: calc(var(--slot, 0) * var(--step, 30));
   --eff: var(--theta);
 }
 

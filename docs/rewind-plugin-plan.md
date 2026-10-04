@@ -1932,3 +1932,69 @@ The step can no longer be one number on the track, so the render writes the
 2. **D-fan-4**: is "a nested fan is centred *below* its parent" right, or should
    a nested fan start at the parent's own ray (+0°) when `k ≥ 2`?
 3. **D-fan-5**: keep the rotation rate at 240°/panel width?
+
+## 13.10 As built (v0.5.72) — the even fan
+
+**The user's decisions (2026-10-04, all three answered):** D-fan-3 → **(C) the
+hybrid** ("按你建议来"): the aligned branch points straight up, and a fan whose
+size would land a branch exactly on ±90 (`k % 4 == 0`) is nudged half a step
+instead. D-fan-4 → **centred on 180** ("嵌套扇以 180° 为中心"). D-fan-5 → the
+rotation rate is **unchanged** ("旋转速率暂时不变"). D-fan-1/2/6 were not in
+question (the step is `360/k` per fan, ranks per fan, no fit change).
+
+**As shipped.** Client + stylesheet only; the server is untouched (its
+`orbit.step_deg`/`orbit.arc_deg` are now *both* unread — the design doc says
+so, so nobody trusts them).
+
+* `web-leptos/src/rewind.rs`:
+  * `FAN_EDGE_ON = 0.087` (5° off the camera's axis), `fan_step(k, nested)`
+    (`360/k`, capped at 120 for a nested fan), `fan_root_theta(rank, align, k)`
+    (the signed step distance plus the half-step nudge when `k % 4 == 0`) and
+    `fan_nested_theta(rank, k)` (centred on 180, quarter-step nudge when
+    180 ± 90 would reappear).
+  * `Cone` loses its scene-wide `step`; `branch()` takes `rank`/`step`/`theta`/
+    `rdeg`/`sum` (all the angles in degrees, `f64`) and writes `--slot`
+    (rank), `--step` (the fan's spacing, informational), `--th`, `--rdeg`,
+    `--sum`, `--kup`, `--kown`.
+  * The child fan is the parent's `kids` list enumerated (rank), not the old
+    ±2-slot pattern; `align` becomes a **rank** in the root fan; the track's
+    inline style is down to `--cols`/`--lanes`.
+  * A `#[cfg(test)] mod fan_angles_tests` writes the law down as assertions
+    (even gaps, never edge-on, the front's nudge rule, a nested fan below its
+    parent). The wasm crate cannot run host tests, so these are *compiled* for
+    `wasm32-unknown-unknown` (`cargo test -p rushi-web-ui --no-run --target
+    wasm32-unknown-unknown` ✓) and *executed* by extracting them verbatim into
+    a standalone host harness (`/tmp/fan_check.rs`, `rustc --test` ⇒ **2
+    passed**), plus by the browser probes below.
+* `web-leptos/style.css`: `--root_a: calc(var(--rdeg, 0) + var(--phase, 0))`,
+  `--theta: var(--th, 0)`; the nested rule keeps `--eff: var(--theta)` and no
+  longer overrides `--theta`; `--step`/`--align`/`--sroot` leave the stylesheet.
+  No selector appears or disappears, so the mirror's canary list is unchanged.
+
+**Measured on the live `rewind` session** (the user's own example: a root fan of
+3 + one nested child), by re-reading the painted beads' rects — before (fixed
+30° step, server slots) vs after:
+
+| | angles | branch beads covering a **trunk** bead | bead pairs < 13px |
+| --- | --- | --- | --- |
+| before | 0° / 60° / 90° (+ nested at −60°) | **7** | **8** |
+| after | 0° / 120° / −120° (+ nested at **180°**) | **1** | **2** |
+
+**The probes, all re-run after the change:**
+
+| probe | v0.5.71 | v0.5.72 |
+| --- | --- | --- |
+| `cargo test -p rushi-web` | 71 | **71 passed** (the server is untouched) |
+| `cargo test -p rushi-web-ui --no-run --target wasm32` | — | compiles (13 pre-existing warnings); the fan-law assertions run in a host harness: **2 passed** |
+| wasm `cargo check` + `trunk build` | clean | clean (13 pre-existing warnings) |
+| `orbit_probe.py` | 44 / 0 | **48 passed / 0 failed** (L2h-L2k added; L7a now proves the alignment through `--rdeg`) |
+| `flow_style_b_probe.py 8480` | 66 / 0 | **68 passed / 0 failed** (H11/H12 added; H reads `--th`/`--rdeg`) |
+| `flow_check.py 8480` | 8 / 0 | **8 sessions, 0 problems** (HTTP only) |
+| `rewind_probe.py` | 140 | **PASS (140 checks)** |
+
+**Two trap notes worth keeping.** (1) A fan's angle must be built from a
+**per-fan rank**: driving `360/3` off the root fan's *global* slots `{0, 2, 3}`
+put two branches on the same angle (0.0px apart, 7 overlapping pairs) because
+slot 3 wraps to 0. (2) A fan of one has no "gap" — its spacing is the whole
+circle, so a check that compares its single angle's gap to a *capped* spacing
+fails by construction (the nested fan's cap is 120, its lone angle 180).

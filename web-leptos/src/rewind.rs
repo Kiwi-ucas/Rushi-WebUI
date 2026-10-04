@@ -1054,10 +1054,10 @@ fn flow_scene(state: AppState) -> AnyView {
             let f = t.flow.clone();
             let cells = f.cols.max(1).to_string();
             let lanes = f.lanes.max(1).to_string();
-            // the ring's angular step, from the server (one source of truth
-            // for the constant, tested there). D-cone-8: `arc_deg` is no
-            // longer read — a branch turns the whole circle.
-            let step = f.orbit.step_deg.max(1).to_string();
+            // `orbit.step_deg` and `orbit.arc_deg` are no longer read: since
+            // D-cone-8 the branch turns the whole circle, and since D-fan-1
+            // (v0.5.72) the step is `360/k` of *each fan*, which only the
+            // render knows (the server still emits both, unread).
             // Where each node sits, and whether it is on the live path: the
             // connectors are drawn from the parent's dot, and an edge is lit
             // by the child's state (D1 — the *path* is highlighted, so the
@@ -1176,6 +1176,18 @@ fn flow_scene(state: AppState) -> AnyView {
                 .or_else(|| t.current_seq.and_then(|s| fin_of.get(&s).copied()))
                 .and_then(|i| top.get(&i).copied())
                 .unwrap_or_else(|| roots.first().copied().unwrap_or(0));
+            // D-fan-1/2 (user decision, v0.5.72): the angle a branch gets is
+            // `360/k` of **its own fan**, and the rank it holds there — the
+            // server's `fin` is global over the session, and the root fan of
+            // the live fixture holds {0, 2, 3}, not {0, 1, 2}. The aligned
+            // branch is a *rank* too, so at rest it points straight up.
+            let root_k = roots.len();
+            let align_rank = roots.iter().position(|&x| x == align).unwrap_or(0) as i32;
+            let root_step = fan_step(root_k, false);
+            let root_theta =
+                |i: u32| fan_root_theta(roots.iter().position(|&x| x == i).unwrap_or(0) as i32,
+                                        align_rank,
+                                        root_k);
 
             let cone = Cone {
                 state,
@@ -1184,11 +1196,17 @@ fn flow_scene(state: AppState) -> AnyView {
                 by_fin: &by_fin,
                 parent_of: &parent_of,
                 kids: &kids,
-                step: f.orbit.step_deg.max(1),
             };
             let fins: Vec<AnyView> = roots
                 .iter()
-                .map(|&i| cone.branch(i, 0, 0, i as i32, i as i32, 0, 1.0, 0))
+                .map(|&i| {
+                    // the `--align` rotation and the angles are the render's
+                    // now (D-fan-1): a root's `--rdeg` is its own angle, which
+                    // every container below it re-reads as its absolute turn.
+                    let theta = root_theta(i);
+                    let rank = roots.iter().position(|&x| x == i).unwrap_or(0) as u32;
+                    cone.branch(i, 0, 0, rank, root_step, theta, theta, 0.0, 1.0, 0)
+                })
                 .collect();
 
             let trunk_nodes: Vec<AnyView> = f
@@ -1295,7 +1313,7 @@ fn flow_scene(state: AppState) -> AnyView {
                     <div
                         id="rw-flow-track"
                         style=format!(
-                            "--cols:{cells}; --lanes:{lanes}; --align:{align}; --step:{step}",
+                            "--cols:{cells}; --lanes:{lanes}",
                         )
                     >
                         <div class="rw3-grid">
@@ -1337,6 +1355,82 @@ fn spine_bar(d0: usize, n: usize, dx: u64, live: bool) -> AnyView {
     .into_any()
 }
 
+/// How close to `±90°` a branch may come before the fan is nudged: `cos a` is
+/// what is left of the ray's projected length, and at 5° off the camera's axis
+/// there is almost nothing of it (the beads land on the trunk row — measured
+/// at the N=4 spacing: an edge-on bead sat 1.7px from a trunk bead).
+const FAN_EDGE_ON: f64 = 0.087;
+
+/// The angular spacing of a fan of `k` branches (plan §13.9, D-fan-1): the
+/// branches of **one parent** share the full circle evenly — `360/k` apart —
+/// instead of the fixed 30° step, so a fan never crowds. A nested fan caps its
+/// spread at 120° (D-fan-4).
+fn fan_step(k: usize, nested: bool) -> f64 {
+    if k == 0 {
+        return 0.0;
+    }
+    let step = 360.0 / k as f64;
+    if nested {
+        step.min(120.0)
+    } else {
+        step
+    }
+}
+
+/// The angle of a **root** fan's branch at `rank`, with the aligned branch at
+/// rank `align`: measured in steps from the front, signed, plus the nudge.
+///
+/// **D-fan-3 (user decision, v0.5.72)**: a 0-based fan puts a branch *exactly*
+/// on ±90 (edge-on: the ray's screen offset is `-q·cos a`, so it loses all of
+/// its projected length and its beads sit on the trunk row) when `k` is a
+/// multiple of 4 — and only then, since 90°/step = k/4. In that one case the
+/// whole fan is nudged by **half a step** (`k = 4` → ±45°/±135° instead of
+/// 0°/90°/180°/270°), at the price of no branch pointing straight up. Half a
+/// step is safe for every multiple of 4: the nudged ranks are odd multiples of
+/// the half step, so 90 and 0 are both out of reach.
+fn fan_root_theta(rank: i32, align: i32, k: usize) -> f64 {
+    if k == 0 {
+        return 0.0;
+    }
+    let k = k as i32;
+    let mut d = (rank - align) % k;
+    if d < 0 {
+        d += k;
+    }
+    if d * 2 > k {
+        d -= k; // the symmetric -k/2 .. k/2, so the fan is centred on the front
+    }
+    let step = fan_step(k as usize, false);
+    let nudge = if k % 4 == 0 { step / 2.0 } else { 0.0 };
+    d as f64 * step + nudge
+}
+
+/// The angle of a **nested** fan's branch at `rank` (D-fan-4): the fan is
+/// centred on 180° — opposite the parent's own ray, so no child ever runs along
+/// its parent's line (D-cone-7 measured a +30° child hiding 4.5px behind its
+/// parent's next bead) — and its spread is capped at 120°. A lone child is
+/// therefore straight below its parent.
+///
+/// The singular ±90 can reappear for some fan sizes (6, 10, 14, … children) and
+/// is nudged by a **quarter** step: half a step would move a child onto the
+/// parent's own ray, and a quarter step is off both (180/h even in every such
+/// case, so no nudged rank reaches ±90 or 0 either).
+fn fan_nested_theta(rank: usize, k: usize) -> f64 {
+    if k == 0 {
+        return 0.0;
+    }
+    let step = fan_step(k, true);
+    let at = |j: usize, shift: f64| {
+        180.0 + (j as f64 - (k as f64 - 1.0) / 2.0) * step + shift
+    };
+    let nudge = if (0..k).any(|j| at(j, 0.0).to_radians().cos().abs() < FAN_EDGE_ON) {
+        step / 4.0
+    } else {
+        0.0
+    };
+    at(rank, nudge)
+}
+
 /// The cone renderer (plan §13). One method, recursing down the branch
 /// *forest*, so a fork off a branch knows its parent's bead and every branch
 /// keeps one straight ray leaving it.
@@ -1347,8 +1441,6 @@ struct Cone<'a> {
     by_fin: &'a HashMap<u32, &'a FlowBranch>,
     parent_of: &'a HashMap<u64, u64>,
     kids: &'a HashMap<u32, Vec<u32>>,
-    /// The server's ring step, for the static part of a nested chain.
-    step: i32,
 }
 
 /// Style B's flat projection shrinks a branch's outward step by this factor
@@ -1365,20 +1457,25 @@ impl Cone<'_> {
     ///
     /// `outer` is the hinge of the container this one lives in (0 when it
     /// lives on the trunk) and `po` its parent bead's step inside that
-    /// container; `slot` is the angle it takes. `sroot` is the slot of the
-    /// topmost trunk-parented ancestor and `sum` the static part of the
-    /// nesting chain — together they give the plane's *absolute* angle, which
-    /// a bead needs to counter-rotate (the CSS cannot add an ancestor's own
-    /// variable to its own without a cycle).
+    /// container. `rank` is this branch's rank inside **its own fan** (D-fan-2:
+    /// the server's `fin` is global over the session, a fan only holds a
+    /// subset, so the rank is what the angles are made of), `step` that fan's
+    /// spacing, and `theta` the angle the render already worked out. `rdeg` is
+    /// the **topmost trunk-parented ancestor's** angle and `sum` the static part
+    /// of the nesting chain — together they give the plane's *absolute* angle,
+    /// which a bead needs to counter-rotate (the CSS cannot add an ancestor's
+    /// own variable to its own without a cycle).
     #[allow(clippy::too_many_arguments)]
     fn branch(
         &self,
         i: u32,
         outer: u64,
         po: u32,
-        slot: i32,
-        sroot: i32,
-        sum: i32,
+        rank: u32,
+        step: f64,
+        theta: f64,
+        rdeg: f64,
+        sum: f64,
         kup: f64,
         depth: u32,
     ) -> AnyView {
@@ -1388,15 +1485,10 @@ impl Cone<'_> {
         // this container's own static flat factor (1 at the root: the root's
         // turn carries the phase, so the stylesheet reads that one from
         // `--root_a`). The children inherit it through `--kup`.
-        // D-cone-8: no clamp any more — a nested fan's slot is a real angle
-        // (two slots per child, D-cone-7) and on a cone ±120° is a place like
-        // any other, instead of a park that would land two children on top of
-        // each other.
-        let kown = if depth == 0 {
-            1.0
-        } else {
-            flat_k((slot * self.step) as f64)
-        };
+        // D-cone-8: no clamp any more — a nested fan's angle is a real angle
+        // and on a cone ±120° is a place like any other, instead of a park that
+        // would land two children on top of each other.
+        let kown = if depth == 0 { 1.0 } else { flat_k(theta) };
         let hinge = b.hinge_x;
         let seqs = &b.seqs;
         let n = seqs.len();
@@ -1434,9 +1526,10 @@ impl Cone<'_> {
             .kids
             .get(&i)
             .map(|cs| {
+                let ck = cs.len();
                 cs.iter()
                     .enumerate()
-                    .map(|(k, &c)| {
+                    .map(|(j, &c)| {
                         // the child's parent round is *this* branch's bead at
                         // that column — where the child's spine must start
                         let p = self
@@ -1446,32 +1539,26 @@ impl Cone<'_> {
                             .copied()
                             .unwrap_or(b.root);
                         let po = seqs.iter().position(|s| *s == p).map(|q| q as u32 + 1);
-                        // D-cone-7: a nested fork fans *relative to its
-                        // parent* — never a zero offset (which would lay the
-                        // child's ray on top of the parent's next bead) and
-                        // never the ring's absolute slots. The fan is **two**
-                        // slots, not one: measured on the live `rewind`
-                        // session, a +30° child put its first bead 4.5px from
-                        // the parent's own continuation bead and *behind* it
-                        // (z −16px), so the current round hid under a dead
-                        // one. ±60° separates them by ~17px and puts the first
-                        // child in front of the viewer.
-                        let slot = if k % 2 == 0 {
-                            -((k as i32) / 2 + 1) * 2
-                        } else {
-                            ((k as i32 + 1) / 2) * 2
-                        };
-                        let inner = slot * self.step;
-                        // the child's `--kup` is every *ancestor* level's
-                        // factor — this container's own included, the child's
-                        // own excluded (the child adds that itself)
+                        // **D-fan-4 (user decision, v0.5.72)**: a nested fan is
+                        // spread evenly over the full circle too, but centred on
+                        // 180 — opposite this branch's own ray — so a lone child
+                        // sits straight below its parent and never on its
+                        // parent's line. Its spread is capped at 120°.
+                        let ctheta = fan_nested_theta(j, ck);
+                        // the child's `--kup` is every *ancestor* level's factor
+                        // — this container's own included, the child's own
+                        // excluded (the child adds that itself); `sum` likewise
+                        // gains the child's own angle (the beads inside it need
+                        // the whole chain)
                         self.branch(
                             c,
                             hinge,
                             po.unwrap_or(0_u32),
-                            slot,
-                            sroot,
-                            sum + inner,
+                            j as u32,
+                            fan_step(ck, true),
+                            ctheta,
+                            rdeg,
+                            sum + ctheta,
                             kup * kown,
                             depth + 1,
                         )
@@ -1490,8 +1577,9 @@ impl Cone<'_> {
                 data-n=n.to_string()
                 data-lane=b.lane.to_string()
                 style=format!(
-                    "--slot:{slot}; --hinge:{hinge}; --ph:{outer}; --po:{po}; --n:{n}; \
-                     --dx:{dx}; --sroot:{sroot}; --sum:{sum}; \
+                    "--slot:{rank}; --step:{step:.4}; --th:{theta:.4}; \
+                     --hinge:{hinge}; --ph:{outer}; --po:{po}; --n:{n}; \
+                     --dx:{dx}; --rdeg:{rdeg:.4}; --sum:{sum:.4}; \
                      --kup:{kup:.5}; --kown:{kown:.5}",
                 )
             >
@@ -1849,4 +1937,66 @@ fn active_row(state: AppState, n: RewindNode) -> AnyView {
         </button>
     }
     .into_any()
+}
+
+#[cfg(test)]
+mod fan_angles_tests {
+    use super::*;
+
+    fn gaps(mut angles: Vec<f64>, k: usize) -> Vec<f64> {
+        if k == 1 {
+            return vec![360.0]; // one branch owns the whole circle
+        }
+        angles.iter_mut().for_each(|a| *a = a.rem_euclid(360.0));
+        angles.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        (0..k)
+            .map(|w| (angles[(w + 1) % k] - angles[w]).rem_euclid(360.0))
+            .collect()
+    }
+
+    /// **D-fan-1/2/3**: a root fan shares the full circle evenly — `360/k`
+    /// apart — so it is never the crowded 60° wedge the fixed 30° step gave a
+    /// three-branch session; the aligned rank points straight up, except for
+    /// the fan sizes (`k % 4 == 0`) whose 0-based placement would land a branch
+    /// exactly on the camera's axis, where the whole fan is nudged half a step.
+    #[test]
+    fn a_root_fan_is_even_and_never_edge_on() {
+        for k in 1..=12usize {
+            let step = fan_step(k, false);
+            assert!((step - 360.0 / k as f64).abs() < 1e-9, "k={k}");
+            let angles: Vec<f64> = (0..k as i32).map(|r| fan_root_theta(r, 0, k)).collect();
+            assert_eq!(angles[0] == 0.0, k % 4 != 0, "the front: k={k}");
+            for a in &angles {
+                assert!(
+                    a.to_radians().cos().abs() >= FAN_EDGE_ON,
+                    "edge-on: k={k} a={a}"
+                );
+            }
+            for g in gaps(angles, k) {
+                assert!((g - step).abs() < 1e-9, "k={k} gap={g}");
+            }
+        }
+    }
+
+    /// **D-fan-4**: a nested fan hangs *below* its parent — centred on 180°, so
+    /// no child ever runs along the parent's own ray (which is what hid a
+    /// +30° child behind its parent's next bead) — and it is off the camera's
+    /// axis too.
+    #[test]
+    fn a_nested_fan_hangs_below_its_parent() {
+        for k in 1..=12usize {
+            for j in 0..k {
+                let a = fan_nested_theta(j, k).rem_euclid(360.0);
+                assert!(a > 5.0 && a < 355.0, "on the parent's ray: k={k} a={a}");
+                assert!(
+                    a.to_radians().cos().abs() >= FAN_EDGE_ON,
+                    "edge-on: k={k} a={a}"
+                );
+            }
+            assert!(
+                (fan_nested_theta(0, 1) - 180.0).abs() < 1e-9,
+                "a lone child sits straight below its parent"
+            );
+        }
+    }
 }

@@ -306,7 +306,7 @@ it supersedes the earlier "list is the default"). `list` stays one click away
 and persisted under `rushi-rw-view`; Style A's probe pins that key explicitly
 so it always tests the style it means to test.
 
-### 3b.6 The cone: how the flow scene is laid out (v0.5.68 → v0.5.71)
+### 3b.6 The cone: how the flow scene is laid out (v0.5.68 → v0.5.72)
 
 The session's history stays the horizontal **axis** — the trunk, which never
 moves — and every **forking branch** is a straight **ray** leaving its
@@ -326,17 +326,39 @@ ribbon per branch").
   half gives, because a branch now reaches as far below the trunk as above it.
   One slope for the whole cone, so branches never cross. The x step stays one
   column per round (D-cone-3), so a branch never becomes a second time axis.
-* **The angle — a full circle (v0.5.71, D-cone-8).**
-  `theta = (slot − align) × 30° + (scroll − rest) × (360°/1.5·width)`, then
+* **The angle — a full circle (v0.5.71, D-cone-8), shared evenly (v0.5.72,
+  D-fan-1..4).**
+  `theta = <the branch's own angle> + (scroll − rest) × (360°/1.5·width)`, then
   **wrapped**: `a = mod(theta + 180, 360) − 180`, in plain CSS `calc()`. A
   branch can therefore point anywhere on the cone — up, sideways, into the
   screen, straight down — and 360° of turning brings it back exactly where it
   started, for ever. This replaced v0.5.68–70's **bounded arc** (±60°, with
   the extra branches *parked* at its ends: clamped, pushed back in depth and
   faded), which is why branches used to be drawn only *above* their parent and
-  used to slide out of sight when a scene was turned too far. Every branch is
-  always on the cone now, 30° apart. Scrolling still moves exactly one value
-  (`--rw-scroll`); everything else is written at layout time.
+  used to slide out of sight when a scene was turned too far. Scrolling still
+  moves exactly one value (`--rw-scroll`); everything else is written at layout
+  time.
+  The branch's own angle is an **even split of the full circle**: every *fan*
+  — the branches leaving the trunk, and separately each branch's own children —
+  gives its members `360/k` each, so three branches sit 120° apart instead of
+  wedging into 30/60/90 (measured on the live session: branch beads landing on
+  top of trunk beads **7 → 1**, overlapping bead pairs **8 → 2**). An angle
+  therefore belongs to a **fan**, not to the session: the server's `fin` numbers
+  every branch of the session (the live root fan holds `{0, 2, 3}`), so each
+  container carries its *rank inside its own fan* and the render works the
+  angle out and writes it as degrees (`--th`, and `--rdeg` for the top
+  ancestor, which is what `--abs` needs) — the stylesheet no longer derives an
+  angle from a slot and one global step (both left it). The aligned branch
+  points straight up; the one warning is that `a = ±90°` is **edge-on** (the
+  screen offset is `−q·cos a`, so the ray loses all of its projected length and
+  its beads land on the trunk row — measured 1.7px from a trunk bead), which a
+  0-based fan hits exactly when `k` is a multiple of 4; those fans are nudged
+  half a step (±45°/±135° instead of 0/90/180/270), at the price of no branch
+  pointing up at all (the user's choice, D-fan-3). A *nested* fan is centred on
+  180° — opposite its parent's own ray, so no child ever runs along the
+  parent's line — with its spread capped at 120°, and nudged by a quarter step
+  in the few sizes where 180 ± 90 would reappear (6, 10, 14, … children);
+  a lone child sits straight below its parent.
 * **The depth cue (v0.5.71, D-cone-10).** With the park gone, the near and the
   far half of the circle share a ray, so the half pointing *away* from the
   viewer is dimmed: `--fade: 1 − 0.35·max(0, sin a)` (near 1.0, far 0.65;
@@ -345,14 +367,15 @@ ribbon per branch").
 * **A fork off a branch nests.** When a branch's parent is itself on a branch,
   its container is rendered *inside* the parent's container (D-cone-6), at
   `−po·q` along the parent's plane, so its line starts on the parent's bead
-  and it fans **relative to its parent** (`slot·30°`, with no second phase —
-  D-cone-7 as the user corrected it). Depth is unbounded, and since v0.5.71 the
-  fan is not clamped either: on a cone ±120° is a place like any other.
-* **The alignment.** `align` is the selected round's fin, else the current
-  round's fin, else 0, and the *rest* offset is re-anchored whenever the
-  layout runs, so "at rest" always means "the current branch is at the
-  front" (click a bead on a branch — nested trees included — to bring that
-  branch round).
+  and it fans **relative to its parent** (its own even split, centred below it,
+  with no second phase — D-cone-7 as the user corrected it, D-fan-4 for the
+  spread). Depth is unbounded, and since v0.5.71 the fan is not clamped either:
+  on a cone ±120° is a place like any other.
+* **The alignment.** `align` is the selected round's branch (its *top*
+  trunk-parented ancestor), else the current round's, else the first fan
+  member, and the *rest* offset is re-anchored whenever the layout runs, so
+  "at rest" always means "the current branch is at the front" (click a bead on
+  a branch — nested trees included — to bring that branch round).
 * **The driver, and why the wheel alone was not enough (v0.5.69).** The phase
   reads the scene's pan, and the scene only pans while its track is wider than
   the panel — `--cell` auto-fits, so a track of **17..45 columns fits
@@ -527,17 +550,21 @@ abandoned rounds are still rendered.
   (**71 tests green**).
 * `trunk build` — the Leptos CSR bundle.
 * `python3 e2e/orbit_probe.py` (v0.5.70, rewritten for the full circle in
-  v0.5.71) — **44 checks, own fixtures, own server**: the ray (`out = k+1`
-  steps, one column each), the one slope and its auto-fit to the smaller half
-  of the panel, the spine's span and its start on the parent's bead, the nested
-  container inside its parent, the **unbounded turn** (nothing parked, `z` push
-  always 0, |angle| past 90° and reaching 180°, and a whole 360° spent on a real
-  **wheel** returning every bead to the pixel), the depth dim being exactly
-  `1 − 0.35·sin a`, the click-to-align of a nested tree, the flat projection
-  (`scaleY` of the same rays, round dots at any depth) and
-  `prefers-reduced-motion` pinning it.
-* `python3 e2e/flow_style_b_probe.py [port]` — **66 checks** (A-I) on a live
-  server, including section H's cone shape and section C's canaries that
+  v0.5.71, extended for the even fan in v0.5.72) — **48 checks, own fixtures,
+  own server**: the ray (`out = k+1` steps, one column each), the one slope and
+  its auto-fit to the smaller half of the panel, the spine's span and its start
+  on the parent's bead, the nested container inside its parent, the **even
+  fan** (every fan's angles are `360/k` apart, none sits on the camera's axis,
+  a nested fan is centred below its parent and never on its ray, and the front
+  is straight up unless `k % 4 == 0` needed the half-step nudge), the
+  **unbounded turn** (nothing parked, `z` push always 0, |angle| past 90° and
+  reaching 180°, and a whole 360° spent on a real **wheel** returning every bead
+  to the pixel), the depth dim being exactly `1 − 0.35·sin a`, the click-to-align
+  of a nested tree, the flat projection (`scaleY` of the same rays, round dots
+  at any depth) and `prefers-reduced-motion` pinning it.
+* `python3 e2e/flow_style_b_probe.py [port]` — **68 checks** (A-I) on a live
+  server, including section H's cone shape (and H11/H12, the live root fan's
+  even split and a child hanging below its parent) and section C's canaries that
   the ribbon (`.rw-fin`) and the elbow bars (`.rw3-elbow`) are gone.
 * `python3 e2e/flow_check.py [port]` — the flow projection's invariants
   across **every session on the server** (8 sessions, 0 problems).
