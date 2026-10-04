@@ -2924,3 +2924,86 @@ the fit's reach, the probes, the docs).
    only *after* the flight, the alternative is to animate `--kof` per branch —
    more code, and it would reintroduce a (smaller) pop. **[recommended: keep the
    smooth growth]**
+
+### 16.6 As built (2026-10-05) — v0.5.74
+
+All three landed as one change. Each number below is measured on the live
+`:8480` fixture (`rewind`), on the build the tag points at.
+
+**F1 — the slope is now a function of the angle** (`style.css`): `--ql:
+calc(--q · (--kof + (1 − --kof) · max(0, cos(--abs))))`; `.rw-branch.unfocused`
+and the class are gone (`data-focus` stays, the probes and the fit read it).
+The commit frame's worst radius move is **0.20px** (was **7px**: the arriving
+branch's out=1 bead 541 → 534 under the old class flip) and the largest
+single-frame move anywhere in the flight is 6.1px, i.e. smooth. Resting sizes
+are bit-identical to v0.5.73: focused `−q` (−36.42px), lower arc `+q·kof`
+(+13.36px at ±120°). Verified by `e2e/snap_probe.py`.
+
+Two things F1 dragged in, both required for correctness:
+
+* **A nested container's offset must ride its *parent's* slope.** The child sits
+  `--po` steps along the parent's ray, so it needs the parent's `--ql` — which a
+  custom property defined on the child cannot express (a rule's own definition
+  wins on that element). The render therefore also writes **`--sum-par`** (the
+  chain's accumulated angle up to but excluding this branch), so the stylesheet
+  computes `--qlp` from `--aroot + --sum-par` — exactly the parent's angle — and
+  the nested container's `top` uses `--qlp`. Measured: the child's container
+  origin lands on the parent's fork bead at every detent (541 vs 540.6 at the
+  focused one).
+* The bead/spine rules keep reading the **local** `--ql`, so a subtree scales
+  with its own angle.
+
+**F2 — the number keeps its line**: `.rw3-node.abandoned .rw3-round { opacity:
+.6 }` (the `text-decoration` is gone). The list style's abandoned *summary*
+strike (`.rw-node.abandoned .rw-sum`) is deliberately untouched, per the user.
+A new invariant is on the record: a round number is never struck through.
+
+**F3 — the nested fan opens along its parent**: `fan_nested_theta` is a
+one-sided fan, `NESTED_BIAS_DEG` = **15°** (the *user's* 22° did not survive
+measurement — see the table in the source: at the mirrored detent a bias that
+pushes the child toward ±90° makes its plane nearly edge-on and its beads
+compress into the parent's own band; the measured safe window is 12–18°, and 15
+is its centre), `NESTED_HALF_DEG` = 25° (the user's number) and
+`NESTED_CHAIN_MAX_DEG` = 70° — a chain whose accumulated angle would overshoot
+scales its fan down (`fan_nested_theta_in`), so **|θ| < 90° at every depth** and
+the "focused subtree climbs" guarantee holds for any nesting. The fit now reads
+**`data-reach`** (the chain-absolute reach the render writes) instead of
+`data-n`, so a climbing subtree is paid for by the upper room.
+
+Measured on the fixture: with fin 0 (round 14) focused, **round 21 renders
+134px above the trunk** (was 53px below it) at 17.3–39.4px from its parent's
+beads across all four detents, and the focused branch's whole subtree is above
+the axis row at every detent. `e2e/spine_probe.py`: the nested spine's beads are
+0.8px off its line, ending at 99.5% (root branches 0.0–0.3px / 99.7%).
+
+**Probe corrections found while verifying (all pre-existing):**
+
+1. `carousel_probe.py` compared viewport bead rects against the **scene-local**
+   `--axis` px value, so every "below the axis" assertion was vacuously true;
+   the sampler now computes the axis in the same coordinates
+   (`scRect.y + --axis`), and S1/F3 are real checks.
+2. The same probe's `below` set did not exclude the **focused** branch's beads
+   (they are *supposed* to be above), and its old `b.fin !== 'trunk'` filter
+   never matched — the focused set is now filtered by the container's focus.
+3. `spine_probe.py` projected beads onto an arbitrary bbox diagonal — the *wrong*
+   one for an up-right bar (154px of phantom error). It now scores both
+   diagonals and takes the fit, and scopes beads to `:scope > .rw3-node`.
+4. `flow_style_b_probe.py`'s H12 asserted D-fan-4 (a child at 90–270°) but the
+   fixture it runs on has no nested fan, so it passed vacuously; it now asserts
+   the F3 law (0 < |θ| < 90) and says where the real proof lives.
+5. `snap_probe.py` (new) is F1's check — the commit frame's radius continuity.
+
+**Verification (all green, live, 2026-10-05, v0.5.74):** `carousel_probe 8480
+rewind` **0 failed** (S1–S6 + the two new F3 checks at all four detents);
+`snap_probe` **PASS** (0.20px); `spine_probe` 0.0–0.8px, 99.5–99.7%;
+`flow_style_b_probe` **68/0**; `flow_check` **8/0**; `rewind_probe` **140 PASS**;
+`cargo test -p rushi-web` **71 passed**; wasm check + `trunk build` clean; the
+extracted native law tests **3 passed** (including the new
+`a_focused_subtree_always_climbs`).
+
+**Open, recorded:** the K3 mirror pair of the two one-bead lower branches
+(**9.1px**, `fin2 r22 × fin3 r23`) is unchanged — it is the symmetric arc's own
+problem (§15.9) and no round-5 change touches it; `NESTED_HALF_DEG` = 25° means
+a nested fan of 3+ children would spread into the 15–40° band, where the
+clearance measurement only covers the 15° edge (no live session has one);
+`k ≥ 4` roots stays unexercised.

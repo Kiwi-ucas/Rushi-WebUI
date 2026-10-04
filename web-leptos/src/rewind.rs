@@ -460,8 +460,15 @@ fn sync_scene_metrics() {
     // Every branch shares one slope, and the *longest* branch sets it: with the
     // axis low, the focused branch's farthest bead spends the whole upper room
     // (D-cone-8/9's auto-fit, now asymmetric). The length is read back off the
-    // DOM (each container carries `data-n`), so the slope stays a layout-time
-    // pixel value and the CSS keeps owning the cell.
+    // DOM, so the slope stays a layout-time pixel value and the CSS keeps
+    // owning the cell.
+    //
+    // **F3 (round 5, §16.3)**: the number read is `data-reach`, **not**
+    // `data-n`. `data-n` is a branch's *own* reach; a nested branch's distance
+    // from the trunk is its ancestors' `po` on top of that. While a nested child
+    // pointed *down* that error hid in the generous lower room, but a subtree
+    // that climbs (F3) has to fit the *upper* room, so the fit must see the
+    // chain. For a root the two attributes are equal.
     let longest = doc
         .query_selector_all(".rw-branch")
         .ok()
@@ -469,7 +476,10 @@ fn sync_scene_metrics() {
             (0..list.length())
                 .filter_map(|i| list.item(i))
                 .filter_map(|n| n.dyn_into::<web_sys::Element>().ok())
-                .filter_map(|el| el.get_attribute("data-n"))
+                .filter_map(|el| {
+                    el.get_attribute("data-reach")
+                        .or_else(|| el.get_attribute("data-n"))
+                })
                 .filter_map(|s| s.parse::<f64>().ok())
                 .fold(0.0_f64, f64::max)
         })
@@ -1433,7 +1443,7 @@ fn flow_scene(state: AppState) -> AnyView {
                     // every container below it re-reads as its absolute turn.
                     let theta = root_theta(i);
                     let rank = roots.iter().position(|&x| x == i).unwrap_or(0) as u32;
-                    cone.branch(i, 0, 0, rank, root_step, theta, theta, 0.0, 1.0, 0)
+                    cone.branch(i, 0, 0, rank, root_step, theta, theta, 0.0, 1.0, 0, 0)
                 })
                 .collect();
 
@@ -1673,45 +1683,94 @@ fn fan_root_theta(rank: i32, focus: i32, k: usize) -> f64 {
 
 /// The angular spacing of a fan of `k` branches (plan §13.9, D-fan-1): the
 /// branches of **one parent** share the full circle evenly — `360/k` apart —
-/// instead of the fixed 30° step, so a fan never crowds. A nested fan caps its
-/// spread at 120° (D-fan-4). Written on the container as `--step` for the
-/// stylesheet's benefit; the render is the only thing that reads it.
+/// instead of the fixed 30° step, so a fan never crowds. A **nested** fan is a
+/// small cone instead (§16.3, F3): `2·NESTED_HALF/k`. Written on the container
+/// as `--step` for the stylesheet's benefit; the render is the only thing that
+/// reads it.
 fn fan_step(k: usize, nested: bool) -> f64 {
     if k == 0 {
         return 0.0;
     }
-    let step = 360.0 / k as f64;
     if nested {
-        step.min(120.0)
+        NESTED_HALF_DEG / (k as f64 - 1.0).max(1.0)
     } else {
-        step
+        360.0 / k as f64
     }
 }
 
-/// The angle of a **nested** fan's branch at `rank` (D-fan-4): the fan is
-/// centred on 180° — opposite the parent's own ray, so no child ever runs along
-/// its parent's line (D-cone-7 measured a +30° child hiding 4.5px behind its
-/// parent's next bead) — and its spread is capped at 120°. A lone child is
-/// therefore straight below its parent.
+/// **Round 5, F3 (plan §16.3)**: how far a **nested** fan's nearest child sits
+/// off its parent's own direction. Zero would put a lone child *along* the
+/// parent's ray — its spine drawn on top of the parent's for their common
+/// length — so the fan is biased away by this much while staying far inside the
+/// guarantee below.
 ///
-/// The singular ±90 can reappear for some fan sizes (6, 10, 14, … children) and
-/// is nudged by a **quarter** step: half a step would move a child onto the
-/// parent's own ray, and a quarter step is off both (180/h even in every such
-/// case, so no nudged rank reaches ±90 or 0 either).
+/// **The number is measured, not chosen** (the user's initial 20–25° does not
+/// survive the fixture). A nested child's own absolute angle is its parent's
+/// ± its bias, so at the *mirrored* detent (parent at ±120°) the bias pushes
+/// the child toward ±90°, where its plane is nearly edge-on and its beads
+/// compress into its parent's own band (~15px apart there) — a measured
+/// collision. Sweeping the rendered angle on the live fixture (`--th` on the
+/// nested container, all four detents) gives a **safe window of 12–18°**:
+///
+/// | θn | detent 0 (parent focused) | detent 1 (parent +120) | detent 2 (parent −120) |
+/// |----|------|------|------|
+/// | 10 | 40.6 | 12.3 ✗ | 24.1 |
+/// | **15** | **37.9** | **18.1** | **17.3** |
+/// | 18 | 36.1 | 21.5 | 13.7 |
+/// | 20 | 34.7 | 23.7 | 11.8 ✗ |
+/// | 22 | 33.3 | 25.8 | 10.6 ✗ |
+///
+/// 15 is the window's centre (13–18px of clearance everywhere). It still does
+/// what the user asked for — a visible fork, never collinear with the parent.
+const NESTED_BIAS_DEG: f64 = 15.0;
+/// **F3**: how wide a nested fan is — its farthest child sits that much further
+/// off its parent's ray than its nearest one (the user's "二级子分支的圆锥面角度
+/// 可以小一点"). Supersedes D-fan-4, which centred the fan on 180° — "opposite
+/// the parent" — and therefore sent a *focused* parent's child straight down
+/// through the trunk (measured 53px below it, at every detent).
+const NESTED_HALF_DEG: f64 = 25.0;
+/// **F3**: the hard ceiling on a nested **chain's** accumulated angle — the sum
+/// of every relative angle from the focused branch down to the deepest
+/// descendant. This is what makes "the whole focused subtree is above the
+/// trunk" hold **at any depth**: while the sum stays below 90° every level's
+/// `cos` is positive, so every step climbs. A fan whose raw angles would
+/// overshoot the remaining budget is scaled down to fit it (see
+/// `fan_nested_theta_in`), so a deep chain narrows its cones instead of
+/// steering a subtree back through the trunk.
+const NESTED_CHAIN_MAX_DEG: f64 = 70.0;
+/// The nested fan's raw angle for rank `j`: **one-sided** — the nearest child
+/// `NESTED_BIAS_DEG` off its parent's own ray (never *on* it, which would draw
+/// its spine over its parent's), the farthest `NESTED_BIAS_DEG +
+/// NESTED_HALF_DEG` off. A lone child takes the inner position.
 fn fan_nested_theta(rank: usize, k: usize) -> f64 {
     if k == 0 {
         return 0.0;
     }
-    let step = fan_step(k, true);
-    let at = |j: usize, shift: f64| {
-        180.0 + (j as f64 - (k as f64 - 1.0) / 2.0) * step + shift
-    };
-    let nudge = if (0..k).any(|j| at(j, 0.0).to_radians().cos().abs() < FAN_EDGE_ON) {
-        step / 4.0
+    if k == 1 {
+        return NESTED_BIAS_DEG;
+    }
+    NESTED_BIAS_DEG + rank as f64 * NESTED_HALF_DEG / (k as f64 - 1.0)
+}
+
+/// The nested angle **as rendered**: `fan_nested_theta`, scaled down when the
+/// chain's accumulated angle (`sum` — the parent chain's relative angles, which
+/// is exactly what the render passes down) has already spent the budget.
+/// Scaling (rather than clamping each angle) keeps the fan's shape; at the
+/// normal depth (1) `sum` is 0 and the scale is exactly 1, so the rendered
+/// angles are the raw ones.
+fn fan_nested_theta_in(rank: usize, k: usize, sum: f64) -> f64 {
+    let raw = fan_nested_theta(rank, k);
+    let widest = if k > 1 {
+        NESTED_BIAS_DEG + NESTED_HALF_DEG
     } else {
-        0.0
+        NESTED_BIAS_DEG
     };
-    at(rank, nudge)
+    let left = NESTED_CHAIN_MAX_DEG - sum;
+    if left >= widest || widest <= 0.0 {
+        raw
+    } else {
+        raw * (left.max(0.0) / widest)
+    }
 }
 
 /// The cone renderer (plan §13). One method, recursing down the branch
@@ -1754,6 +1813,7 @@ impl Cone<'_> {
     /// which a bead needs to counter-rotate (the CSS cannot add an ancestor's
     /// own variable to its own without a cycle).
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn branch(
         &self,
         i: u32,
@@ -1766,6 +1826,10 @@ impl Cone<'_> {
         sum: f64,
         kup: f64,
         depth: u32,
+        // **F3**: how many steps this container's own origin sits from the
+        // trunk — its ancestors' `po` summed. A root is on the trunk (0); a
+        // nested container is `po` further along its parent's ray.
+        reach: u32,
     ) -> AnyView {
         let Some(b) = self.by_fin.get(&i).copied() else {
             return view! { <div></div> }.into_any();
@@ -1860,12 +1924,13 @@ impl Cone<'_> {
                             .copied()
                             .unwrap_or(b.root);
                         let po = seqs.iter().position(|s| *s == p).map(|q| q as u32 + 1);
-                        // **D-fan-4 (user decision, v0.5.72)**: a nested fan is
-                        // spread evenly over the full circle too, but centred on
-                        // 180 — opposite this branch's own ray — so a lone child
-                        // sits straight below its parent and never on its
-                        // parent's line. Its spread is capped at 120°.
-                        let ctheta = fan_nested_theta(j, ck);
+                        // **F3 (round 5, supersedes D-fan-4)**: a nested fan is
+                        // a *small one-sided cone* opening **along** this
+                        // branch's own ray, biased off it and scaled to the
+                        // chain's remaining angle budget — so a focused
+                        // branch's whole subtree keeps climbing away from the
+                        // trunk, at any depth.
+                        let ctheta = fan_nested_theta_in(j, ck, sum);
                         // the child's `--kup` is every *ancestor* level's factor
                         // — this container's own included, the child's own
                         // excluded (the child adds that itself); `sum` likewise
@@ -1882,6 +1947,7 @@ impl Cone<'_> {
                             sum + ctheta,
                             kup * kown,
                             depth + 1,
+                            reach + po.unwrap_or(0_u32),
                         )
                     })
                     .collect()
@@ -1891,15 +1957,14 @@ impl Cone<'_> {
         // carries the phase, so the stylesheet reads it from `--root_a`)
         //
         // **v0.5.73 (plan §15)**: only the root containers take part in the
-        // focus carousel — `data-focus` and `.unfocused` are what the fit reads
-        // and what the stylesheet scales (D-snap-5/8).
+        // focus carousel, and **v0.5.73 §16.1 (F1)** made the *scale* a
+        // continuous function of the branch's own angle instead of a class —
+        // `data-focus` is still written (the probes and the fit read it) but no
+        // `.unfocused` rule exists any more, so nothing about a branch's size
+        // can flip discretely when the focus moves.
         let is_root = depth == 0;
         let focused = is_root && i == self.focus_fin;
-        let cls = if is_root && !focused {
-            "rw-branch unfocused"
-        } else {
-            "rw-branch"
-        };
+        let cls = "rw-branch";
         view! {
             <div
                 class=cls
@@ -1907,6 +1972,7 @@ impl Cone<'_> {
                 data-root=b.root.to_string()
                 data-hinge=hinge.to_string()
                 data-n=n_eff.to_string()
+                data-reach=(reach + n_eff as u32).to_string()
                 data-lane=b.lane.to_string()
                 data-depth=depth.to_string()
                 data-focus=if focused { "1" } else { "0" }
@@ -1915,6 +1981,7 @@ impl Cone<'_> {
                     "--slot:{rank}; --step:{step:.4}; --th:{theta:.4}; \
                      --hinge:{hinge}; --ph:{outer}; --po:{po}; --n:{n}; \
                      --dx:{dx}; --rdeg:{rdeg:.4}; --sum:{sum:.4}; \
+                     --sum-par:{sum:.4}; \
                      --kup:{kup:.5}; --kown:{kown:.5}",
                 )
             >
@@ -2331,27 +2398,58 @@ mod fan_angles_tests {
         assert_eq!(wrap180(fan_root_theta(2, 0, 3)), 120.0);
     }
 
-    /// **D-fan-4**: a nested fan hangs *below* its parent — centred on 180°, so
-    /// no child ever runs along the parent's own ray (which is what hid a
-    /// +30° child behind its parent's next bead) — and it is off the camera's
-    /// axis too.
+    /// **F3 (round 5, supersedes D-fan-4)**: a nested fan opens **along** its
+    /// parent — a small cone, biased off the parent's own ray. That is the
+    /// structural guarantee the user asked for: with a focused parent at
+    /// `abs = 0`, **every** descendant's `cos > 0`, so the whole subtree climbs
+    /// away from the trunk at any depth and for any number of children. A child
+    /// *on* the parent's ray (θ = 0) is excluded too — its spine would be drawn
+    /// on top of its parent's.
     #[test]
-    fn a_nested_fan_hangs_below_its_parent() {
+    fn a_nested_fan_opens_along_its_parent() {
         for k in 1..=12usize {
-            let step = fan_step(k, true);
-            assert!((step - (360.0 / k as f64).min(120.0)).abs() < 1e-9, "k={k}");
             for j in 0..k {
-                let a = fan_nested_theta(j, k).rem_euclid(360.0);
-                assert!(a > 5.0 && a < 355.0, "on the parent's ray: k={k} a={a}");
+                let a = fan_nested_theta(j, k);
+                // strictly off the parent's ray and strictly inside ±90
+                assert!(a >= NESTED_BIAS_DEG, "on the parent's ray: k={k} a={a}");
                 assert!(
-                    a.to_radians().cos().abs() >= FAN_EDGE_ON,
-                    "edge-on: k={k} a={a}"
+                    a <= NESTED_BIAS_DEG + NESTED_HALF_DEG,
+                    "wider than the cone: k={k} a={a}"
                 );
+                assert!(a.to_radians().cos() > FAN_EDGE_ON, "edge-on: k={k} a={a}");
             }
-            assert!(
-                (fan_nested_theta(0, 1) - 180.0).abs() < 1e-9,
-                "a lone child sits straight below its parent"
-            );
+        }
+        assert!(
+            (fan_nested_theta(0, 1) - NESTED_BIAS_DEG).abs() < 1e-9,
+            "a lone child sits just off its parent's ray"
+        );
+    }
+
+    /// **F3's whole point** (the user's "无论有多少节点和子分支都应被渲染在主干
+    /// 上方"): a focused branch's subtree climbs at **every** level, however deep
+    /// and however many children each level has. The render's law is
+    /// `fan_nested_theta_in`, so this walks a worst-case chain — every level
+    /// taking its *widest* child — and asserts the accumulated angle stays under
+    /// `NESTED_CHAIN_MAX_DEG`, i.e. strictly under 90°, at every depth: `cos > 0`
+    /// all the way down, so nothing in the subtree can ever point back across
+    /// the trunk.
+    #[test]
+    fn a_focused_subtree_always_climbs() {
+        for k in 1..=12usize {
+            let widest_rank = k - 1;
+            for depth in 1..=8 {
+                let mut sum = 0.0_f64;
+                for _ in 0..depth {
+                    let a = fan_nested_theta_in(widest_rank, k, sum);
+                    assert!(a >= 0.0, "the fan went backwards: k={k} sum={sum}");
+                    sum += a;
+                    assert!(
+                        sum < NESTED_CHAIN_MAX_DEG + 1e-9,
+                        "chain over budget: k={k} depth={depth} sum={sum}"
+                    );
+                    assert!(sum.to_radians().cos() > 0.0, "points back down: k={k}");
+                }
+            }
         }
     }
 }

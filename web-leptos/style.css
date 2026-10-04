@@ -1823,7 +1823,11 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
 .rw3-node:hover .rw3-dot { box-shadow: var(--shadow-hover); }
 .rw3-node.off .rw3-dot { background: var(--text-muted); opacity: .6; box-shadow: none; }
 .rw3-node.abandoned .rw3-dot { background: var(--text-muted); opacity: .45; box-shadow: none; }
-.rw3-node.abandoned .rw3-round { opacity: .6; text-decoration: line-through; }
+/* **F2 (round 5, user rule)**: the round *number* is never struck through —
+   the line made the digits unreadable. "Abandoned" is carried by the muted
+   colour and the dimmed opacity above, plus the grey dot; prose (a summary)
+   may still be struck, a number may not. */
+.rw3-node.abandoned .rw3-round { opacity: .6; }
 .rw3-node.current .rw3-dot { outline: 2px solid var(--accent); outline-offset: 3px; }
 .rw3-node.current .rw3-round { color: var(--accent); }
 .rw3-node.selected .rw3-dot { background: var(--accent2); outline: 2px solid var(--accent2); outline-offset: 3px; box-shadow: var(--shadow-hover); }
@@ -1936,15 +1940,36 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
      dot round. Cosine is periodic, so the wrapped angle is the right one. */
   --aroot: calc(mod(calc(var(--root_a, 0) + 180), 360) - 180);
   --kroot: calc(cos(calc(var(--aroot, 0) * 1deg)) - 0.12 * sin(calc(var(--aroot, 0) * 1deg)));
-  /* **v0.5.73 (plan §15.3, D-snap-5)**: the slope this branch's own beads ride
-     on. It is `--q` (the layout's shared slope) for the focused branch, and
-     `--q · --kof` for an unfocused one, so the lower branches shrink into the
-     room below the trunk — their *positions*, their spine and their depth all
-     scale together, while every dot stays exactly 13px (nothing scales an
+  /* **v0.5.73 (plan §15.3, D-snap-5) → round 5, §16.1 (F1)**: the slope this
+     branch's own beads ride on — `--q` (the layout's shared slope) on top,
+     `--q · --kof` for a branch in the lower half, so the lower rods shrink into
+     the room below the trunk. Their *positions*, their spine and their depth
+     all scale together, while every dot stays exactly 13px (nothing scales an
      element: only the step does), which is what keeps them readable and
-     clickable (S5). A nested fan inherits its root's slope, so a whole subtree
-     recedes as one. */
-  --ql: var(--q, 0px);
+     clickable (S5).
+     **F1 made it a continuous function of the branch's own *angle* instead of
+     the focus class.** With the old `--ql: var(--q)` plus an
+     `.rw-branch.unfocused { --ql: q·kof }` override, the arriving branch's
+     radius *jumped* 22% in the one frame the focus class flipped at the end of
+     a snap — the "flash", and why a branch landed near rather than on the
+     flight's end (measured: its out=1 bead 541 → 534px). `cos(--abs)` is 1 at
+     the top, ≤ 0 for everything in the lower half (so `max(0, …)` pins those to
+     `q·kof` exactly as before: at rest nothing changes) and smooth in between,
+     so the flight and the growth move together and the commit is invisible. A
+     nested fan's `--abs` is its own absolute angle, so a subtree scales like
+     the branch that carries it. */
+  --ql: calc(var(--q, 0px) * (var(--kof, 1) + (1 - var(--kof, 1)) * max(0, cos(calc(var(--abs, 0) * 1deg)))));
+  /* **F1, the other half**: a nested container has to sit *on its parent's
+     bead*, and that offset is measured in the **parent's** steps — so it needs
+     the parent's slope, not its own (`--ql` above would be its own, since a
+     custom property defined in a rule always wins on that element). The render
+     therefore also writes `--sum-par`, the chain's accumulated angle *up to but
+     excluding* this branch, so `--aroot + --sum-par` is exactly the parent's
+     absolute angle and `--qlp` is exactly the parent's step. The two agree at
+     every detent (both are outside ±90 or both on top); during a flight this is
+     what keeps the child glued to its parent's bead. Root branches have
+     `--po: 0` and never read it. */
+  --qlp: calc(var(--q, 0px) * (var(--kof, 1) + (1 - var(--kof, 1)) * max(0, cos(calc((var(--aroot, 0) + var(--sum-par, 0)) * 1deg)))));
   /* **D-snap-9 / §14.4 B (user decision)**: the cone's opening leans **up and
      to the right** — a roll of this branch's own plane about the view axis, so
      the trunk stays exactly horizontal (C1) and the branch's far end runs up
@@ -1953,11 +1978,10 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
      it with `cos ψ` (4.5px on the live panel). */
   transform: rotateZ(calc(var(--roll, 0) * 1deg)) rotateX(calc(var(--a) * 1deg));
 }
-/* an **unfocused** branch of the root fan: the lower half of the cone. It takes
-   the smaller slope above; `--kof` is the fit's answer (1 … FAN_MIN_SCALE). */
-.rw-branch.unfocused {
-  --ql: calc(var(--q, 0px) * var(--kof, 1));
-}
+/* (F1 removed this rule's selector: `.rw-branch.unfocused` used to carry the
+   smaller slope. There is no focus-keyed size any more — the class itself is
+   gone from the render, only `data-focus` remains, which the probes and the
+   fit read.) */
 /* a branch of a branch (D-cone-6/7, D-fan-4): its container sits on its
    parent's bead inside the parent's container, and it turns by its own angle
    only — the render's `--th`, which for a nested fan is spread over the full
@@ -1967,12 +1991,13 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
    fan turn at double the scroll rate. */
 .rw-branch .rw-branch {
   left: calc((var(--hinge, 0) - var(--ph, 0)) * var(--cell));
-  top: calc(-1 * var(--po, 0) * var(--ql, var(--q, 0px)));
+  top: calc(-1 * var(--po, 0) * var(--qlp, var(--q, 0px)));
   --eff: var(--theta);
   /* **v0.5.73**: unlike its parent, a nested container carries **no roll** —
-     the roll belongs to the root plane and would otherwise compose twice — and
-     it keeps the slope it inherited (`--ql`, which a nested fan does *not*
-     re-derive). */
+     the roll belongs to the root plane and would otherwise compose twice.
+     Its slope is its **own** `--ql` (F1 derives it from `--abs`, the nested
+     branch's own absolute angle), so a focused branch's subtree keeps its full
+     step instead of receding with a remote ancestor. */
   transform: rotateX(calc(var(--a) * 1deg));
 }
 

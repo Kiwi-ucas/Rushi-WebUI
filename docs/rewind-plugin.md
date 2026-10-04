@@ -1,10 +1,12 @@
 # Rewind plugin — the history tree
 
 Status: **implemented** (P1–P7, the v0.5.56b/v0.5.57 additions, and
-**Style B — the flow scene**, v0.5.63–v0.5.73, of
+**Style B — the flow scene**, v0.5.63–v0.5.74, of
 `rewind-plugin-plan.md`; §10 there is the plan, and §10.8/§12.9/§13.6/§13.8/
-§14/§15 the as-built records — §15 is **the focus carousel**, v0.5.73's
-current shape). UI text is English.
+§14/§15/§16 the as-built records — §15 is **the focus carousel** (v0.5.73) and
+§16 is **round 5** (v0.5.74: the snap's commit is now continuous, an abandoned
+number is never struck through, and a nested fan opens *along* its parent so a
+focused branch's whole subtree climbs above the trunk). UI text is English.
 
 The rewind plugin lets a user rewind a conversation to any earlier user
 message **without losing anything**: every branch stays in the same
@@ -343,10 +345,19 @@ ribbon per branch").
 * **The fit is asymmetric (v0.5.73, D-snap-5).** The axis sits at
   **0.68·h**; `q = (axis − margin − dot/2) / longest branch` (36.5px on the
   live 418px panel, **+42%** on the old 25.7px), and an unfocused branch rides
-  a smaller slope `--ql = --q · --kof` (`--kof = 0.82` there) so the lower arcs
-  fit under the trunk. Nothing scales an *element* — only the step — so every
-  dot is still 13px: the focused branch is 13.00px by construction (`a = 0`),
-  the unfocused ones vary only with the perspective (11.7…13.2px measured).
+  a smaller slope so the lower arcs fit under the trunk. **Since round 5 the
+  step is a continuous function of the branch's own angle** —
+  `--ql = --q · (--kof + (1 − --kof)·max(0, cos a))` (`--kof = 0.82` there) —
+  rather than a focus-keyed class: at rest it is identical (1 on top, `kof` for
+  everything in the lower half, so the focused branch is `q` = 36.5px and the
+  lower arc `q·kof` = 13.4px at ±120°), but a snap's *arriving* branch now
+  grows smoothly instead of popping 22% in the frame the focus changes hands
+  (measured: the commit frame's worst radius move **0.20px**, was 7px). The fit
+  reads each branch's **chain-absolute reach** (`data-reach`: a nested branch's
+  ancestors' offsets on top of its own) so a subtree that climbs is paid for by
+  the upper room. Nothing scales an *element* — only the step — so every dot is
+  still 13px: the focused branch is 13.00px by construction (`a = 0`), the
+  unfocused ones vary only with the perspective (11.7…13.2px measured).
 * **The wheel keeps a pan fallback (v0.5.73).** A fan of **0 or 1 branch** has
   nothing to bring up (a lone branch is always the focused one — D-cone-11 is
   superseded), so there the vertical wheel pans again, through the same proxy
@@ -413,11 +424,19 @@ ribbon per branch").
   round's own state factor is multiplied into it.
 * **A fork off a branch nests.** When a branch's parent is itself on a branch,
   its container is rendered *inside* the parent's container (D-cone-6), at
-  `−po·q` along the parent's plane, so its line starts on the parent's bead
-  and it fans **relative to its parent** (its own even split, centred below it,
-  with no second phase — D-cone-7 as the user corrected it, D-fan-4 for the
-  spread). Depth is unbounded, and since v0.5.71 the fan is not clamped either:
-  on a cone ±120° is a place like any other.
+  `−po` steps along the parent's plane — the step is the **parent's** slope
+  (`--qlp`, computed from `--sum-par`; F1, round 5), so the child's origin sits
+  exactly on the parent's fork bead — and it fans **relative to its parent**,
+  with no second phase (D-cone-7 as the user corrected it).
+  **The spread is a small one-sided cone opening *along* the parent** (round 5,
+  F3 — superseding D-fan-4, which centred it on 180° and so sent a focused
+  parent's child straight down through the trunk): the nearest child is
+  `NESTED_BIAS_DEG` = 15° off the parent's ray (never *on* it — its spine would
+  be drawn over the parent's), the farthest 40°, and a chain whose accumulated
+  angle would overshoot `NESTED_CHAIN_MAX_DEG` = 70° scales its fan down, so
+  **|θ| < 90° at every depth** and a focused branch's whole subtree climbs above
+  the trunk however deep it goes. Depth is unbounded, and since v0.5.71 the fan
+  is not clamped either: on a cone ±120° is a place like any other.
 * **The alignment.** `align` is the selected round's branch (its *top*
   trunk-parented ancestor), else the current round's, else the first fan
   member, and the *rest* offset is re-anchored whenever the layout runs, so
@@ -612,26 +631,49 @@ abandoned rounds are still rendered.
   to the pixel), the depth dim being exactly `1 − 0.35·sin a`, the click-to-align
   of a nested tree, the flat projection (`scaleY` of the same rays, round dots
   at any depth) and `prefers-reduced-motion` pinning it.
-* `python3 e2e/carousel_probe.py [port] <session>` (v0.5.73, local) — **S1–S6,
-  all green** on the live fixture: at every detent the wheel walks to, exactly
-  one branch is focused, the detent phase is exactly 0, **every unfocused root
-  branch's beads are below the axis**, no branch pair coincides, the focused
-  branch's dots are exactly 13.00px and the rest are in the perspective's
-  11–16px band, the axis is `0.68·h`, `q` grew to 36.5px and `--kof` is 0.82,
-  and the walk wraps (3 notches: `fin0 → fin2 → fin3 → fin0`, always a *new*
-  branch). Its **residual-collision section is deliberately red-flagged as
-  data**: the closest pairs at the final detent are 8.3px (`fin2 r22 × fin3
-  r23` — the two one-bead lower branches are mirror images on one column, plan
-  §15.2's **K3**) and 13.9px (a branch bead against the trunk's own, clear by a
-  hair). K3 needs the staged relaxation (plan §15.7's **O-snap-0**) or an
-  x-stagger (D-snap-1b): the symmetric arc is what keeps the walk
-  jump-free, and it is *itself* what makes the mirror pair.
-* `python3 e2e/spine_probe.py [port] <session>` (v0.5.73, local) — the spine
-  still ends on its branch's last bead after the nested shift: a 7-round branch
-  is 0.1px off its own line, the last bead at 99.7% along it.
+* `python3 e2e/carousel_probe.py [port] <session>` (v0.5.73, rewritten for
+  round 5, local) — **S1–S6 + F3, all green** on the live fixture: at every
+  detent the wheel walks to, exactly one branch is focused, the detent phase is
+  exactly 0, **every unfocused root branch's beads are below the axis**, no
+  branch pair coincides, the focused branch's dots are exactly 13.00px and the
+  rest are in the perspective's 11–16px band, the axis is `0.68·h`, `q` grew to
+  36.5px and `--kof` is 0.82, and the walk wraps (3 notches: `fin0 → fin2 →
+  fin3 → fin0`, always a *new* branch).
+  **Round 5 added F3**, the user's 14 → 21 report: the **focused branch's whole
+  subtree** — its own beads and every nested fan's — must be above the axis row
+  at every detent, and the nested bead must clear its own parent's beads by
+  ≥ 13px. Both are real checks now: they measure the axis in the same
+  coordinates as the bead rects (the earlier version compared viewport rects to
+  the scene-local `--axis`, so every "below the axis" assertion was vacuously
+  true, and the same bug family left the focused branch inside the "unfocused
+  roots" set).
+  Its **residual-collision section is deliberately red-flagged as data**: the
+  closest pair at the final detent is **9.1px** (`fin2 r22 × fin3 r23` — the two
+  one-bead lower branches are mirror images on one column, plan §15.2's
+  **K3**). K3 needs the staged relaxation (plan §15.7's **O-snap-0**) or an
+  x-stagger (D-snap-1b): the symmetric arc is what keeps the walk jump-free, and
+  it is *itself* what makes the mirror pair.
+* `python3 e2e/snap_probe.py [port] <session>` (round 5 / v0.5.74, local) —
+  **the F1 check**: it arms a `requestAnimationFrame` sampler, fires one real
+  wheel notch, and reports each root branch's out=1 bead as a signed distance
+  from the axis (its *radius*) frame by frame. Across the frame the focus
+  changes hands no branch's radius may move more than 1.5px — measured
+  **0.20px** (was 7px, the class flip) — and the largest single-frame move
+  anywhere in the flight is 6.1px, i.e. smooth.
+* `python3 e2e/spine_probe.py [port] <session>` (v0.5.73, extended in round 5,
+  local) — the spine still ends on its branch's last bead after the nested
+  shift, for **root and nested branches alike**: 0.0–0.3px off the line and the
+  last bead at 99.7% for the roots, **0.8px / 99.5%** for the nested one. (It
+  now scores both diagonals of the spine's bounding box — the old version
+  assumed one, which is the *wrong* one for an up-right bar — and scopes the
+  beads to `:scope > .rw3-node`, so a nested branch's beads are no longer
+  projected onto its parent's spine.)
 * `python3 e2e/flow_style_b_probe.py [port]` — **68 checks** (A-I) on a live
-  server, including section H's cone shape (and H11/H12, the live root fan's
-  even split and a child hanging below its parent) and section C's canaries that
+  server, including section H's cone shape (H11, the live root fan's even
+  split, and H12, which now asserts the round-5 nested law — *a nested fan
+  opens along its parent, never on it*; the fixture it runs on has no nested
+  fan, so the live geometric proof is the carousel probe's F3) and section C's
+  canaries that
   the ribbon (`.rw-fin`) and the elbow bars (`.rw3-elbow`) are gone.
 * `python3 e2e/flow_check.py [port]` — the flow projection's invariants
   across **every session on the server** (8 sessions, 0 problems).
