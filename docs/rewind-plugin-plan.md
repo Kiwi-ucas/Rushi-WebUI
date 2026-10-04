@@ -2397,19 +2397,39 @@ D-cone-8/v0.5.69 was really about ("an unbounded gesture must produce an unbound
 angle"). The cone does keep rotating — between detents it is a real turn, at a detent it is at
 rest.
 
-**The win, quantified (and what it does not win).** With the inset arc **every detent is
-edge-on-free** and no two branches are mirror-symmetric about the vertical, so the whole §14.1
-K2 class (a branch's beads lying on the trunk row, 1.1-3.6px from a trunk bead at the edge-on
-phases) and the K3 mirror pair (6.1-12.6px today) **cannot occur at rest any more** — modelled
-on the live fixture at all three detents: **no edge-on branch, and the chosen angles are
-`0/120/240`**. The promotion itself must cross the edge-on zone once per snap (for the live
-fixture that is 17.2° of the 120° turn ⇒ ≈ 45ms of a 300ms animation) — a transient, not a rest
-state.
+**The win, quantified — and the three things it does not win.** Modelled on the live fixture at
+all three detents with `δ = 30`, `f = 0.72` (`q 38.9px`, the unfocused scale `s 0.65`):
 
-But **K1 does not go away**: modelled at all three detents, the nested pair `fin1 r21` ×
-`trunk r31` is still **0.0px**, because the law cannot move a lone nested child off 180° (that
-would put it on its parent's ray, D-cone-7). So the carousel is *not* a substitute for §14.3 —
-**the relaxation is what fixes the defect the user actually reported**, and it should land first.
+| detent (focused) | the angles | edge-on | closest pair **excluding** the known K1 pair |
+| --- | --- | --- | --- |
+| fin0 (rank 0) | `0 / 120 / 180 / 240` | none | **4.3px** `fin2 r22` × `fin3 r23` |
+| fin2 (rank 1) | `0 / 60 / 120 / 240` | none | **6.7px** `fin0 r14` × `fin3 r23` |
+| fin3 (rank 2) | `0 / 120 / 240 / 300` | none | **6.7px** `fin0 r14` × `fin2 r22` |
+
+* **Won:** no detent has an edge-on branch, so the §14.1 **K2** class (a branch's beads on the
+  trunk row, 1.1-3.6px from a trunk bead at the edge-on phases) is gone at rest. The promotion
+  itself still crosses the edge-on zone once per snap (17.2° of the 120° turn ⇒ ≈ 45ms of a
+  300ms animation) — a transient, not a rest state.
+* **Not won, (a):** the **K1** exact coincidence — modelled at all three detents, the nested
+  `fin1 r21` × `trunk r31` is still **0.0px**. The law cannot move a lone nested child off 180°
+  (that is its parent's ray, D-cone-7).
+* **Not won, (b):** the **K3 mirror pair comes back by construction.** "The others in the lower
+  half" *symmetric about straight-down* makes the two lower branches mirror images — and two
+  branches whose beads share a column (here fin2 and fin3 both start at column 13) then land on
+  the same row: measured today at 6.1px, modelled at **4.3px** with the unfocused scale (the
+  scale shrinks the very `cos` that separates them). So the lower half is *not* collision-free:
+  it needs either an asymmetric bias in the arc, a **column-aware** angle (a branch's angle
+  depends on which columns it owns — which is legitimate, the law is already per-fan), or the
+  relaxation.
+* **Not won, (c):** the two lower branches are also 6.7px from a *nested* bead when the aligned
+  branch is not rank 0.
+
+**Therefore the carousel and §14.3's relaxation are one change, not two.** The carousel supplies
+the *targets* (the `k` detents); the relaxation resolves what is left at each of them, so it runs
+**once per layout per detent** (`k` solves instead of one, still a few ms in wasm) and its phase
+set Φ is simply the detent set. That also *simplifies* §14.3: no 72-phase sweep is needed, the
+objective is judged at the `k` rest states — and **the relaxation should land first**, because it
+is what fixes the defect the user actually reported.
 
 **What it does not fix.** The **K1 exact coincidence** is about the *nested* case
 (`po = out`, a child of its parent's first bead) and is independent of this law: the lone nested
@@ -2455,8 +2475,10 @@ panel (`h = 418`, `longest = 7`):
 
 So `f ≈ 0.68–0.72` is the sweet spot: the focused branch grows 40–50%, and the unfocused ones
 are drawn at 0.65–0.82 with their **dots counter-scaled back to 13px** (the same trick the flat
-projection already uses, so they stay readable and clickable, and consecutive dots stay ~25–30px
-apart — no overlap). At `f = 0.80` the compression starts to squeeze the beads too close. "下方分支占用空间小" then holds *by construction*, and the scale also
+projection already uses, so they stay readable and clickable, and **consecutive** dots on one
+branch stay ~25–30px apart). At `f = 0.80` the compression starts to squeeze the beads too close.
+Note that this budget only covers *within* a branch: the *between*-branch collisions of §15.2
+are a separate constraint, and the scale makes them slightly worse, not better. "下方分支占用空间小" then holds *by construction*, and the scale also
 **doubles as the focus cue** together with the existing depth dim (D-cone-10).
 
 **The roll composes.** With the §14.4/B roll the focused branch points at the *cone's* top
@@ -2537,7 +2559,7 @@ be interruptible and the pending target recomputed).
 | --- | --- |
 | **S1** | at every detent (all `k` of them, driven by the wheel), each branch's angle is `θ_j + phase` with the focused one at `0 ± 0.5°` |
 | **S2** | at every detent, **no** branch is within 8.6° of ±90° (edge-on) — the K2 class is gone at rest |
-| **S3** | at every detent, no two beads are < 13px apart (today: 2-6 pairs, one 0.0px — this one only passes once §14.3's relaxation has moved the nested child) |
+| **S3** | at every detent, no two beads are < 13px apart — this **cannot** pass on the carousel law alone: today 2-6 pairs, modelled at the detents 4.3-6.7px between the two lower branches plus the 0.0px K1 pair. It is the *relaxation's* check (§14.3 run per detent), so S3 is the gate for shipping the two together |
 | **S4** | one small wheel notch (≤ 40px) always changes the top branch (v0.5.69's no-op rule) and the walk wraps `k → 0` |
 | **S5** | the focused branch's dot measures 13.00px and its length grows by the fit's ratio (≥ +20% at `f = 0.72`); the unfocused dots also measure 13.00px (counter-scaled) |
 | **S6** | the axis row is at `f·h` (`|Δ| < 0.5px`) and the trunk's beads stay exactly on it |
@@ -2551,6 +2573,8 @@ detent, which is exactly what it asserts.
 
 ### 15.7 Step plan (once the decisions land)
 
+0. **O-snap-0** — §14.3's relaxation, run **per detent** (it is what clears K1 and the lower
+   branches' mirror pair), on top of today's even fan.
 1. **O-snap-1** — the fan law becomes the focus carousel law (`fan_root_theta` /
    `fan_nested_theta` rewritten; the assertions in `fan_angles_tests` updated: the focused one
    at 0, the rest inside `(90+δ, 270−δ)`, `k ≤ 3` provably all-below).
@@ -2575,6 +2599,12 @@ Everything stays **client + stylesheet** — the server projection does not chan
 
 * **D-snap-1**: accept the law — focused at the top, the rest in the lower arc inset by `δ`
   (so no detent is ever edge-on)? **[recommended: yes, δ = 30°]**
+* **D-snap-1b**: the lower arc is *symmetric* today (k = 3 → 120°/240°), which is exactly what
+  makes the two lower branches mirror each other and collide (4.3px modelled). Break the
+  symmetry — (i) a fixed bias (the lower branches at 90+δ and 270−δ−b, b ≈ 15°, i.e.
+  135°/225°), (ii) a **column-aware** angle (the arc's spacing follows each branch's own
+  column span, so branches that share columns are pushed apart), (iii) leave it to the
+  relaxation? **[recommended: (iii) + (ii) as the relaxation's first move — measure both]**
 * **D-snap-2**: the wheel's new role — (a) focus the branches (the pan stays on the drag /
   horizontal delta / scrollbar), (b) keep panning + snap on settle, (c) shift+wheel pans?
   **[recommended: (a) — on the live fixture nothing is lost]**
