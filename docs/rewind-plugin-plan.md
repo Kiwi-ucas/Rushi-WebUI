@@ -2728,3 +2728,199 @@ left alone). Without this, the wheel was a **no-op on every live session but
    rule is trusted.
 4. The **hardened** relaxed-state question of §14.5 R8: with the roll off,
    nothing in the current build depends on `--roll` being non-zero.
+
+---
+
+## §16 Round 5 — the three defects the user found in v0.5.73 (2026-10-05)
+
+Reported after looking at the shipped carousel, verbatim:
+
+1. **"转动吸附到上方后，分支会闪一下然后渲染到动画停止点附近的位置"** — after a
+   branch snaps to the top it *flashes*, then renders *near* where the flight
+   stopped (i.e. not exactly where the flight ended).
+2. **"abandon 分支的数字不要用横线划掉，会导致用户看不清楚数字"** — the round
+   number of an abandoned branch must not be struck through; the line makes the
+   number unreadable.
+3. **"节点 14 到节点 21 的处理方式还是不好，14 吸附在主干上方时，21 节点被渲染
+   到了主干下方。二级子分支的圆锥面角度可以小一点，至少被聚焦的分支无论有多少
+   节点和子分支都应被渲染在主干上方"** — the 14 → 21 case is still wrong: when
+   round 14 is snapped above the trunk, round 21 (its child) renders *below*
+   the trunk. The second-level cone angle should be **smaller**, and at the very
+   least **a focused branch — however many nodes and sub-branches it has — must
+   render above the trunk**.
+
+All three are diagnosed below with live measurements; §16.4 is the order and
+the verification, §16.5 the decisions that are the user's.
+
+### 16.1 F1 — the snap's *scale* pop (the "flash")
+
+**Measured, not guessed.** A rAF sampler (`/tmp/snap_flash_probe.py`, 150 frames
+at ~16 ms over one wheel notch on the live `rewind` session) records, per frame,
+the phase, every root branch's `--th` and the screen `y` of its topmost bead.
+The flight itself is clean — the frames around the commit read:
+
+```
+t=312ms  phase=119.6   fin0*: th   0.0  top 587   fin2: th-120.0  top 541
+t=323ms  phase=119.6   fin0*: th   0.0  top 587   fin2: th-120.0  top 541
+t=331ms  phase=  0.0   fin0 : th 120.0  top 584   fin2*: th   0.0  top 534
+```
+
+The *angles* are continuous across the commit (fin0 `0 + 119.6 → 120 + 0`,
+fin2 `−120 + 119.6 → 0 + 0`: **≤ 0.4°**), which is the property §15.4 was built
+for. What is **not** continuous is the **radius**: `--ql` is keyed to the
+*focus* — `--ql: var(--q)` on a `data-focus=1` branch and `--ql: calc(var(--q) *
+var(--kof))` on `.rw-branch.unfocused` — so the branch that has just *arrived*
+jumps from `q·kof` to `q` in the single frame the class flips. On the live
+fixture: fin2's out=1 bead moves `29.9px → 36.5px` from the axis (**+6.6px**, the
+measured 541 → 534) and the departing fin0's beads shrink by the same 22%. That
+is the flash — and it is exactly why the branch lands *near* the flight's end
+point instead of *on* it: the flight moves the angle; the class flip then moves
+the radius.
+
+**Fix F1 — the slope becomes a function of the angle, never of the focus.**
+`--abs` already holds every branch's *absolute* angle (root or nested, phase
+included), so:
+
+```css
+--ql: calc(var(--q) * (var(--kof) + (1 - var(--kof)) * max(0, cos(var(--abs) * 1deg))));
+```
+
+* on top (`abs = 0`) → `cos = 1` → `--ql = --q` — **identical to today at rest**;
+* below the horizontal (`|abs| ≥ 90°`) → `max(0, …) = 0` → `--ql = q·kof` —
+  identical to today for every unfocused branch (the live lower arc is ±120°);
+* in between, and during a flight, it is **continuous**, so the arriving branch
+  grows *smoothly* as it rises and there is no frame where its radius jumps.
+  A branch below the axis is unaffected (`cos < 0` there), so the down-fit that
+  `--kof` encodes still holds; a branch *above* is bounded by the full `q`,
+  which is what the up-room was sized for.
+
+The `.rw-branch.unfocused { --ql: … }` rule and the class go (the render keeps
+`data-focus`, which the probes read). The mirror's selector note
+(`install/TOUCHPOINTS.md`, v0.5.73's paragraph) has to be updated with it.
+
+*Invariant to add:* the slope is a continuous function of the branch's own
+angle; nothing about a branch's *size* may change discretely with the focus.
+
+### 16.2 F2 — the abandoned round's number keeps its line
+
+`web-leptos/style.css:1843`:
+
+```css
+.rw3-node.abandoned .rw3-round { opacity: .6; text-decoration: line-through; }
+```
+
+`.rw3-round` *is* the number in the flow scene's bead, so the strike hits exactly
+what the user cannot afford to lose. **Fix:** drop the `text-decoration`; keep
+the muted colour and the `.6` opacity as the "abandoned" cue (and the dot keeps
+its own `.45` grey, which is the primary cue today).
+
+Related, and deliberately *not* changed without a word from the user:
+
+* the **list** style strikes the *summary*, not the number —
+  `.rw-node.abandoned .rw-sum { text-decoration: line-through }` (1718) — and
+  dims the whole head to `.55`. The number there is legible.
+* the **transcript**'s `.ev-retract` (711) strikes a retracted *event card*'s
+  text. Different surface, different meaning.
+
+### 16.3 F3 — a focused branch's sub-branches must stay above the trunk
+
+**Measured today.** The carousel probe already reports it as data: at *every*
+detent `below_nested: [1]` — the nested fan's beads are **always below the axis**
+— and with fin0 (round 14) focused the 21 bead sits **53px below** the trunk row
+while its parent's beads run up to 255px above it. Mechanically: the container
+is `po = 1` step up the parent's ray, and the child's first bead is 3 steps out
+along **180° relative to the parent** ⇒ `y = −po·q − out·q·cos 180 = −36.5 +
+89.8 = +53px` below the trunk.
+
+**Root cause** is a v0.5.72 decision, **D-fan-4**: "a nested fan is centred on
+**180°** — opposite its parent's own ray, never along it". That was chosen to
+keep a child off its parent's beads (K1/K2 neighbours), but with the carousel a
+focused parent points **up**, so "opposite the parent" points **down, through
+the trunk**.
+
+**Fix F3 — the nested fan opens along the parent, not against it (supersedes
+D-fan-4's centre).** `fan_nested_theta` centres the fan on the parent's own
+direction (`0°`, not `180°`) with a **small** spread, `±NESTED_HALF` and a small
+bias so that no child is exactly collinear with its parent (the spine would
+overlap) and none is edge-on:
+
+* `NESTED_HALF ≈ 40°`, so **|θn| < 90°** — and *that* is the structural
+  guarantee the user asked for: with the parent at `abs = 0` (focused), every
+  descendant's `cos > 0`, so **every step of the subtree is upward**, at any
+  depth and for any number of children. No per-fixture arithmetic, no cap.
+* Live numbers for round 21 with a 20° bias: its bead becomes
+  `−36.5 − 3·36.1·cos 20° ≈ **138px above** the trunk` (from 53px below), and it
+  stays clear of its parent's own beads in the same column (the parent's round
+  15 sits at −73px, the child at −138px: **65px** apart).
+* A lone child is the interesting degenerate case: at exactly `0°` its spine
+  lies *on* its parent's for the common length. The bias fixes that; the
+  decision in §16.5 is which bias.
+
+**Two consequences F3 drags along (both must land with it):**
+
+1. **The fit must measure the *chain* reach, not the local one.** The layout's
+   `longest` is the maximum `data-n` over `.rw-branch`, and `data-n` is a
+   branch's **own** reach (`n + shift`). A nested branch's distance from the
+   trunk is its **ancestors' `po` plus its own reach** — while a nested child
+   pointed *down* that error was hidden by the generous lower room, but a
+   subtree that goes *up* must fit the upper room. Fix: write `data-reach`
+   (absolute steps from the trunk, accumulated through the chain) in the render
+   and use it for `up_room / longest`. On the live fixture the deepest reach is
+   `1 + 3 = 4` steps against the longest root branch's 7, so **no number moves
+   today** — it is correctness for the general case.
+2. **The focused subtree now rides the full slope**, because F1's angle-based
+   rule gives `cos ≈ 1` at `abs ≈ 0`. That is the wanted behaviour (the subtree
+   keeps its 2-step clearance from its parent instead of shrinking), and it is
+   also why consequence 1 is not optional.
+3. Copy to update: design doc §3b.6 (D-fan-4's nesting entry + the carousel
+   entry), the mirror README, `install/TOUCHPOINTS.md`.
+
+### 16.4 Order, verification, effort, rollback
+
+Land them as one change, in this order (each is independently verifiable):
+
+1. **F2** (one CSS line) — no geometry involved.
+2. **F1** (CSS + the class removal) — verify with the frame sampler: per frame,
+   for every branch, the bead radius from the axis must change by no more than a
+   smooth bound (and by **0** across the commit frame), while the flight still
+   ends exactly on the detent. `carousel_probe.py`'s S1–S6 must stay green
+   (at rest the formula is identical) and `flow_style_b_probe.py` 68/0 must hold.
+3. **F3** (Rust law + `data-reach` + the fit) — new probe checks, all on the
+   live session, at **every** detent:
+   * the focused branch's **whole subtree** (its own beads *and* every nested
+     descendant's) is **above** the axis;
+   * no bead of the subtree is within 13px of a trunk bead, or of another bead
+     of the same subtree;
+   * the nested bead's clearance from its parent's beads in its own columns
+     (the K1/K2 family) is ≥ 13px;
+   * the existing S1–S6 (one focus, phase 0, unfocused roots below, dots 13px,
+     the walk wrapping) stay green.
+
+Then: `cargo test -p rushi-web` (71), the wasm check + `trunk build`,
+`flow_check.py` (8/0), `rewind_probe.py` (140), rebuild `dist/`, mirror sync
+(canaries), README/TOUCHPOINTS, commit + tag. Rollback stays
+`pre-carousel-2026-10-05`; this change gets its own tag (`round5-2026-10-05`).
+
+Rough effort: F2 ≈ 5 min, F1 ≈ 45 min (mostly the sampler), F3 ≈ 2 h (the law,
+the fit's reach, the probes, the docs).
+
+### 16.5 The decisions that are the user's
+
+1. **The lone nested child's bias** (§16.3): exactly `0°` (parallel to the
+   parent — reads as a continuation rail, but its spine overlaps the parent's
+   for the common length) or a small `±φ` with `φ ≈ 20–30°` (visibly separate,
+   still well inside the ±90° guarantee). **[recommended: φ = 20–25°, chosen so
+   the two spines never overlap on screen]**
+2. **The nested spread** `NESTED_HALF`: 40° (recommended — the smallest that
+   still reads as a cone) or narrower (25–30°) now that the user asked for
+   "小一点". **[recommended: 40°, tune by look]**
+3. **F2's scope**: only the bead's number (recommended, that is what was
+   reported), or also the *list* style's abandoned **summary** strike
+   (`.rw-node.abandoned .rw-sum`)? **[recommended: leave the summary — it is
+   prose, not the number; the user's words were about numbers]**
+4. **F1's visual**: with the fix, the arriving branch *grows* smoothly as it
+   rises (its beads slide outward). That is the natural consequence of making
+   the slope continuous; if the user would rather it arrive at its final size
+   only *after* the flight, the alternative is to animate `--kof` per branch —
+   more code, and it would reintroduce a (smaller) pop. **[recommended: keep the
+   smooth growth]**
