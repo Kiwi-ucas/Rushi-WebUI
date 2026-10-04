@@ -148,23 +148,164 @@ thread_local! {
     /// The element `SCENE_OB` currently watches, for the identity compare.
     static SCENE_OB_EL: RefCell<Option<HtmlElement>> = const { RefCell::new(None) };
     /// **v0.5.69 (round-3 defect 2)**: the turn a gesture could not spend
-    /// on panning — see [`pan_and_turn`]. `--rw-scroll` is
-    /// `scrollLeft + this`, so a scene narrower than its panel (which is
-    /// what a track of 17..45 columns is, `#rw-flow-track`'s `--cell`
-    /// makes it fit exactly) still turns the ring even though it has no
-    /// scroll range at all. Reset at every layout, like `--rw0`.
+    /// on panning. `--rw-scroll` is `scrollLeft + this`, so a scene narrower
+    /// than its panel (which is what a track of 17..45 columns is,
+    /// `#rw-flow-track`'s `--cell` makes it fit exactly) still turns the cone
+    /// even though it has no scroll range at all. Since v0.5.73 the wheel does
+    /// not pan at all — it *walks the fan* ([`snap_step`]) — and this is the
+    /// accumulator the snap flights and the drag write through. Reset at every
+    /// layout, like `--rw0`.
     static RW_TURN: Cell<f64> = const { Cell::new(0.0) };
+    /// **v0.5.73 (plan §15)**: the running snap. One at a time: a new gesture
+    /// cancels the old one and retargets, so a fast wheel cannot queue a
+    /// backlog of flights.
+    static RW_SNAP: RefCell<Option<gloo_timers::callback::Interval>> =
+        const { RefCell::new(None) };
 }
 
 /// The scene's turn accumulator (px, the same unit as `scrollLeft`).
 fn turn() -> f64 {
     RW_TURN.with(|c| c.get())
 }
-fn add_turn(d: f64) {
-    RW_TURN.with(|c| c.set(c.get() + d));
-}
 fn set_turn(v: f64) {
     RW_TURN.with(|c| c.set(v));
+}
+
+/// A computed custom property as a number (the layout's own numbers are all
+/// written without units except the lengths, which we never read this way).
+fn css_num(el: &HtmlElement, name: &str) -> Option<f64> {
+    let w = web_sys::window()?;
+    let cs = w.get_computed_style(el).ok().flatten()?;
+    cs.get_property_value(name)
+        .ok()?
+        .trim()
+        .trim_end_matches("px")
+        .parse::<f64>()
+        .ok()
+}
+
+/// Wrap into (-180, 180]: the cone's angles are all read that way, so a fan's
+/// angle does not depend on how many turns the phase has behind it.
+fn wrap180(deg: f64) -> f64 {
+    (deg + 180.0).rem_euclid(360.0) - 180.0
+}
+
+/// `ease-in-out`, so the snap leaves and arrives softly.
+fn ease01(t: f64) -> f64 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Can we animate at all? `prefers-reduced-motion` jumps straight to the
+/// detent (D-snap-4) — and it is also the flat projection's switch.
+fn reduced_motion() -> bool {
+    web_sys::window()
+        .and_then(|w| w.match_media("(prefers-reduced-motion: reduce)").ok().flatten())
+        .map(|m| m.matches())
+        .unwrap_or(false)
+}
+
+/// Abandon a flight in progress (a new gesture retargets instead of queuing).
+fn cancel_snap() {
+    RW_SNAP.with(|s| {
+        if let Some(iv) = s.borrow_mut().take() {
+            iv.cancel();
+        }
+    });
+}
+
+/// **The focus carousel's snap (plan §15.4, D-snap-3/4)**: fly the cone to the
+/// **next detent in the direction of travel** and, on arrival, commit that
+/// branch's rank as the focus — so the new law re-hangs the whole fan with the
+/// new branch on top, and the phase returns to zero.
+///
+/// The rule is "strictly ahead", never "the nearest": a gesture that lands
+/// exactly on a detent still advances one branch, which is the v0.5.69 rule
+/// ("a gesture must never be a no-op") and the user's own words — *"每一次滚轮
+/// 滚动，都会让上方的分支回到下方并让一个新的分支转动到上方并吸附"*.
+///
+/// The flight moves `--rw-scroll` only (the single value a frame writes, B7),
+/// through the turn accumulator, so nothing reads layout per frame. `dir` is
+/// ±1. A no-op is impossible: with `dir > 0` the target phase is the smallest
+/// detent strictly above the current one, and the detents wrap, so there is
+/// always one.
+fn snap_step(state: AppState, el: &HtmlElement, dir: i32, k: usize, focus: i32) {
+    if k == 0 {
+        return;
+    }
+    // Stop the flight in the air (a fast wheel retargets instead of queuing).
+    cancel_snap();
+    let detent = |rank: i32| wrap180(fan_root_theta(rank, focus, k));
+    let dpp = css_num(el, "--dpp").unwrap_or(0.3).max(1e-6);
+    // where the cone is, in **degrees** (`--rw-scroll − --rw0` is px; `dpp` is
+    // degrees per px). It is deliberately not wrapped: the detents are compared
+    // modulo 360 below.
+    let phase_now = (css_num(el, "--rw-scroll").unwrap_or(0.0)
+        - css_num(el, "--rw0").unwrap_or(0.0))
+        * dpp;
+    // The detents in *phase* degrees: a branch is on top when its angle plus
+    // the phase is zero.
+    let mut target: Option<(f64, i32)> = None;
+    for j in 0..k as i32 {
+        let want = -detent(j);
+        // how far ahead of where we are, in the direction of travel
+        let mut delta = (want - phase_now).rem_euclid(360.0);
+        if dir < 0 {
+            delta -= 360.0;
+        }
+        if dir > 0 && delta <= 1e-9 {
+            delta += 360.0; // *strictly* ahead: a landed gesture still moves
+        }
+        if dir < 0 && delta >= -1e-9 {
+            delta -= 360.0;
+        }
+        if target.is_none() || (dir > 0 && delta < target.unwrap().0)
+            || (dir < 0 && delta > target.unwrap().0)
+        {
+            target = Some((delta, j));
+        }
+    }
+    let Some((delta, rank)) = target else { return };
+    let rw0 = css_num(el, "--rw0").unwrap_or(0.0);
+    let from = el.scroll_left() as f64 + turn();
+    let to = rw0 + (phase_now + delta) / dpp;
+    if reduced_motion() {
+        set_turn(to - el.scroll_left() as f64);
+        mark_scroll(el);
+        finish_snap(state, el, rank, rw0);
+        return;
+    }
+    let t0 = web_sys::window()
+        .and_then(|w| w.performance())
+        .map(|p| p.now())
+        .unwrap_or(0.0);
+    let el2 = el.clone();
+    let iv = gloo_timers::callback::Interval::new(16, move || {
+        let now = web_sys::window()
+            .and_then(|w| w.performance())
+            .map(|p| p.now())
+            .unwrap_or(t0);
+        let t = ((now - t0) / SNAP_MS).clamp(0.0, 1.0);
+        let v = from + (to - from) * ease01(t);
+        set_turn(v - el2.scroll_left() as f64);
+        mark_scroll(&el2);
+        if t >= 1.0 {
+            cancel_snap();
+            finish_snap(state, &el2, rank, rw0);
+        }
+    });
+    RW_SNAP.with(|s| *s.borrow_mut() = Some(iv));
+}
+
+/// Arrive: the new branch is the focus (so the render re-hangs the fan with it
+/// on top) and the phase goes back to rest. For a fan of up to three branches
+/// the new law is the old one rotated by exactly the angle we just flew, so the
+/// picture does not move a pixel here; the even fan (4+) is rigid by
+/// construction and is smooth too.
+fn finish_snap(state: AppState, el: &HtmlElement, rank: i32, rw0: f64) {
+    state.rw_focus.set(rank);
+    set_turn(rw0 - el.scroll_left() as f64);
+    mark_scroll(el);
 }
 
 /// B7's numbers, written once per **layout** so that a scroll frame writes
@@ -176,14 +317,21 @@ fn set_turn(v: f64) {
 /// (`--halfpw`, `--denom`). Numbers, never lengths: CSS cannot divide a
 /// length by a length, and this way the proxy costs one `setProperty` per
 /// scroll event and never reads layout while scrolling.
-/// **D-cone-9 (user decision, v0.5.71)**: where the trunk sits in the scene,
-/// as a fraction of its height. The cone turns a **full circle** (D-cone-8),
-/// so a branch's far end sweeps as far below the trunk as above it and the
-/// room the fit can spend is what the *smaller* half gives — the frame is
-/// symmetric about the axis, so the axis goes in the middle.
-/// (v0.5.68..70 put it at 0.62, when the bounded arc only ever used the upper
-/// half. That is why branches could never appear below their parent.)
-const SCENE_AXIS_FRAC: f64 = 0.5;
+/// **D-snap-5 (user decision, 2026-10-05, plan §15)**: where the trunk sits in
+/// the scene, as a fraction of its height. The focus carousel puts the focused
+/// branch **on top** and every other branch in the lower half, so the room
+/// above the trunk is what the focused branch needs and the room below is only
+/// the (much smaller) unfocused arcs. Moving the axis down is what buys the
+/// focused branch its length: on the live 418px panel the fit goes from
+/// `q 25.7px` to `q 36.5px` (+42%, measured), and the unfocused branches are
+/// drawn at `--kof` (0.82 there) so they still fit below.
+///
+/// Measured, and why not lower: at 0.72 the lower room is so short that `--kof`
+/// drops to 0.65, and then the *first* bead of a branch at the arc's end sits
+/// 12.7px from the trunk's own bead in the same column — a hair inside one dot
+/// (measured 7.7/9.2px apart). At 0.68 `--kof` is 0.82 and that distance is
+/// 15px, clear, for 8px less reach on the focused branch.
+const SCENE_AXIS_FRAC: f64 = 0.68;
 /// Half the bead band in px (the CSS gives a `.rw3-dot` a 13px dot).
 const FIN_HALF_PX: f64 = 13.0;
 /// Air between the farthest bead's end and the panel's edge.
@@ -194,6 +342,34 @@ const FIN_MIN_RADIUS_PX: f64 = 34.0;
 /// **D-orb-8**: one full turn per 1.5 scene widths of scrolling — a fixed
 /// angular rate, so the gesture feels the same in every session.
 const ORBIT_DEG_PER_WIDTH: f64 = 360.0 / 1.5;
+/// **D-snap-1 (user decision, 2026-10-05)**: how far the *lower* arc stays off
+/// the horizontal. A branch at ±90° is **edge-on** (its screen offset is
+/// `-q·cos a`: nothing of the ray is left on screen and its beads land on the
+/// trunk row — the §14.1 K2 class, measured 1.1-3.6px from a trunk bead), so
+/// the non-focused branches start `FAN_ARC_INSET` degrees below the horizontal
+/// and end as far above it on the other side. At `k = 3` this is exactly
+/// today's 120°/240°; it only bites for larger fans.
+const FAN_ARC_INSET: f64 = 30.0;
+/// **D-snap-5**: an unfocused branch may not shrink below this or it stops
+/// reading as a branch; the fit gives way instead.
+const FAN_MIN_SCALE: f64 = 0.45;
+/// **D-snap-9 / §14.4 B (user decision)**: the cone's opening should lean
+/// **up-right** instead of straight right, so the focused branch's far end runs
+/// up and to the right.
+///
+/// **Measured (v0.5.73): the obvious mechanism is wrong.** A `rotateZ` on the
+/// branch's own plane does lean the ray, but it rolls the branch's **column
+/// axis** with it: the beads of a 7-column branch then span `±7·cell·sin ψ`
+/// (41px at 10°) of height, which tilted the branch's bead line and lifted its
+/// far beads *above* the trunk row — the probe caught beads on the wrong side
+/// of the axis. The tilt has to shear the *radial* direction only (each step
+/// leans, the columns stay horizontal), which is the plan's D-slant question;
+/// until that lands this is 0 and the CSS machinery
+/// (`--roll`, the bead's `rotateZ(-ψ)`) is wired and inert.
+const CONE_ROLL_DEG: f64 = 0.0;
+/// **D-snap-4**: the snap's flight time. A gesture must never be a no-op
+/// (v0.5.69), so every settle rotates at least one branch up.
+const SNAP_MS: f64 = 300.0;
 
 /// Keep the scene's layout probe on `scroll` (bug 3 / D-cone-12). Cheap: the
 /// element is compared by identity, and an already-armed scene does nothing.
@@ -267,25 +443,25 @@ fn sync_scene_metrics() {
     // never move the ring
     mark_scroll(&scroll);
 
-    // ── the orbital scene's pixels (the server owns the angles) ─────
-    // The axis, and the radius the auto-fit gives it: a branch's farthest
-    // bead sweeps a whole circle of radius `r` about its parent's bead
-    // (D-cone-8), so `r` is what the *smaller* half of the panel gives, minus
-    // half a bead and a little air — D-orb-1 asked for the far end to *just*
-    // fit, and with a full circle that holds on the way down as well.
+    // ── the orbital scene's pixels ─────────────────────────────────
+    // **D-snap-5 (plan §15)**: with the focused branch on top and every other
+    // branch in the lower half, the two rooms are no longer equal — the focused
+    // branch spends `axis` (SCENE_AXIS_FRAC of the panel) and the unfocused
+    // ones the rest, drawn at `--kof`. On the live 418px panel that is
+    // `q 25.7px → 38.9px` for the focused branch (+51%) and `--kof 0.65` for
+    // the others. The roll (D-snap-9) leans each ray, so its vertical reach is
+    // its length times `cos ψ`.
     let axis = (h * SCENE_AXIS_FRAC).round();
-    let room = axis.min(h - axis);
-    let r = (room - FIN_MARGIN_PX - FIN_HALF_PX).max(FIN_MIN_RADIUS_PX);
+    let up_room = (axis - FIN_MARGIN_PX - FIN_HALF_PX).max(FIN_MIN_RADIUS_PX);
+    let down_room = ((h - axis) - FIN_MARGIN_PX - FIN_HALF_PX).max(0.0);
+    let roll = CONE_ROLL_DEG.to_radians().cos();
     let _ = st.set_property("--axis", &format!("{axis}px"));
-    // px, not a bare number: the CSS reads it as a length
-    let _ = st.set_property("--r", &format!("{r}px"));
-    // Every branch shares one slope, and the *longest* branch sets it: its
-    // farthest bead sweeps the scene's whole circle (D-cone-8), so
-    // `q = r / longest` puts that bead exactly inside the panel at every
-    // angle — the same auto-fit the ring's radius had, per step instead of per
-    // branch. The length is read back off the DOM (each container carries
-    // `data-n`), so the slope stays a layout-time pixel value and the CSS
-    // keeps owning the cell.
+    let _ = st.set_property("--roll", &format!("{CONE_ROLL_DEG}"));
+    // Every branch shares one slope, and the *longest* branch sets it: with the
+    // axis low, the focused branch's farthest bead spends the whole upper room
+    // (D-cone-8/9's auto-fit, now asymmetric). The length is read back off the
+    // DOM (each container carries `data-n`), so the slope stays a layout-time
+    // pixel value and the CSS keeps owning the cell.
     let longest = doc
         .query_selector_all(".rw-branch")
         .ok()
@@ -298,8 +474,38 @@ fn sync_scene_metrics() {
                 .fold(0.0_f64, f64::max)
         })
         .unwrap_or(0.0);
-    let q = if longest > 0.0 { r / longest } else { 0.0 };
+    let q = if longest > 0.0 {
+        up_room / (longest * roll)
+    } else {
+        0.0
+    };
     let _ = st.set_property("--q", &format!("{q:.3}px"));
+    let _ = st.set_property("--r", &format!("{:.3}px", q * longest));
+    // **D-snap-5**: how much an *unfocused* branch shrinks so the lower half
+    // holds them all. The worst branch is the one whose plane leans most into
+    // the screen (`max |cos θ|`), and that is what the render wrote on each
+    // root container — read it back like `longest`, so the number always
+    // matches the painted angles.
+    let cos_worst = doc
+        .query_selector_all(".rw-orbit > .rw-branch")
+        .ok()
+        .map(|list| {
+            (0..list.length())
+                .filter_map(|i| list.item(i))
+                .filter_map(|n| n.dyn_into::<web_sys::Element>().ok())
+                .filter(|el| el.get_attribute("data-focus").as_deref() != Some("1"))
+                .filter_map(|el| el.get_attribute("data-th"))
+                .filter_map(|s| s.parse::<f64>().ok())
+                .map(|d| d.to_radians().cos().abs())
+                .fold(0.0_f64, f64::max)
+        })
+        .unwrap_or(0.0);
+    let kof = if q > 0.0 && cos_worst > 0.0 {
+        (down_room / (q * longest * roll * cos_worst)).clamp(FAN_MIN_SCALE, 1.0)
+    } else {
+        1.0
+    };
+    let _ = st.set_property("--kof", &format!("{kof:.4}"));
     // ── v0.5.70: the cell, in plain px, for the spine ───────────────
     // The spine's angle is `atan2(steps·q, columns·cell)` — and Chromium
     // refuses a *container unit* inside `atan2()` (measured: `--cell` is
@@ -371,6 +577,12 @@ pub fn register_flow_effects(state: AppState) {
     // [`arm_scene_probe`], this is the second line of defence).
     Effect::new(move || {
         let _ = (view.get(), tree.get(), selected.get(), layout.get());
+        // **v0.5.73 (plan §15)**: a layout point also puts the *walk* back to
+        // the start — the aligned branch is the one on top at rest (the
+        // D-orb-7 rule, now read as "the focus is the selection's branch"), so
+        // entering the view, picking a round or a tree reload always opens on a
+        // clean, snapped scene.
+        state.rw_focus.set(0);
         relayout_scene();
         gloo_timers::callback::Timeout::new(0, relayout_scene).forget();
     });
@@ -978,31 +1190,32 @@ fn flow_detail(state: AppState) -> AnyView {
 /// The single value a scroll frame writes (B7): the offset the ribbons'
 /// `--turn` calc reads. Never `scrollLeft` itself, so nothing reads layout
 /// while scrolling, and `--halfpw`/`--denom`/`--bx` stay from the layout.
+/// The pan-only fallback: move the scroller by `dy` (the browser cannot, see
+/// above) and refresh the one value a scroll frame writes.
+fn pan_only(el: &HtmlElement, dy: f64) {
+    let max = (el.scroll_width() - el.client_width()).max(0) as f64;
+    let want = (el.scroll_left() as f64 + dy).clamp(0.0, max);
+    el.set_scroll_left(want as i32);
+    mark_scroll(el);
+}
+
 fn mark_scroll(el: &HtmlElement) {
     let v = el.scroll_left() as f64 + turn();
     let _ = el.style().set_property("--rw-scroll", &format!("{v}"));
 }
 
-/// **v0.5.69 (round-3 defect 2)**: move the scene by `delta` px along the
-/// line — as far as the track allows — and keep the rest as *turn*, so
-/// the ring's `--phase` keeps moving when the trunk cannot.
+/// **v0.5.69 (round-3 defect 2)** → **v0.5.73 (D-snap-2)**: the wheel used to
+/// come through here (`pan_and_turn`: pan as far as the track allows, keep the
+/// rest as *turn*, so the cone kept moving when the trunk could not). Since the
+/// focus carousel the vertical wheel is the **focus** control on a real fan,
+/// and it measures its own delta against `--dpp` to decide which branch comes
+/// up next ([`snap_step`]).
 ///
-/// `--phase` reads `--rw-scroll` (the wheel = the line = the ring, one
-/// value per frame, D7/D-orb-4). That only ever worked while the scene
-/// could scroll: `#rw-flow-track` is `(cols+1)` cells wide and `--cell`
-/// auto-fits down to a 26px floor, so a session of 17..45 rounds fits its
-/// panel **exactly** — `scrollLeft` is pinned at 0 for ever and the ring
-/// froze (the live `rewind` and `Time inject` sessions are both in that
-/// band). Now the gesture pans first and turns afterwards: with a track
-/// that can move, the pan takes the whole delta (nothing changes from
-/// before) and only the overshoot at either end becomes turn.
-fn pan_and_turn(el: &HtmlElement, delta: f64) {
-    let before = el.scroll_left() as f64;
-    el.set_scroll_left((before + delta) as i32);
-    let after = el.scroll_left() as f64;
-    add_turn((before + delta) - after);
-    mark_scroll(el);
-}
+/// It still pans — as a **fallback** — when there is nothing to bring up (a fan
+/// of 0 or 1 branch, i.e. every live session but `rewind`), and that has to go
+/// through a proxy for the same reason it always did: the scroller is
+/// `overflow-x` only, so the browser has nothing to scroll for a vertical
+/// delta (measured: 260 → 260 with the event left alone).
 
 /// Short label for the dialog's title line ("round 3 \u{00b7} first chars\u{2026}").
 fn summarize_label(text: &str) -> String {
@@ -1179,15 +1392,29 @@ fn flow_scene(state: AppState) -> AnyView {
             // D-fan-1/2 (user decision, v0.5.72): the angle a branch gets is
             // `360/k` of **its own fan**, and the rank it holds there — the
             // server's `fin` is global over the session, and the root fan of
-            // the live fixture holds {0, 2, 3}, not {0, 1, 2}. The aligned
-            // branch is a *rank* too, so at rest it points straight up.
+            // the live fixture holds {0, 2, 3}, not {0, 1, 2}.
+            //
+            // **v0.5.73 (plan §15, D-snap)**: the root fan's angles are now
+            // *focus-relative*: the branch the wheel has walked to sits at 0
+            // (on top) and every other branch is spread over the lower arc. The
+            // focus is a view state of its own (`rw_focus`), never the
+            // selection — the detail panel must not churn while browsing
+            // (D-snap-7).
             let root_k = roots.len();
-            let align_rank = roots.iter().position(|&x| x == align).unwrap_or(0) as i32;
+            let focus_rank = if root_k == 0 {
+                0
+            } else {
+                state.rw_focus.get().rem_euclid(root_k as i32)
+            };
+            let focus_fin = roots.get(focus_rank as usize).copied().unwrap_or(align);
             let root_step = fan_step(root_k, false);
-            let root_theta =
-                |i: u32| fan_root_theta(roots.iter().position(|&x| x == i).unwrap_or(0) as i32,
-                                        align_rank,
-                                        root_k);
+            let root_theta = |i: u32| {
+                fan_root_theta(
+                    roots.iter().position(|&x| x == i).unwrap_or(0) as i32,
+                    focus_rank,
+                    root_k,
+                )
+            };
 
             let cone = Cone {
                 state,
@@ -1196,6 +1423,7 @@ fn flow_scene(state: AppState) -> AnyView {
                 by_fin: &by_fin,
                 parent_of: &parent_of,
                 kids: &kids,
+                focus_fin,
             };
             let fins: Vec<AnyView> = roots
                 .iter()
@@ -1224,6 +1452,8 @@ fn flow_scene(state: AppState) -> AnyView {
                 ev.current_target()?.dyn_into::<HtmlElement>().ok()
             };
             let on_down = move |ev: PointerEvent| {
+                // a new gesture retargets any flight still in the air
+                cancel_snap();
                 let Some(el) = el_of(&ev) else { return };
                 // a drag starts after some layout, possibly: re-measure
                 sync_scene_metrics();
@@ -1262,9 +1492,23 @@ fn flow_scene(state: AppState) -> AnyView {
                 mark_scroll(&el);
             };
             let on_up = move |ev: PointerEvent| {
+                let (down, x0, _, _) = drag.get_value();
                 if let Some(el) = el_of(&ev) {
                     let _ = el.release_pointer_capture(ev.pointer_id());
                     let _ = el.class_list().remove_1("dragging");
+                    // **D-snap-3 (plan §15.4)**: a drag settles onto the next
+                    // detent in the direction it travelled — the same rule as
+                    // the wheel, so the gesture is never a no-op (v0.5.69). A
+                    // press that did not move (a click on empty space) stays a
+                    // no-op, exactly as before.
+                    let moved = ev.client_x() as f64 - x0;
+                    // a fan of 0 or 1 branch has nothing to bring up — the
+                    // drag keeps panning it, as before (v0.5.69's rule is about
+                    // *gestures*, and the pan **is** the effect there)
+                    if root_k >= 2 && down && moved.abs() >= 2.0 {
+                        let dir = if moved < 0.0 { 1 } else { -1 };
+                        snap_step(state, &el, dir, root_k, focus_rank);
+                    }
                 }
                 drag.set_value((false, 0.0, 0.0, 0.0));
             };
@@ -1278,10 +1522,21 @@ fn flow_scene(state: AppState) -> AnyView {
                     mark_scroll(&el);
                 }
             };
-            // D7: the plain wheel drives the line too. A horizontal delta
-            // (or shift+wheel) is already this element's own scroll, so only
-            // the vertical delta is taken over — the plan's "scroll proxy",
-            // measured in pixels/lines/pages like the browser does.
+            // **v0.5.73 (plan §15, D-snap-2)**: the plain vertical wheel is now
+            // the **focus** control — one notch brings the next branch up and
+            // snaps it (the user's ask), instead of panning the line. The pan
+            // keeps every other home: the drag, a horizontal delta (which stays
+            // the browser's own x-scroll, D9) and the scrollbar. On the live
+            // sessions nothing is lost: their track fits the panel exactly, so
+            // the wheel could never pan there anyway.
+            //
+            // **The fallback (measured, 2026-10-05)**: on a fan of **0 or 1
+            // branch** there is nothing to bring up (a lone branch is always
+            // the focused one under this law — D-cone-11 is superseded), so the
+            // wheel is left to the browser and pans the line natively, exactly
+            // as it did before the carousel. That is what keeps v0.5.69's rule
+            // true on the branchless live sessions (the check that caught this
+            // was flow_style_b_probe's F4, on the 117-round one).
             let on_wheel = move |ev: web_sys::WheelEvent| {
                 let Some(el) = ev.current_target().and_then(|t| t.dyn_into::<HtmlElement>().ok())
                 else {
@@ -1296,8 +1551,14 @@ fn flow_scene(state: AppState) -> AnyView {
                 if dy.abs() < 0.5 {
                     return;
                 }
-                ev.prevent_default();
-                pan_and_turn(&el, dy);
+                if root_k >= 2 {
+                    ev.prevent_default();
+                    snap_step(state, &el, if dy > 0.0 { 1 } else { -1 }, root_k, focus_rank);
+                } else {
+                    // nothing to focus: pan, exactly as v0.5.69 did
+                    ev.prevent_default();
+                    pan_only(&el, dy);
+                }
             };
 
             view! {
@@ -1361,10 +1622,60 @@ fn spine_bar(d0: usize, n: usize, dx: u64, live: bool) -> AnyView {
 /// at the N=4 spacing: an edge-on bead sat 1.7px from a trunk bead).
 const FAN_EDGE_ON: f64 = 0.087;
 
+/// The angle of a **root** fan's branch at `rank`, with `focus` the rank that
+/// is **on top of the cone** (plan §15, D-snap-1, user decision 2026-10-05):
+/// *"自动吸附对应的分支到圆锥面正上方的位置，此时不管其余有多少分支，全部都位于圆锥面的
+/// 下半部分"* — the focused branch at 0, **every** other branch in the lower
+/// half, whatever `k` is.
+///
+/// The law is *relative to the focus* (it re-hangs the fan for each of the `k`
+/// detents), so "all of them below" is achievable for any fan size — a *rigid*
+/// rotation of one fixed shape could only do it for `k ≤ 3` (every forward gap
+/// would have to exceed 90° while the gaps sum to 360°). What a focus-relative
+/// law costs is that the fan's shape changes as the focus walks; it stays
+/// *continuous* exactly for the fans this law handles specially:
+///
+/// * `k = 1` — nothing to place;
+/// * `k = 2` — the other branch sits straight down;
+/// * `k ≥ 3` — the others are spread evenly over the lower arc, which starts
+///   `FAN_ARC_INSET` below the horizontal on one side and ends as far above it
+///   on the other (for `k = 3` that is exactly v0.5.72's 120°/240°).
+///
+/// The slot order is the walk's own: `s = 1` is the branch a positive wheel
+/// brings up first, and the angles are assigned so that increasing the phase
+/// visits `s = 1, 2, … , k-1, 0` — the fan's rank order, wrapping.
+///
+/// One honest cost, for fans of **4 or more**: the law re-hangs the fan for the
+/// new focus, and that shape is not a rigid rotation of the old one, so the
+/// branches *relocate* (by up to one arc gap) at the instant the focus commits.
+/// No live session has such a fan (the `rewind` fixture's root fan is 3); the
+/// alternative — the rigid even fan — is the one that would put a branch
+/// exactly edge-on at rest, which is the defect this round exists to remove.
+/// It is the plan's open question D-snap-6.
+fn fan_root_theta(rank: i32, focus: i32, k: usize) -> f64 {
+    if k == 0 {
+        return 0.0;
+    }
+    let k = k as i32;
+    let mut s = (rank - focus) % k;
+    if s < 0 {
+        s += k;
+    }
+    if s == 0 {
+        return 0.0;
+    }
+    if k == 2 {
+        return 180.0;
+    }
+    let step = (180.0 - 2.0 * FAN_ARC_INSET) / (k as f64 - 2.0);
+    wrap180(90.0 + FAN_ARC_INSET + (k - 1 - s) as f64 * step)
+}
+
 /// The angular spacing of a fan of `k` branches (plan §13.9, D-fan-1): the
 /// branches of **one parent** share the full circle evenly — `360/k` apart —
 /// instead of the fixed 30° step, so a fan never crowds. A nested fan caps its
-/// spread at 120° (D-fan-4).
+/// spread at 120° (D-fan-4). Written on the container as `--step` for the
+/// stylesheet's benefit; the render is the only thing that reads it.
 fn fan_step(k: usize, nested: bool) -> f64 {
     if k == 0 {
         return 0.0;
@@ -1375,34 +1686,6 @@ fn fan_step(k: usize, nested: bool) -> f64 {
     } else {
         step
     }
-}
-
-/// The angle of a **root** fan's branch at `rank`, with the aligned branch at
-/// rank `align`: measured in steps from the front, signed, plus the nudge.
-///
-/// **D-fan-3 (user decision, v0.5.72)**: a 0-based fan puts a branch *exactly*
-/// on ±90 (edge-on: the ray's screen offset is `-q·cos a`, so it loses all of
-/// its projected length and its beads sit on the trunk row) when `k` is a
-/// multiple of 4 — and only then, since 90°/step = k/4. In that one case the
-/// whole fan is nudged by **half a step** (`k = 4` → ±45°/±135° instead of
-/// 0°/90°/180°/270°), at the price of no branch pointing straight up. Half a
-/// step is safe for every multiple of 4: the nudged ranks are odd multiples of
-/// the half step, so 90 and 0 are both out of reach.
-fn fan_root_theta(rank: i32, align: i32, k: usize) -> f64 {
-    if k == 0 {
-        return 0.0;
-    }
-    let k = k as i32;
-    let mut d = (rank - align) % k;
-    if d < 0 {
-        d += k;
-    }
-    if d * 2 > k {
-        d -= k; // the symmetric -k/2 .. k/2, so the fan is centred on the front
-    }
-    let step = fan_step(k as usize, false);
-    let nudge = if k % 4 == 0 { step / 2.0 } else { 0.0 };
-    d as f64 * step + nudge
 }
 
 /// The angle of a **nested** fan's branch at `rank` (D-fan-4): the fan is
@@ -1441,6 +1724,11 @@ struct Cone<'a> {
     by_fin: &'a HashMap<u32, &'a FlowBranch>,
     parent_of: &'a HashMap<u64, u64>,
     kids: &'a HashMap<u32, Vec<u32>>,
+    /// **v0.5.73 (plan §15)**: the root branch that is on top. Only the root
+    /// container carries `data-focus`/`.unfocused` — a nested fan lives inside
+    /// its parent and is *not* part of the root fan's walk (D-snap-8), so it
+    /// neither shrinks nor reports a focus of its own.
+    focus_fin: u32,
 }
 
 /// Style B's flat projection shrinks a branch's outward step by this factor
@@ -1505,20 +1793,53 @@ impl Cone<'_> {
             .iter()
             .take_while(|s| self.at.get(s).map(|t| t.2).unwrap_or(false))
             .count();
+        // **v0.5.73**: how many extra steps out a **nested** branch starts —
+        // see the bead comment below. Two is the measured minimum that clears
+        // *every* neighbour at every detent (the child's bead against the trunk
+        // row, against its parent's other beads, and against the sibling
+        // branch): modelled on the live fixture at 44/29/29px, where one step
+        // left it 8.7px from a sibling's bead.
+        const NESTED_SHIFT: u32 = 2;
+        let shift: u32 = if depth > 0 { NESTED_SHIFT } else { 0 };
+        // `--n`/`data-n` are the branch's *reach* in steps — the last bead's
+        // `out` — not its bead count: the fit reads `data-n` off the DOM to size
+        // the slope, and the spine must end on the last bead.
+        let n_eff = n + shift as usize;
         let spines: Vec<AnyView> = if live == 0 || live >= n {
-            vec![spine_bar(0, n, dx, live > 0)]
+            vec![spine_bar(0, n_eff, dx, live > 0)]
         } else {
             vec![
-                spine_bar(0, live, dx.min(live as u64).max(1), true),
-                spine_bar(live, n - live, dx.saturating_sub(live as u64).max(1), false),
+                spine_bar(0, live + shift as usize, dx.min(live as u64).max(1), true),
+                spine_bar(
+                    live + shift as usize,
+                    n_eff - live - shift as usize,
+                    dx.saturating_sub(live as u64).max(1),
+                    false,
+                ),
             ]
         };
         // the beads: the k-th round of the branch rides `k+1` steps out, so
-        // the first one leaves the parent rather than sitting on it
+        // the first one leaves the parent rather than sitting on it.
+        //
+        // **v0.5.73 (plan §14.1's K1, done here instead of by a solver)**: a
+        // **nested** branch starts one step further out. K1 is the exact
+        // coincidence of a nested branch whose container offset `po` equals a
+        // bead's `out` (a child of its parent's *first* bead — the live
+        // fixture): the radial term `(po − out)·q` and the depth term
+        // `−(po − out)·q·sin a` both cancel, so the child's first bead lands on
+        // the trunk row at **every** phase (measured 0.0px, 24/24 phases) and
+        // its dot permanently covers the trunk's round. `po + 1` cannot cancel
+        // for any phase, so the collision is gone by construction — and the
+        // spine is lengthened by the same step (`--n` below) so it still starts
+        // at the parent's bead and ends on its last bead.
         let beads: Vec<AnyView> = seqs
             .iter()
             .enumerate()
-            .filter_map(|(k, s)| self.by_seq.get(s).map(|nd| (k as u32 + 1, nd.clone())))
+            .filter_map(|(k, s)| {
+                self.by_seq
+                    .get(s)
+                    .map(|nd| (k as u32 + 1 + shift, nd.clone()))
+            })
             .map(|(out, nd)| flow_node_button(self.state, nd, out))
             .collect();
         // the branches that fork off this one, as nested containers
@@ -1568,14 +1889,28 @@ impl Cone<'_> {
             .unwrap_or_default();
         // the container's own static flat factor (1 at the root: its turn
         // carries the phase, so the stylesheet reads it from `--root_a`)
+        //
+        // **v0.5.73 (plan §15)**: only the root containers take part in the
+        // focus carousel — `data-focus` and `.unfocused` are what the fit reads
+        // and what the stylesheet scales (D-snap-5/8).
+        let is_root = depth == 0;
+        let focused = is_root && i == self.focus_fin;
+        let cls = if is_root && !focused {
+            "rw-branch unfocused"
+        } else {
+            "rw-branch"
+        };
         view! {
             <div
-                class="rw-branch"
+                class=cls
                 data-fin=i.to_string()
                 data-root=b.root.to_string()
                 data-hinge=hinge.to_string()
-                data-n=n.to_string()
+                data-n=n_eff.to_string()
                 data-lane=b.lane.to_string()
+                data-depth=depth.to_string()
+                data-focus=if focused { "1" } else { "0" }
+                data-th=format!("{theta:.4}")
                 style=format!(
                     "--slot:{rank}; --step:{step:.4}; --th:{theta:.4}; \
                      --hinge:{hinge}; --ph:{outer}; --po:{po}; --n:{n}; \
@@ -1943,39 +2278,57 @@ fn active_row(state: AppState, n: RewindNode) -> AnyView {
 mod fan_angles_tests {
     use super::*;
 
-    fn gaps(mut angles: Vec<f64>, k: usize) -> Vec<f64> {
-        if k == 1 {
-            return vec![360.0]; // one branch owns the whole circle
-        }
-        angles.iter_mut().for_each(|a| *a = a.rem_euclid(360.0));
-        angles.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        (0..k)
-            .map(|w| (angles[(w + 1) % k] - angles[w]).rem_euclid(360.0))
-            .collect()
-    }
-
-    /// **D-fan-1/2/3**: a root fan shares the full circle evenly — `360/k`
-    /// apart — so it is never the crowded 60° wedge the fixed 30° step gave a
-    /// three-branch session; the aligned rank points straight up, except for
-    /// the fan sizes (`k % 4 == 0`) whose 0-based placement would land a branch
-    /// exactly on the camera's axis, where the whole fan is nudged half a step.
+    /// **D-fan-1/3 → D-snap-1/2 (v0.5.73, plan §15)**: the root fan is the
+    /// **focus carousel**. For any `k` the focused rank sits at 0 (on top) and
+    /// every other branch is in the lower half, `FAN_ARC_INSET` in from the
+    /// horizontal at both ends; the `k = 3` case is exactly v0.5.72's
+    /// 120°/240°. Nothing is ever edge-on, whatever the fan size.
     #[test]
-    fn a_root_fan_is_even_and_never_edge_on() {
+    fn a_root_fan_hangs_below_the_focus() {
         for k in 1..=12usize {
-            let step = fan_step(k, false);
-            assert!((step - 360.0 / k as f64).abs() < 1e-9, "k={k}");
-            let angles: Vec<f64> = (0..k as i32).map(|r| fan_root_theta(r, 0, k)).collect();
-            assert_eq!(angles[0] == 0.0, k % 4 != 0, "the front: k={k}");
-            for a in &angles {
-                assert!(
-                    a.to_radians().cos().abs() >= FAN_EDGE_ON,
-                    "edge-on: k={k} a={a}"
-                );
-            }
-            for g in gaps(angles, k) {
-                assert!((g - step).abs() < 1e-9, "k={k} gap={g}");
+            for focus in 0..k as i32 {
+                let angles: Vec<f64> =
+                    (0..k as i32).map(|r| fan_root_theta(r, focus, k)).collect();
+                assert_eq!(angles[focus as usize], 0.0, "the focus is on top: k={k}");
+                for (rank, a) in angles.iter().enumerate() {
+                    if rank as i32 == focus {
+                        continue;
+                    }
+                    // below the trunk: `cos a < 0` is the far half of the cone
+                    // (`y = -q·cos a` puts it *below* the axis row)
+                    assert!(
+                        a.to_radians().cos() < 0.0,
+                        "not in the lower half: k={k} rank={rank} a={a}"
+                    );
+                    assert!(
+                        a.to_radians().cos().abs() >= FAN_EDGE_ON,
+                        "edge-on: k={k} rank={rank} a={a}"
+                    );
+                    // and inside the inset arc (never past the horizontal)
+                    let deg = a.rem_euclid(360.0);
+                    assert!(
+                        deg > FAN_ARC_INSET && deg < 360.0 - FAN_ARC_INSET,
+                        "outside the arc: k={k} a={a}"
+                    );
+                }
+                // the walk order: a positive wheel (a rising phase) visits the
+                // ranks in fan order, wrapping
+                let mut ahead: Vec<(f64, i32)> = (0..k as i32)
+                    .map(|r| ((-wrap180(fan_root_theta(r, focus, k))).rem_euclid(360.0), r))
+                    .collect();
+                ahead.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                for w in 1..k as i32 {
+                    let want = (focus + w) % k as i32;
+                    assert_eq!(
+                        ahead[w as usize].1, want,
+                        "walk order: k={k} focus={focus} step={w}"
+                    );
+                }
             }
         }
+        // the three-branch case is the v0.5.72 picture, unchanged
+        assert_eq!(wrap180(fan_root_theta(1, 0, 3)), -120.0);
+        assert_eq!(wrap180(fan_root_theta(2, 0, 3)), 120.0);
     }
 
     /// **D-fan-4**: a nested fan hangs *below* its parent — centred on 180°, so
@@ -1985,6 +2338,8 @@ mod fan_angles_tests {
     #[test]
     fn a_nested_fan_hangs_below_its_parent() {
         for k in 1..=12usize {
+            let step = fan_step(k, true);
+            assert!((step - (360.0 / k as f64).min(120.0)).abs() < 1e-9, "k={k}");
             for j in 0..k {
                 let a = fan_nested_theta(j, k).rem_euclid(360.0);
                 assert!(a > 5.0 && a < 355.0, "on the parent's ray: k={k} a={a}");

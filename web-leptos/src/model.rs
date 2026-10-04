@@ -1055,6 +1055,13 @@ pub struct AppState {
     pub rw_selected: RwSignal<Option<u64>>,
     /// Style B: the selected round in full (B2), fetched on selection.
     pub rw_detail: RwSignal<Option<RewindDetail>>,
+    /// **v0.5.73 (plan §15, the focus carousel)**: which rank of the root fan
+    /// is **on top of the cone**. The wheel walks it (one notch = the next
+    /// branch up, wrapping) and the drag settles onto it; a layout point puts
+    /// it back to the aligned branch's rank, so entering the view always shows
+    /// the selection at the top. It is a *view* state: the selection never
+    /// moves with it (D-snap-7).
+    pub rw_focus: RwSignal<i32>,
     /// v0.5.57: display aliases for the session groups, keyed by the session's
     /// **working path** (`cwd`). The group head shows the path's basename or,
     /// when the user renamed it, this label — a display-only preference
@@ -1148,6 +1155,7 @@ impl AppState {
             rw_view: RwSignal::new("tree".to_string()),
             rw_selected: RwSignal::new(None),
             rw_detail: RwSignal::new(None),
+            rw_focus: RwSignal::new(0),
             project_labels: RwSignal::new(std::collections::HashMap::new()),
             group_edit: RwSignal::new(None),
         }

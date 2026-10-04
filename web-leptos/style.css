@@ -1936,7 +1936,27 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
      dot round. Cosine is periodic, so the wrapped angle is the right one. */
   --aroot: calc(mod(calc(var(--root_a, 0) + 180), 360) - 180);
   --kroot: calc(cos(calc(var(--aroot, 0) * 1deg)) - 0.12 * sin(calc(var(--aroot, 0) * 1deg)));
-  transform: rotateX(calc(var(--a) * 1deg));
+  /* **v0.5.73 (plan §15.3, D-snap-5)**: the slope this branch's own beads ride
+     on. It is `--q` (the layout's shared slope) for the focused branch, and
+     `--q · --kof` for an unfocused one, so the lower branches shrink into the
+     room below the trunk — their *positions*, their spine and their depth all
+     scale together, while every dot stays exactly 13px (nothing scales an
+     element: only the step does), which is what keeps them readable and
+     clickable (S5). A nested fan inherits its root's slope, so a whole subtree
+     recedes as one. */
+  --ql: var(--q, 0px);
+  /* **D-snap-9 / §14.4 B (user decision)**: the cone's opening leans **up and
+     to the right** — a roll of this branch's own plane about the view axis, so
+     the trunk stays exactly horizontal (C1) and the branch's far end runs up
+     and right instead of straight up. It leaves `z` untouched, so the focused
+     branch (a = 0) is still exactly the main line's size, and the fit pays for
+     it with `cos ψ` (4.5px on the live panel). */
+  transform: rotateZ(calc(var(--roll, 0) * 1deg)) rotateX(calc(var(--a) * 1deg));
+}
+/* an **unfocused** branch of the root fan: the lower half of the cone. It takes
+   the smaller slope above; `--kof` is the fit's answer (1 … FAN_MIN_SCALE). */
+.rw-branch.unfocused {
+  --ql: calc(var(--q, 0px) * var(--kof, 1));
 }
 /* a branch of a branch (D-cone-6/7, D-fan-4): its container sits on its
    parent's bead inside the parent's container, and it turns by its own angle
@@ -1947,8 +1967,13 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
    fan turn at double the scroll rate. */
 .rw-branch .rw-branch {
   left: calc((var(--hinge, 0) - var(--ph, 0)) * var(--cell));
-  top: calc(-1 * var(--po, 0) * var(--q, 0px));
+  top: calc(-1 * var(--po, 0) * var(--ql, var(--q, 0px)));
   --eff: var(--theta);
+  /* **v0.5.73**: unlike its parent, a nested container carries **no roll** —
+     the roll belongs to the root plane and would otherwise compose twice — and
+     it keeps the slope it inherited (`--ql`, which a nested fan does *not*
+     re-derive). */
+  transform: rotateX(calc(var(--a) * 1deg));
 }
 
 /* the spine: one straight bar from the bead `--d0` steps out of the parent
@@ -1956,13 +1981,13 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
 .rw-br-line {
   position: absolute;
   left: calc(var(--d0, 0) * var(--cell));
-  top: calc(-1 * var(--d0, 0) * var(--q, 0px));
+  top: calc(-1 * var(--d0, 0) * var(--ql, var(--q, 0px)));
   height: 2px;
   margin-top: -1px;
   border-radius: 2px;
   transform-origin: 0 50%;
-  width: hypot(calc(var(--dx, 1) * var(--cellpx, var(--cell))), calc(var(--n, 1) * var(--q, 0px)));
-  transform: rotate(calc(-1 * atan2(calc(var(--n, 1) * var(--q, 0px)), calc(var(--dx, 1) * var(--cellpx, var(--cell))))));
+  width: hypot(calc(var(--dx, 1) * var(--cellpx, var(--cell))), calc(var(--n, 1) * var(--ql, var(--q, 0px))));
+  transform: rotate(calc(-1 * atan2(calc(var(--n, 1) * var(--ql, var(--q, 0px))), calc(var(--dx, 1) * var(--cellpx, var(--cell))))));
   background: var(--accent);
 }
 .rw-br-line.abandoned { background: var(--text-muted); opacity: calc(var(--fade, 1) * 0.35); }
@@ -1981,10 +2006,12 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
    (D-orb-5). The counter-rotation is the plane's absolute angle, so a bead on
    a branch that has turned behind the trunk stays square to the camera. */
 .rw-branch .rw3-node {
-  top: calc(-1 * var(--out, 1) * var(--q, 0px));
+  top: calc(-1 * var(--out, 1) * var(--ql, var(--q, 0px)));
   left: calc((var(--x) - var(--hinge)) * var(--cell));
   transform-origin: 50% var(--dot-c, 6.5px);
-  transform: translate(-50%, calc(-1 * var(--dot-c, 6.5px))) rotateX(calc(-1 * var(--abs, 0) * 1deg));
+  transform: translate(-50%, calc(-1 * var(--dot-c, 6.5px)))
+             rotateX(calc(-1 * var(--abs, 0) * 1deg))
+             rotateZ(calc(-1 * var(--roll, 0) * 1deg));
   pointer-events: auto;
 }
 /* The depth dim lives on the *leaves* of a bead, never on the bead or its

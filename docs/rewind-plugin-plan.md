@@ -2630,3 +2630,91 @@ Everything stays **client + stylesheet** — the server projection does not chan
   screen-tilted by ψ — not straight up)? **[recommended: yes to both, ψ = −10°]**
 * **D-snap-10**: the supersession list of §15.5 (D-fan-1/3/4/5, D-orb-8, and D-cone-8's full
   circle bounded again while the walk keeps wrapping). **[recommended: accept]**
+
+---
+
+## §15.9 As built (v0.5.73, 2026-10-05)
+
+Shipped as the default, exactly as §15.8 recommends, with the three
+corrections below — all three are **measurements**, taken on the live fixture
+(`rewind`, 34 cols, 418px scene, 3 root branches, a nested child on the
+parent's first bead), not preferences.
+
+**The constants that landed**
+
+| what | value | measured effect |
+| --- | --- | --- |
+| `SCENE_AXIS_FRAC` | **0.68** (not 0.72) | `q 25.7 → 36.5px` (**+42%** on the focused branch), `--kof 0.82` |
+| `FAN_ARC_INSET` (δ) | 30° | no unfocused branch is edge-on; the live detents are `120°/0°/−120°` |
+| the unfocused slope | `--ql = --q · --kof`, `--kof = 0.82` | the lower arc fits; every dot still 13px (the focused one exactly 13.00) |
+| `NESTED_SHIFT` | **2 steps** | K1 across all detents: `0.0px → 44/29/29px` |
+| `CONE_ROLL_DEG` | **0** (wired, inert) | see below |
+
+**Correction 1 — the axis is 0.68, not 0.72.** §15.3 picked `f = 0.72` on the
+scale numbers alone. Live, 0.72 makes `--kof` collapse to 0.65, and then the
+**first bead of an end-of-arc branch sits 12.7px from the trunk's own bead in
+the same column** — a hair inside one dot (measured 7.7/9.2px once the
+perspective and the roll were applied). At 0.68 the same distance is 15px
+(clear) for 8px less reach. Both are modelled two ways (the analytic model and
+the live DOM) and agree.
+
+**Correction 2 — a nested fan starts **two** steps out, and this is the whole
+of K1's fix.** §14.1's K1 was diagnosed as a solver problem; it is not. K1 is
+exact and **phase-independent**: with `po == out` both `(po − out)·q` and
+`−(po − out)·q·sin a` vanish, so the child's bead is on the trunk row at every
+phase and no relaxation of *angles* or *radii* can change that (only moving
+the child itself). `out = po + 2` cannot cancel for any phase. Two, not one:
+at one step the bead is 8.7px from a sibling branch's bead at the detent where
+that sibling is focused; at two it is ≥ 20px from everything at all three
+detents. The branch's reach (`data-n`, `--n`) grows with it, so the fit and
+the spine stay correct — verified: the longest branch's beads are 0.1px off
+its spine and its last bead is at 99.7% of it.
+
+**Correction 3 — the up-right tilt must not be a `rotateZ`.** D-snap-9's roll
+is the wrong mechanism and was shipped **off** (`CONE_ROLL_DEG = 0`, the CSS
+wired and inert). `rotateZ(ψ)` on a branch's plane rolls that branch's **own
+column axis** as well: a 7-column branch's bead line then spans
+`±7·cell·sin ψ` = 41px at ψ = 10°, which tilted the bead line and lifted its
+far beads **above the trunk row** — the probe caught unfocused beads on the
+wrong side of the axis at three of the four steps. What the user asked for
+("the cone's opening leans up-right") is a **shear of the radial direction
+only**: each step leans, the columns stay horizontal. That is §14.6's D-slant
+question (O-slant-1..3), and it stays open.
+
+**Verified (all green, live, 2026-10-05 00:42)**
+
+* `/tmp/carousel_probe.py 8480 rewind` — **0 failed checks** over S1–S6: at
+  every detent exactly one branch is focused, the detent phase is exactly 0,
+  **every unfocused root branch's beads are below the axis**, no branch pair
+  coincides, the focused branch's dots are exactly 13.00px (the rest
+  11.7…13.2px, the perspective's band), the axis is `0.68·h`, `q = 36.5px`,
+  `--kof = 0.82`, and 3 wheel notches walk `fin0 → fin2 → fin3 → fin0` —
+  every notch a *new* branch up, the walk wrapping.
+* `/tmp/spine_probe.py 8480 rewind` — the spine still ends on its last bead
+  (a 7-round branch: beads 0.1px off the line, the last at 99.7%).
+* `cargo check --target wasm32-unknown-unknown` clean; `trunk build`
+  succeeds; `cargo test -p rushi-web` unchanged; the two native law tests
+  (extracted, `rustc --test`) pass.
+
+**Still open (ranked)**
+
+1. **K3, the mirror pair (8.3px measured)** — the two one-bead lower branches
+   of the live fixture are mirror images on one column, and the symmetric arc
+   is *why the walk is jump-free*: any asymmetric placement of a `k = 3` fan
+   teleports branches at the detent (proved in the model: a 180–240° swing).
+   The options, in the order §15.7 stages them: (a) **O-snap-0**, the §14.3
+   relaxation run **per detent**, which may only nudge within its cap — it
+   cannot fix a mirror pair *by angles* either, so it must be given a lateral
+   DOF; (b) **D-snap-1b(ii)**, a column-aware **x-stagger** of a half cell for
+   branches sharing a column (a static assignment keeps it jump-free; the cost
+   is that the focused branch can be 17px off its own columns); (c) accept it
+   (8.3px of overlap between two 13px dots at the *bottom* of the cone, the
+   dimmest, smallest, most "background" pair in the scene).
+2. **The up-right tilt** (Correction 3) — the shear form, D-slant.
+3. `k ≥ 4` is unbuilt and unmeasurable here: **no session on this host has
+   more than 3 root branches** (`flow_check.py`: every other session has 0 or
+   1). D-snap-6's "allow the minimum above the trunk" is written but never
+   exercised — the first real `k ≥ 4` session must be looked at before the
+   rule is trusted.
+4. The **hardened** relaxed-state question of §14.5 R8: with the roll off,
+   nothing in the current build depends on `--roll` being non-zero.

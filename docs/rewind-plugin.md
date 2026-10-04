@@ -1,9 +1,10 @@
 # Rewind plugin — the history tree
 
 Status: **implemented** (P1–P7, the v0.5.56b/v0.5.57 additions, and
-**Style B — the flow scene**, v0.5.63–v0.5.71, of
-`rewind-plugin-plan.md`; §10 there is the plan, §10.8/§12.9/§13.6/§13.8 the
-as-built records). UI text is English.
+**Style B — the flow scene**, v0.5.63–v0.5.73, of
+`rewind-plugin-plan.md`; §10 there is the plan, and §10.8/§12.9/§13.6/§13.8/
+§14/§15 the as-built records — §15 is **the focus carousel**, v0.5.73's
+current shape). UI text is English.
 
 The rewind plugin lets a user rewind a conversation to any earlier user
 message **without losing anything**: every branch stays in the same
@@ -306,7 +307,7 @@ it supersedes the earlier "list is the default"). `list` stays one click away
 and persisted under `rushi-rw-view`; Style A's probe pins that key explicitly
 so it always tests the style it means to test.
 
-### 3b.6 The cone: how the flow scene is laid out (v0.5.68 → v0.5.72)
+### 3b.6 The cone: how the flow scene is laid out (v0.5.68 → v0.5.73)
 
 The session's history stays the horizontal **axis** — the trunk, which never
 moves — and every **forking branch** is a straight **ray** leaving its
@@ -326,8 +327,47 @@ ribbon per branch").
   half gives, because a branch now reaches as far below the trunk as above it.
   One slope for the whole cone, so branches never cross. The x step stays one
   column per round (D-cone-3), so a branch never becomes a second time axis.
-* **The angle — a full circle (v0.5.71, D-cone-8), shared evenly (v0.5.72,
-  D-fan-1..4).**
+* **The angle — the focus carousel (v0.5.73, plan §15, D-snap-1..10).** The
+  root fan is **ranked** against a *focus*: the focused branch hangs at `0`
+  (straight up, `z = 0`, so its beads are exactly the main line's size, 13px
+  measured), and the others are spread over the **lower arc**, inset by
+  `δ = 30°` so none of them is ever edge-on (the K2 class). One wheel notch
+  walks the focus to the next branch **in rank order, wrapping** (`k → 0`), so
+  a gesture is never a no-op (v0.5.69's rule) and every notch brings a new
+  branch up; a drag pans and then settles onto the same detent lattice with a
+  ~300 ms eased snap (`prefers-reduced-motion` snaps instantly). The **view**
+  moves, never the **selection** (D-snap-7). Measured on the live fixture: at
+  every detent exactly one branch is focused, every unfocused root branch's
+  beads are **below the axis**, the phase is exactly 0, and the walk wraps
+  `fin0 → fin2 → fin3 → fin0`.
+* **The fit is asymmetric (v0.5.73, D-snap-5).** The axis sits at
+  **0.68·h**; `q = (axis − margin − dot/2) / longest branch` (36.5px on the
+  live 418px panel, **+42%** on the old 25.7px), and an unfocused branch rides
+  a smaller slope `--ql = --q · --kof` (`--kof = 0.82` there) so the lower arcs
+  fit under the trunk. Nothing scales an *element* — only the step — so every
+  dot is still 13px: the focused branch is 13.00px by construction (`a = 0`),
+  the unfocused ones vary only with the perspective (11.7…13.2px measured).
+* **A nested fan starts two steps out (v0.5.73).** Plan §14.1's **K1** was the
+  exact, phase-independent coincidence of a nested branch whose container
+  offset `po` equals a bead's `out` (the live fixture: a fork off the parent's
+  *first* bead): the radial term `(po − out)·q` and the depth term
+  `−(po − out)·q·sin a` both cancel, so its dot covered the trunk's round at
+  **every** phase (0.0px measured at 24/24 phases). `po + Δ` with `Δ = 2` cannot
+  cancel for any phase — measured 44/29/29px clearance at the three detents —
+  and the spine is lengthened by the same two steps (`data-n`/`--n` are the
+  branch's **reach**, not its bead count) so it still starts at the parent's
+  bead and ends on its last bead (verified: the live 7-round branch's beads sit
+  0.1px off its spine).
+* **The tilt is not shipped (v0.5.73, open).** D-snap-9 wanted the cone's
+  opening to lean up-right. The obvious `rotateZ(ψ)` was **measured wrong**: it
+  rolls the branch's own *column axis* too, so a 7-column branch's bead line
+  gained `±7·cell·sin ψ` (41px at 10°) of height and beads rose above the trunk
+  row. `CONE_ROLL_DEG` is therefore **0** (the CSS machinery, `--roll` and the
+  bead counter-rotation, is wired and inert) and the tilt waits for the shear
+  form (plan §14.6's D-slant questions).
+* **The old angle law — a full circle (v0.5.71, D-cone-8), shared evenly
+  (v0.5.72, D-fan-1..4) — is superseded by the carousel above** (D-snap-10);
+  what follows describes the *turning* it still shares:
   `theta = <the branch's own angle> + (scroll − rest) × (360°/1.5·width)`, then
   **wrapped**: `a = mod(theta + 180, 360) − 180`, in plain CSS `calc()`. A
   branch can therefore point anywhere on the cone — up, sideways, into the
@@ -551,7 +591,10 @@ abandoned rounds are still rendered.
 * `trunk build` — the Leptos CSR bundle.
 * `python3 e2e/orbit_probe.py` (v0.5.70, rewritten for the full circle in
   v0.5.71, extended for the even fan in v0.5.72) — **48 checks, own fixtures,
-  own server**: the ray (`out = k+1` steps, one column each), the one slope and
+  own server**. **Superseded in v0.5.73**: its angle assertions pin the *even
+  fan* law (D-fan-1..6) that the focus carousel replaces (D-snap-10), so it is
+  kept as the record of v0.5.72 and is not re-run; the carousel's own probe
+  takes over (below). Its still-true checks: the ray (`out = k+1` steps, one column each), the one slope and
   its auto-fit to the smaller half of the panel, the spine's span and its start
   on the parent's bead, the nested container inside its parent, the **even
   fan** (every fan's angles are `360/k` apart, none sits on the camera's axis,
@@ -562,6 +605,23 @@ abandoned rounds are still rendered.
   to the pixel), the depth dim being exactly `1 − 0.35·sin a`, the click-to-align
   of a nested tree, the flat projection (`scaleY` of the same rays, round dots
   at any depth) and `prefers-reduced-motion` pinning it.
+* `python3 e2e/carousel_probe.py [port] <session>` (v0.5.73, local) — **S1–S6,
+  all green** on the live fixture: at every detent the wheel walks to, exactly
+  one branch is focused, the detent phase is exactly 0, **every unfocused root
+  branch's beads are below the axis**, no branch pair coincides, the focused
+  branch's dots are exactly 13.00px and the rest are in the perspective's
+  11–16px band, the axis is `0.68·h`, `q` grew to 36.5px and `--kof` is 0.82,
+  and the walk wraps (3 notches: `fin0 → fin2 → fin3 → fin0`, always a *new*
+  branch). Its **residual-collision section is deliberately red-flagged as
+  data**: the closest pairs at the final detent are 8.3px (`fin2 r22 × fin3
+  r23` — the two one-bead lower branches are mirror images on one column, plan
+  §15.2's **K3**) and 13.9px (a branch bead against the trunk's own, clear by a
+  hair). K3 needs the staged relaxation (plan §15.7's **O-snap-0**) or an
+  x-stagger (D-snap-1b): the symmetric arc is what keeps the walk
+  jump-free, and it is *itself* what makes the mirror pair.
+* `python3 e2e/spine_probe.py [port] <session>` (v0.5.73, local) — the spine
+  still ends on its branch's last bead after the nested shift: a 7-round branch
+  is 0.1px off its own line, the last bead at 99.7% along it.
 * `python3 e2e/flow_style_b_probe.py [port]` — **68 checks** (A-I) on a live
   server, including section H's cone shape (and H11/H12, the live root fan's
   even split and a child hanging below its parent) and section C's canaries that
@@ -584,33 +644,8 @@ abandoned rounds are still rendered.
   dialog), the `#plugin-area` entry, the loop-running guard (with a live
   `loop.pid`: every node locked, no dialog, footer explains, card buttons
   disabled), the `409` refusals, the ignored markers and the tail notice.
-* `python3 e2e/orbit_probe.py` — **34 browser assertions** (L1–L12) over
-  fixtures the probe writes and serves itself (a sixty-round trunk with six
-  forks off six early rounds plus a fork *inside* one of them, a one-fork
-  session, a forkless one): the ring's structure, the geometry law
-  recomputed in Python against the painted rects (rotateX **and** the
-  perspective divide, to 3px), the bounded arc and its depth-ordered queue,
-  the trunk unmoved and untransformed through a full turn, the phase riding
-  on `--rw-scroll` alone, click-to-align, hit-testing a turned bead, the
-  flat `−R·cos` projection, reduced motion genuinely static, the zero- and
-  one-fork cases, the nested fin, and no wasm traps.
-* `python3 e2e/flow_style_b_probe.py [port]` — **66 browser assertions**, the
-  Style B surfaces end to end on the live sessions: the switch and its
-  persistence; the 1:2 split and the x-only scroller; the scene (a dot per
-  round, a run per main-line step and a run per forking branch, the lit live
-  path, lane geometry, no dot overlap, the pitch floor and cap); the panel
-  (D5 pre-select, the verbatim text, the button inert on the current round, a
-  click that selects and opens **no** dialog); the button → the one dialog →
-  cancel writes nothing; the 117-round session (pan, wheel, a horizontal
-  delta left native, the flat list); persistence; the orbit section
-  (`.rw-orbit` inside a real perspective, one fin per fork, the trunk on the
-  axis and never turned, a turned fin as a real `matrix3d` with
-  counter-rotated beads, the rest radius, the phase moving and re-anchoring,
-  the flat projection, `prefers-reduced-motion` holding still); and the
-  **paint** — accent pixels counted from real screenshots in the light *and*
-  dark palettes (this is what caught the missing `--lane` on the line's runs).
 * `python3 e2e/flow_check.py [port]` — the flow projection over every session
-  the server knows (`main` chain, cols/lanes, each node's column and lane,
+  the server knows, **8 sessions, 0 problems** on this host (`main` chain, cols/lanes, each node's column and lane,
   the edge list, and since v0.5.68 the ring's own invariants: `orbit.fins`
   against the numbered fins, slots `0..n-1`, the trunk not numbered, `hinge_x`
   the parent's column, the trunk branch carrying exactly the main line, no
