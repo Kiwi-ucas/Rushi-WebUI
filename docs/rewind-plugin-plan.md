@@ -2898,8 +2898,11 @@ Land them as one change, in this order (each is independently verifiable):
 
 Then: `cargo test -p rushi-web` (71), the wasm check + `trunk build`,
 `flow_check.py` (8/0), `rewind_probe.py` (140), rebuild `dist/`, mirror sync
-(canaries), README/TOUCHPOINTS, commit + tag. Rollback stays
-`pre-carousel-2026-10-05`; this change gets its own tag (`round5-2026-10-05`).
+(canaries), README/TOUCHPOINTS and a commit. **No tags** — the user removed
+them (2026-10-05): the rollback points are the **commits**,
+`pre-carousel` = `0d4752d` (§15's last docs commit) and `carousel` = `0525fce`
+(v0.5.73), and round 5's own is `ec67918` (v0.5.74). `git checkout` one of
+those hashes is the whole rollback.
 
 Rough effort: F2 ≈ 5 min, F1 ≈ 45 min (mostly the sampler), F3 ≈ 2 h (the law,
 the fit's reach, the probes, the docs).
