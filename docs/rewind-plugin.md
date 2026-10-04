@@ -1,9 +1,9 @@
 # Rewind plugin — the history tree
 
 Status: **implemented** (P1–P7, the v0.5.56b/v0.5.57 additions, and
-**Style B — the flow scene**, v0.5.63–v0.5.66, of
-`rewind-plugin-plan.md`; §10 there is the plan, §10.8 the as-built record).
-UI text is English.
+**Style B — the flow scene**, v0.5.63–v0.5.71, of
+`rewind-plugin-plan.md`; §10 there is the plan, §10.8/§12.9/§13.6/§13.8 the
+as-built records). UI text is English.
 
 The rewind plugin lets a user rewind a conversation to any earlier user
 message **without losing anything**: every branch stays in the same
@@ -306,7 +306,7 @@ it supersedes the earlier "list is the default"). `list` stays one click away
 and persisted under `rushi-rw-view`; Style A's probe pins that key explicitly
 so it always tests the style it means to test.
 
-### 3b.6 The cone: how the flow scene is laid out (v0.5.68 → v0.5.70)
+### 3b.6 The cone: how the flow scene is laid out (v0.5.68 → v0.5.71)
 
 The session's history stays the horizontal **axis** — the trunk, which never
 moves — and every **forking branch** is a straight **ray** leaving its
@@ -320,21 +320,34 @@ ribbon per branch").
 * **The ray.** A branch's container is a zero-size point **on its parent's
   bead**; it holds one bar (`hypot`/`atan2` over the container's own span and
   slope) and the beads that branch owns, each one column right and one `q`
-  out. `q = (axis − margin − band/2) / longest branch` is the auto-fit slope:
-  the longest branch's last bead lands on the panel's top edge, and every
-  other branch is steeper-looking or shallower for free — one slope for the
-  whole cone, so branches never cross. The x step stays one column per round
-  (D-cone-3), so a branch never becomes a second time axis.
-* **The angle.** `theta = (slot − align) × 30° + (scroll − rest) × (360°/1.5·width)`,
-  clamped to ±60°: three slots are inside the arc, the rest *park* at its ends
-  — pushed back in depth and faded, so they read as a queue and every branch
-  takes its turn at the front as the scene pans. Scrolling moves exactly one
-  value (`--rw-scroll`); everything else is written at layout time.
+  out. `q = r / longest branch` is the auto-fit slope, with
+  `r = min(axis, h − axis) − margin − band/2`: since **v0.5.71** (D-cone-9) the
+  axis sits at the panel's **middle** and the fit spends what the *smaller*
+  half gives, because a branch now reaches as far below the trunk as above it.
+  One slope for the whole cone, so branches never cross. The x step stays one
+  column per round (D-cone-3), so a branch never becomes a second time axis.
+* **The angle — a full circle (v0.5.71, D-cone-8).**
+  `theta = (slot − align) × 30° + (scroll − rest) × (360°/1.5·width)`, then
+  **wrapped**: `a = mod(theta + 180, 360) − 180`, in plain CSS `calc()`. A
+  branch can therefore point anywhere on the cone — up, sideways, into the
+  screen, straight down — and 360° of turning brings it back exactly where it
+  started, for ever. This replaced v0.5.68–70's **bounded arc** (±60°, with
+  the extra branches *parked* at its ends: clamped, pushed back in depth and
+  faded), which is why branches used to be drawn only *above* their parent and
+  used to slide out of sight when a scene was turned too far. Every branch is
+  always on the cone now, 30° apart. Scrolling still moves exactly one value
+  (`--rw-scroll`); everything else is written at layout time.
+* **The depth cue (v0.5.71, D-cone-10).** With the park gone, the near and the
+  far half of the circle share a ray, so the half pointing *away* from the
+  viewer is dimmed: `--fade: 1 − 0.35·max(0, sin a)` (near 1.0, far 0.65;
+  straight down stays lit). It remains a **value** read by the leaves, and each
+  round's own state factor is multiplied into it.
 * **A fork off a branch nests.** When a branch's parent is itself on a branch,
   its container is rendered *inside* the parent's container (D-cone-6), at
   `−po·q` along the parent's plane, so its line starts on the parent's bead
   and it fans **relative to its parent** (`slot·30°`, with no second phase —
-  D-cone-7 as the user corrected it). Depth is unbounded.
+  D-cone-7 as the user corrected it). Depth is unbounded, and since v0.5.71 the
+  fan is not clamped either: on a cone ±120° is a place like any other.
 * **The alignment.** `align` is the selected round's fin, else the current
   round's fin, else 0, and the *rest* offset is re-anchored whenever the
   layout runs, so "at rest" always means "the current branch is at the
@@ -350,9 +363,25 @@ ribbon per branch").
   not take: the wheel accumulates its overshoot at either end, the drag sets
   it from the pointer's own wish. A scene that can pan behaves exactly as
   before, one value per frame; a scene that cannot, turns the cone where it
-  stands. The turn resets with `--rw0` at every **layout point** (a new scene,
-  a new selection, a resize, a session switch), so rest still means alignment,
-  and a bare re-measure (`on:pointerdown`) leaves the cone alone.
+  stands — which is what makes D-cone-8's "infinitely rotatable" reachable even
+  in a session with no scroll range. The turn resets with `--rw0` at every
+  **layout point** (a new scene, a new selection, a resize, a session switch),
+  so rest still means alignment, and a bare re-measure (`on:pointerdown`)
+  leaves the cone alone.
+* **The scene measures itself when it mounts (v0.5.71, D-cone-12).** Mounting
+  is not a reactive event: when the History opens, none of `view`/`tree`/
+  `selected` changes, and the tree had already been fetched while the *split*
+  plugin body was showing — so the layout effect had early-returned (there was
+  no `#rw-flow-scroll` to measure) and the scene painted with **no geometry at
+  all**. An empty `--q` makes `var(--q, 0px)` 0 (beads sit on the trunk), and an
+  empty `--cellpx` puts a *container unit* inside `atan2()`, which invalidates
+  the whole `transform` (the spine stays horizontal). That is exactly "the
+  previous version's purely horizontal look", and it persisted until any
+  pointer press (`on:pointerdown` measures) or a tree refetch repaired it. A
+  per-mount `ResizeObserver` on the scroller — fired once on observe and on
+  every box change (mount, split↔full, sidebar, panel) — plus the layout signal
+  in the flow effect's dependency list now cover every way the scene can come
+  up.
 * **The projection is taken *live* (v0.5.69).** The server's pop guard is the
   kernel's own — but the kernel only runs it between turns, when every call of
   the previous turn is answered, while the plugin projects on every request.
@@ -362,20 +391,26 @@ ribbon per branch").
   while the agent worked, `4 fins` a moment later). The rule is narrow: a pair
   the *mask* splits still strands, and a dead loop gets the kernel's exact
   behaviour.
-* **The beads.** A branch's rounds ride its plane, each counter-rotated about
-  its own dot so numbers stay upright; the plane itself is what tips into the
-  screen. Clicking, hover tooltips and `elementFromPoint` all work on a turned
-  branch. Two engine facts are load-bearing here and were measured the hard
-  way: an element with `opacity < 1` becomes a **grouping element** and
-  flattens its 3D children, so the park fade is a *value* (`--fade`) read by
-  the leaves, never the `opacity` property on a container; and a bead must
-  counter-rotate by its plane's **absolute** angle, which the render supplies
-  (`--sroot`/`--sum`) because CSS cannot add an ancestor's variable to its own
-  without a cycle. `hypot()`/`atan2()` are usable but not with container units
-  inside them, so the cell and the slope cross into CSS as px (`--cell`, `--q`).
+* **The beads.** A branch's rounds ride its plane, each counter-rotated by the
+  plane's **absolute** angle so numbers stay upright; the plane itself is what
+  tips into the screen. Clicking, hover tooltips and `elementFromPoint` all
+  work on a turned branch — and because the near and the far half of a full
+  circle share a ray, a bead *behind* another is legitimately covered (the
+  depth dim says so), while anything else covering a bead would be a bug. Two
+  engine facts are load-bearing here and were measured the hard way: an element
+  with `opacity < 1` becomes a **grouping element** and flattens its 3D
+  children, so the depth dim is a *value* (`--fade`) read by the leaves, never
+  the `opacity` property on a container; and a bead must counter-rotate by its
+  plane's absolute angle, which the render supplies (`--sroot`/`--sum`)
+  because CSS cannot add an ancestor's variable to its own without a cycle.
+  `hypot()`/`atan2()` are usable but not with container units inside them, so
+  the cell and the slope cross into CSS as px (`--cellpx`, `--q`). CSS `mod()`
+  — the wrap's only new primitive — was measured to work in the target
+  Chromium, negative arguments and custom-property chains included.
 * **Degenerate cases.** No fork: no branch at all, the flat line the scene
-  always was. One fork: a **swing** (`25°·sin(phase)`) instead of a cone that
-  can park — one CSS line, no server field.
+  always was. One fork: since v0.5.71 (D-cone-11) it orbits the trunk like
+  every other branch — the old `25°·sin(phase)` swing existed only because a
+  bounded arc had nowhere for a lone branch to go.
 * **Less motion.** `prefers-reduced-motion: reduce` unfolds the same local
   geometry onto rows with the container's `scaleY(cos a − 0.12·sin a)` *and*
   pins the phase, so it is genuinely static; the 3D-off-but-still-sliding
@@ -385,21 +420,20 @@ ribbon per branch").
   beside the dynamic `--kroot`), so its dot stays round at any depth.
 
 The old lane-vs-trunk hinge (`.rw3-hinge`) and the per-branch ribbon
-(`.rw-fin`) with its elbow bars (`.rw3-elbow`) are **deleted** (D-cone-3);
-the stylesheet mirror's extractor asserts their absence. Implementation
-record, the three engine traps, the one honest limitation (a *parked*
-branch's plane travels with its push, so its spine no longer lands exactly on
-its parent's bead in projection) and the pixel measurements are **§13.6 of
+(`.rw-fin`) with its elbow bars (`.rw3-elbow`) are **deleted** (D-cone-3), and
+since v0.5.71 so is the `solo` class; the stylesheet mirror's extractor asserts
+their absence. Implementation record, the three engine traps, the fixes for the
+three defects live use found and the pixel measurements are **§13.6–§13.8 of
 `rewind-plugin-plan.md`**; the deep probe is `e2e/orbit_probe.py` (L1–L12,
-**40 checks**, own fixtures) and the live-shape probe is section H of
+**44 checks**, own fixtures) and the live-shape probe is section H of
 `e2e/flow_style_b_probe.py`.
 
 **v0.5.69 open item (still open).** The two live defects are covered by unit
 tests and were confirmed against the live API, and the four probes have since
-been re-run green (v0.5.70) — but the two *new* browser checks that would pin
-them (a cone that turns on a scene too narrow to pan, and a `loop.pid` toggle
-for the pending rule) were deferred at the user's request, because they were
-reviewing that fix by hand.
+been re-run green (v0.5.70, v0.5.71) — but the two *new* browser checks that
+would pin them (a cone that turns on a scene too narrow to pan, and a
+`loop.pid` toggle for the pending rule) were deferred at the user's request,
+because they were reviewing that fix by hand.
 
 ## 4. Rewind is forbidden while the loop runs (decision 5)
 
@@ -487,18 +521,21 @@ abandoned rounds are still rendered.
 ## 6. Verification
 
 * `cargo test -p rushi-web` — the projection against the kernel fixtures,
-  the flow layout, the ring's fin/hinge/round attribution, the per-round
+  the flow layout, the fin/hinge/round attribution, the per-round
   detail, and (v0.5.69) the two live-projection rules: a pending in-flight
   call never drops a marker, a mask-split pair always does
   (**71 tests green**).
 * `trunk build` — the Leptos CSR bundle.
-* `python3 e2e/orbit_probe.py` (v0.5.70) — **40 checks, own fixtures, own
-  server**: the ray (`out = k+1` steps, one column each), the one slope and
-  its auto-fit, the spine's span and its start on the parent's bead, the
-  nested container inside its parent, the arc's queue and its parking order,
-  the turn under scroll (every bead still on the law), the click-to-align of a
-  nested tree, the flat projection (`scaleY` of the same rays, round dots at
-  any depth) and `prefers-reduced-motion` pinning it.
+* `python3 e2e/orbit_probe.py` (v0.5.70, rewritten for the full circle in
+  v0.5.71) — **44 checks, own fixtures, own server**: the ray (`out = k+1`
+  steps, one column each), the one slope and its auto-fit to the smaller half
+  of the panel, the spine's span and its start on the parent's bead, the nested
+  container inside its parent, the **unbounded turn** (nothing parked, `z` push
+  always 0, |angle| past 90° and reaching 180°, and a whole 360° spent on a real
+  **wheel** returning every bead to the pixel), the depth dim being exactly
+  `1 − 0.35·sin a`, the click-to-align of a nested tree, the flat projection
+  (`scaleY` of the same rays, round dots at any depth) and
+  `prefers-reduced-motion` pinning it.
 * `python3 e2e/flow_style_b_probe.py [port]` — **66 checks** (A-I) on a live
   server, including section H's cone shape and section C's canaries that
   the ribbon (`.rw-fin`) and the elbow bars (`.rw3-elbow`) are gone.

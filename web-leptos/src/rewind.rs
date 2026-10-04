@@ -26,7 +26,7 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
-use web_sys::{HtmlElement, MouseEvent, PointerEvent};
+use web_sys::{HtmlElement, MouseEvent, PointerEvent, ResizeObserver};
 
 use crate::api;
 use std::collections::HashMap;
@@ -126,6 +126,27 @@ thread_local! {
     /// The one `resize` listener Style B installs. A resize is a layout
     /// point (not a scroll frame), so the scene re-measures itself here.
     static SCENE_RESIZE: RefCell<Option<Closure<dyn Fn()>>> = const { RefCell::new(None) };
+    /// **bug 3 (D-cone-12, user decision, v0.5.71)**: the scene's own layout
+    /// probe — one `ResizeObserver` on the element the scene is mounted at.
+    ///
+    /// Mounting is *not* a reactive event: when the History opens, none of the
+    /// flow effect's dependencies (`view`/`tree`/`selected`) changes, and its
+    /// `Timeout(0)` has already fired while the scene was still absent (the
+    /// split plugin body fetches the tree, so `sync_scene_metrics` returned
+    /// early and never measured). The scene therefore used to paint with **no
+    /// geometry at all** — `--q`/`--cellpx`/`--axis` empty — which fell back to
+    /// a plain horizontal line, i.e. "the previous version's look", until some
+    /// later event (a pointer press, a tree refetch) measured it.
+    ///
+    /// A `ResizeObserver` fires once when it is observed and on every box
+    /// change after that, which is exactly the set of layout points the
+    /// geometry needs: the mount, the split↔full switch, the sidebar, the
+    /// panel. One slot: the probe is re-armed (and the old one disconnected)
+    /// whenever the measured element changes.
+    static SCENE_OB: RefCell<Option<(ResizeObserver, Closure<dyn FnMut(js_sys::Array)>)>> =
+        const { RefCell::new(None) };
+    /// The element `SCENE_OB` currently watches, for the identity compare.
+    static SCENE_OB_EL: RefCell<Option<HtmlElement>> = const { RefCell::new(None) };
     /// **v0.5.69 (round-3 defect 2)**: the turn a gesture could not spend
     /// on panning — see [`pan_and_turn`]. `--rw-scroll` is
     /// `scrollLeft + this`, so a scene narrower than its panel (which is
@@ -155,21 +176,73 @@ fn set_turn(v: f64) {
 /// (`--halfpw`, `--denom`). Numbers, never lengths: CSS cannot divide a
 /// length by a length, and this way the proxy costs one `setProperty` per
 /// scroll event and never reads layout while scrolling.
-/// **v0.5.68 (D-orb-1, user decision)**: where the trunk sits in the scene,
-/// as a fraction of its height. The ring is drawn *above* the trunk (the
-/// bounded arc of D-orb-2 lives on the upper half), so the axis is below the
-/// middle and the fins get the room.
-const SCENE_AXIS_FRAC: f64 = 0.62;
-/// Half the fin band in px (the CSS gives `.rw-fin` a 26px band).
+/// **D-cone-9 (user decision, v0.5.71)**: where the trunk sits in the scene,
+/// as a fraction of its height. The cone turns a **full circle** (D-cone-8),
+/// so a branch's far end sweeps as far below the trunk as above it and the
+/// room the fit can spend is what the *smaller* half gives — the frame is
+/// symmetric about the axis, so the axis goes in the middle.
+/// (v0.5.68..70 put it at 0.62, when the bounded arc only ever used the upper
+/// half. That is why branches could never appear below their parent.)
+const SCENE_AXIS_FRAC: f64 = 0.5;
+/// Half the bead band in px (the CSS gives a `.rw3-dot` a 13px dot).
 const FIN_HALF_PX: f64 = 13.0;
-/// Air between the farthest fin's end and the panel's edge.
+/// Air between the farthest bead's end and the panel's edge.
 const FIN_MARGIN_PX: f64 = 16.0;
-/// A ring smaller than this reads as a squashed line; below it the fit gives
+/// A cone smaller than this reads as a squashed line; below it the fit gives
 /// way rather than the geometry.
 const FIN_MIN_RADIUS_PX: f64 = 34.0;
 /// **D-orb-8**: one full turn per 1.5 scene widths of scrolling — a fixed
 /// angular rate, so the gesture feels the same in every session.
 const ORBIT_DEG_PER_WIDTH: f64 = 360.0 / 1.5;
+
+/// Keep the scene's layout probe on `scroll` (bug 3 / D-cone-12). Cheap: the
+/// element is compared by identity, and an already-armed scene does nothing.
+/// A re-render that replaces the node re-arms the observer on the new one.
+fn arm_scene_probe(scroll: &HtmlElement) {
+    SCENE_OB_EL.with(|slot| {
+        if slot.borrow().as_ref() == Some(scroll) {
+            return;
+        }
+        SCENE_OB.with(|obs| {
+            let mut obs = obs.borrow_mut();
+            if let Some((old, _)) = obs.take() {
+                old.disconnect();
+            }
+            let cb = Closure::<dyn FnMut(js_sys::Array)>::new(|_: js_sys::Array| {
+                relayout_scene()
+            });
+            if let Ok(ro) =
+                ResizeObserver::new(cb.as_ref().unchecked_ref::<js_sys::Function>())
+            {
+                ro.observe(scroll);
+                *obs = Some((ro, cb));
+            }
+        });
+        slot.borrow_mut().replace(scroll.clone());
+    });
+}
+
+/// The scene's **mount** layout point: arm the probe on the element that is
+/// there right now and measure once, so the first paint is the cone rather
+/// than the horizontal fallback. Returns false when the scene is not in the
+/// DOM yet (the tree is still loading), where the tree effect's own
+/// `relayout_scene` will arm it later.
+fn arm_scene_probe_now() -> bool {
+    let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
+        return false;
+    };
+    let Some(scroll) = doc
+        .query_selector("#rw-flow-scroll")
+        .ok()
+        .flatten()
+        .and_then(|e| e.dyn_into::<HtmlElement>().ok())
+    else {
+        return false;
+    };
+    arm_scene_probe(&scroll);
+    relayout_scene();
+    true
+}
 
 fn sync_scene_metrics() {
     let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
@@ -183,6 +256,7 @@ fn sync_scene_metrics() {
     else {
         return;
     };
+    arm_scene_probe(&scroll);
     let w = scroll.client_width().max(1) as f64;
     let h = scroll.client_height().max(1) as f64;
     let half = w / 2.0;
@@ -194,23 +268,24 @@ fn sync_scene_metrics() {
     mark_scroll(&scroll);
 
     // ── the orbital scene's pixels (the server owns the angles) ─────
-    // The axis, and the radius the auto-fit gives it: the farthest fin is
-    // the one at the front of the arc (its projected row is `-R`, z = 0, so
-    // the perspective does not stretch it), and its end is half a fin above
-    // that. `R = axis - margin - band/2` puts it exactly inside the panel —
-    // D-orb-1 asked for the far end to *just* fit.
+    // The axis, and the radius the auto-fit gives it: a branch's farthest
+    // bead sweeps a whole circle of radius `r` about its parent's bead
+    // (D-cone-8), so `r` is what the *smaller* half of the panel gives, minus
+    // half a bead and a little air — D-orb-1 asked for the far end to *just*
+    // fit, and with a full circle that holds on the way down as well.
     let axis = (h * SCENE_AXIS_FRAC).round();
-    let r = (axis - FIN_MARGIN_PX - FIN_HALF_PX).max(FIN_MIN_RADIUS_PX);
+    let room = axis.min(h - axis);
+    let r = (room - FIN_MARGIN_PX - FIN_HALF_PX).max(FIN_MIN_RADIUS_PX);
     let _ = st.set_property("--axis", &format!("{axis}px"));
     // px, not a bare number: the CSS reads it as a length
     let _ = st.set_property("--r", &format!("{r}px"));
-    // ── v0.5.70: the cone's slope (plan §13, D-cone-2) ───────────────
     // Every branch shares one slope, and the *longest* branch sets it: its
-    // farthest bead is the scene's highest point, so `q = span / longest`
-    // puts that bead exactly inside the panel — the same auto-fit the ring's
-    // radius had, per step instead of per branch. The length is read back off
-    // the DOM (each container carries `data-n`), so the slope stays a
-    // layout-time pixel value and the CSS keeps owning the cell.
+    // farthest bead sweeps the scene's whole circle (D-cone-8), so
+    // `q = r / longest` puts that bead exactly inside the panel at every
+    // angle — the same auto-fit the ring's radius had, per step instead of per
+    // branch. The length is read back off the DOM (each container carries
+    // `data-n`), so the slope stays a layout-time pixel value and the CSS
+    // keeps owning the cell.
     let longest = doc
         .query_selector_all(".rw-branch")
         .ok()
@@ -286,11 +361,16 @@ pub fn register_flow_effects(state: AppState) {
     let view = state.rw_view;
     let selected = state.rw_selected;
     let detail = state.rw_detail;
+    let layout = state.layout_mode;
 
     // B7: a new scene (or a resized panel) re-measures the ribbons. The
     // first pass runs after the render that produced them.
+    // **bug 3**: `layout` is in the dependencies because *opening the History*
+    // is a layout change and nothing else — without it this effect never sees
+    // the scene appear (the scene arms its own probe too; see
+    // [`arm_scene_probe`], this is the second line of defence).
     Effect::new(move || {
-        let _ = (view.get(), tree.get(), selected.get());
+        let _ = (view.get(), tree.get(), selected.get(), layout.get());
         relayout_scene();
         gloo_timers::callback::Timeout::new(0, relayout_scene).forget();
     });
@@ -943,6 +1023,21 @@ fn flow_scene(state: AppState) -> AnyView {
     let tree = state.rewind_tree;
     // the scene draws the ring's alignment from the selection (D-orb-7)
     let selected = state.rw_selected;
+    // **bug 3 (D-cone-12)**: the scene measures itself when it *mounts*. This
+    // effect belongs to the scene's own lifetime, so it runs after the render
+    // that produced this element — whatever brought the scene up (the History
+    // opening, the plugin coming back, a style switch) and whoever else did or
+    // did not change in the same tick.
+    Effect::new(move || {
+        if !arm_scene_probe_now() {
+            // the tree is still loading: the scene mounts a moment later, and
+            // that render's own tree effect measures and arms it
+            gloo_timers::callback::Timeout::new(0, || {
+                let _ = arm_scene_probe_now();
+            })
+            .forget();
+        }
+    });
     view! {
         { move || {
             let Some(t) = tree.get() else {
@@ -959,10 +1054,10 @@ fn flow_scene(state: AppState) -> AnyView {
             let f = t.flow.clone();
             let cells = f.cols.max(1).to_string();
             let lanes = f.lanes.max(1).to_string();
-            // the ring's angular step and the visible arc, from the server
-            // (one source of truth for the constants, tested there)
+            // the ring's angular step, from the server (one source of truth
+            // for the constant, tested there). D-cone-8: `arc_deg` is no
+            // longer read — a branch turns the whole circle.
             let step = f.orbit.step_deg.max(1).to_string();
-            let arc = f.orbit.arc_deg.max(1).to_string();
             // Where each node sits, and whether it is on the live path: the
             // connectors are drawn from the parent's dot, and an edge is lit
             // by the child's state (D1 — the *path* is highlighted, so the
@@ -1090,14 +1185,11 @@ fn flow_scene(state: AppState) -> AnyView {
                 parent_of: &parent_of,
                 kids: &kids,
                 step: f.orbit.step_deg.max(1),
-                arc: f.orbit.arc_deg.max(1),
             };
             let fins: Vec<AnyView> = roots
                 .iter()
                 .map(|&i| cone.branch(i, 0, 0, i as i32, i as i32, 0, 1.0, 0))
                 .collect();
-            // how many fins the ring actually has (D-orb-9 reads this)
-            let fins_len = by_fin.len();
 
             let trunk_nodes: Vec<AnyView> = f
                 .nodes
@@ -1203,19 +1295,17 @@ fn flow_scene(state: AppState) -> AnyView {
                     <div
                         id="rw-flow-track"
                         style=format!(
-                            "--cols:{cells}; --lanes:{lanes}; --align:{align}; --step:{step}; \
-                             --arc:{arc}",
+                            "--cols:{cells}; --lanes:{lanes}; --align:{align}; --step:{step}",
                         )
                     >
                         <div class="rw3-grid">
                             { trunk_edges }
                             { trunk_nodes }
-                            // D-orb-9: a lone branch is a *swing*, not a ring
-                            // that can park — the class lets the stylesheet
-                            // read the phase through a sine instead.
-                            <div class={move || {
-                                if fins_len == 1 { "rw-orbit solo" } else { "rw-orbit" }
-                            }}>{ fins }</div>
+                            // D-cone-11 (user decision, v0.5.71): every branch
+                            // turns the same way — a lone one orbits the trunk
+                            // like the rest, so the ring carries no `solo`
+                            // special case any more.
+                            <div class="rw-orbit">{ fins }</div>
                         </div>
                         <div class="rw3-sheen"></div>
                     </div>
@@ -1257,9 +1347,8 @@ struct Cone<'a> {
     by_fin: &'a HashMap<u32, &'a FlowBranch>,
     parent_of: &'a HashMap<u64, u64>,
     kids: &'a HashMap<u32, Vec<u32>>,
-    /// The server's ring constants, for the static part of a nested chain.
+    /// The server's ring step, for the static part of a nested chain.
     step: i32,
-    arc: i32,
 }
 
 /// Style B's flat projection shrinks a branch's outward step by this factor
@@ -1299,10 +1388,14 @@ impl Cone<'_> {
         // this container's own static flat factor (1 at the root: the root's
         // turn carries the phase, so the stylesheet reads that one from
         // `--root_a`). The children inherit it through `--kup`.
+        // D-cone-8: no clamp any more — a nested fan's slot is a real angle
+        // (two slots per child, D-cone-7) and on a cone ±120° is a place like
+        // any other, instead of a park that would land two children on top of
+        // each other.
         let kown = if depth == 0 {
             1.0
         } else {
-            flat_k((slot * self.step).clamp(-self.arc, self.arc) as f64)
+            flat_k((slot * self.step) as f64)
         };
         let hinge = b.hinge_x;
         let seqs = &b.seqs;
@@ -1368,7 +1461,7 @@ impl Cone<'_> {
                         } else {
                             ((k as i32 + 1) / 2) * 2
                         };
-                        let inner = (slot * self.step).clamp(-self.arc, self.arc);
+                        let inner = slot * self.step;
                         // the child's `--kup` is every *ancestor* level's
                         // factor — this container's own included, the child's
                         // own excluded (the child adds that itself)

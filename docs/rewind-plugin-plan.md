@@ -1660,3 +1660,114 @@ reported a nested bead 36px off the law when the paint was exact), and
 rounds (it is 118 now, so it reads the length from the API like the rest).
 `cargo test -p rushi-web` stays at 71; the wasm check and `trunk build` are
 clean.
+
+### 13.7 The three defects live use found (2026-10-04, v0.5.71)
+
+The user reported three bugs right after v0.5.70 shipped, and asked for the
+*causes* first ("详细调研这几个bug的原因"). All three were reproduced and
+measured before any code changed.
+
+**Bug 1 — "why does a branch only turn above its parent?"** Because it did:
+`--a: clamp(-arc, eff, +arc)` with `arc = 60`. Sweeping `--rw-scroll` through
+more than a full turn and reading the *rendered* transform (the `calc()` vars
+cannot be parsed off `getComputedStyle`; `matrix3d`'s m22/m23 give the angle)
+showed the angle never leaving {±60}: 0, 60, 60 … The far bead's `dy` from its
+parent was **always negative** (above), e.g. -210px at rest for the longest
+branch. `SCENE_AXIS_FRAC = 0.62` — a v0.5.68 leftover whose own comment said
+"the bounded arc lives on the upper half" — was the structural half of it.
+
+**Bug 2 — "it detaches from the parent and then shrinks out of sight."**
+Past the arc, `--over` grows without bound (0 → 300 over the sweep) and drives
+two things: the container's `translate3d(0, 0, over·-22px)`, which moves the
+container's **origin** off its parent's bead (measured drift 0 → **86.9px**),
+and `--fade: clamp(0.08, 1 - over/70, 0.92)` on the leaves, while the
+perspective shrank the dots from 13px to **2.2px**. A park that cannot end.
+
+**Bug 3 — "entering the flow view shows the previous version's purely
+horizontal layout."** The scene mounted with **no inline geometry at all**:
+`--rw-scroll`/`--rw0`/`--axis`/`--r`/`--q`/`--cellpx`/`--dpp` all empty,
+`--cell` still the raw `clamp(26px, calc(100cqw / N - 4px), 64px)`, `--phase`
+still an unresolved `calc()`. `sync_scene_metrics` has exactly four callers —
+the flow effect (deps `view`/`tree`/`selected`), its `Timeout(0)`, the window
+`resize` listener and `on_down` — and **entering the History changes none of
+them**: the tree had been fetched while the split plugin body was showing (so
+the effect early-returned with no `#rw-flow-scroll` in the DOM), and opening
+the History only re-rendered chrome. With `--q` empty, `var(--q, 0px)` is 0
+(beads sit on the trunk) and the spine's `atan2()` eats an empty `--cellpx`
+(container unit → invalid → `transform: none`), which is precisely a straight
+horizontal line. The scene painted that way until *any* pointer press
+(`on_down` measures) or a tree refetch fixed it — "click the card and it
+appears".
+
+**The decisions (D-cone-8..12 — all approved by the user, 2026-10-04).**
+
+| # | decision | supersedes |
+| --- | --- | --- |
+| D-cone-8 | The angle becomes a **full circle**: `mod(eff + 180, 360) - 180`. The park (`--over`, the z push, the park fade) and the queue are **deleted**; every branch is always on the cone, 30° apart. | D-orb-2, D-orb-6 |
+| D-cone-9 | The auto-fit fits the **smaller half**: the axis moves to `0.5·h`, `r = min(axis, h-axis) - margin - band/2`, `q = r / longest`. Branches get ~30% shorter (measured on the live `rewind` session: q 30.0 → 23.3px, r 210 → 163px) — the user accepted the shorter branches. | D-orb-1's fit |
+| D-cone-10 | The park fade is replaced by a **depth dim**: the half pointing away from the viewer reads `1 - 0.35·max(0, sin a)` (near 1.0, far 0.65); straight down stays lit. Still a **value** on the leaves, never the `opacity` property on a container. | D-orb-6 |
+| D-cone-11 | The one-branch `solo` swing is **gone**: a lone branch orbits the trunk like every other one, and the `.rw-orbit.solo` class is no longer rendered. | D-orb-9 |
+| D-cone-12 | Bug 3's mechanism: the scene **arms its own probe** — a per-mount `ResizeObserver` on `#rw-flow-scroll` (it fires once when observed and on every box change: mount, split↔full, sidebar, panel) plus the layout signal in the flow effect's deps as a second line of defence. | — |
+
+**Engine finding, measured before the fix was written:** CSS `mod()` and
+`rem()` **work** in the target Chromium (131.0.0.0), including *negative*
+arguments and through a custom-property chain —
+`mod(calc(var(--phase) + 180), 360) - 180` computes exactly (`mod(-390, 360)
+= -30`). So the whole wrap stays in CSS and a scroll frame still writes exactly
+one value. A live CDP override of that one transform (`park dropped`) was used
+as the fix *preview*: angles then span the whole circle, `tz` stays 0, the far
+end goes below the trunk — and with the old slope the down-half overflowed the
+panel by ~65px, which is what made D-cone-9 a decision rather than a detail.
+
+### 13.8 As built (v0.5.71)
+
+Client + stylesheet only again (**the server is untouched**; `arc_deg` is still
+emitted and simply not read any more — `--arc` is no longer written on the
+track).
+
+* `style.css`, `.rw-branch`: `--a: calc(mod(calc(var(--eff) + 180), 360) -
+  180)`, `--aroot` the same wrap, `transform: rotateX(calc(var(--a) * 1deg))`
+  (the `translate3d` push is gone), `--fade: calc(1 - 0.35 * max(0,
+  sin(calc(var(--a) * 1deg))))`, `--over` deleted, `.rw-orbit.solo` deleted,
+  and the two `--over`-based `--fade` overrides (flat + reduced motion)
+  deleted with it. The depth dim reads `--fade` on the leaf elements, and the
+  per-state factors are now *multiplied* into it
+  (`.off .rw3-dot` × .6, `.abandoned .rw3-dot` × .45, `.rw3-round` × .6) —
+  without that, most of a branch's rounds are `off` and the dim would never be
+  visible on them.
+* `rewind.rs`: `SCENE_AXIS_FRAC = 0.5` with `room = axis.min(h - axis)`;
+  `arm_scene_probe()` / `arm_scene_probe_now()` (one `ResizeObserver`, re-armed
+  by identity when the scene re-renders its node, `disconnect()` on
+  replacement); an `Effect::new` *inside* `flow_scene` that calls
+  `arm_scene_probe_now()` (with one `Timeout(0)` retry while the tree is still
+  loading); `layout_mode` added to the flow effect's deps; `solo` dropped from
+  the render; the per-level `clamp(±arc)` removed from the static nesting
+  chain (`--kown`, `--sum`) — on a cone ±120° is a place like any other, and
+  the old clamp parked two children on top of each other.
+* `Cargo.toml`: the `ResizeObserver` web-sys feature.
+
+**The four probes, re-run green after the change:**
+
+| probe | v0.5.70 | v0.5.71 |
+| --- | --- | --- |
+| `cargo test -p rushi-web` | 71 | **71 passed** |
+| wasm `cargo check` + `trunk build` | clean (13 pre-existing warnings) | clean |
+| `orbit_probe.py` (own fixtures, L1-L12) | 40 / 0 | **44 passed / 0 failed** (the arc/queue checks became the full-circle ones: no park, `|angle|` reaches 180, a whole turn spent on the **wheel** returns every bead, the depth dim is exactly `1 - 0.35 sin a`, and the lone branch goes above *and* below) |
+| `flow_style_b_probe.py 8480` | 66 / 0 | **66 passed / 0 failed** (H re-worded; `solo` is now an absence canary) |
+| `flow_check.py 8480` | 8 / 0 | **8 sessions, 0 problems** |
+| `rewind_probe.py` | 140 | **PASS (140 checks)** |
+
+Three probe lessons worth keeping:
+
+1. The geometry model's phase must be read from **`--rw-scroll`**, not from
+   `scrollLeft`: since v0.5.69 that proxy is `scrollLeft + turn`, and a wheel
+   gesture keeps turning the cone after the track's own scroll range runs out.
+   With a wheel-driven check the old model reported a 278px "law" error that
+   was entirely the probe's.
+2. A wheel delta must be an **integer** if the check needs an exact sum
+   (`scrollLeft` is an integer, so fractional deltas leak to rounding — 16
+   × 79.69px came out 11px short).
+3. A full circle means the near and the far half of the cone share a ray, so
+   a bead *behind* another is legitimately covered. The hit test now accepts a
+   cover only when the two dots actually overlap (≤12px apart); anything else
+   covering a bead is still a failure.

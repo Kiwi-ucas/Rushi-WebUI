@@ -1861,7 +1861,7 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
    The one value a scroll frame moves is `--rw-scroll`; `--phase` is that
    offset minus the scene's rest offset (`--rw0`, also layout time) times a
    fixed angular rate (`--dpp`, D-orb-8). Everything else is written once:
-   the render writes `--slot`/`--step`/`--arc`/`--hinge`/`--ph`/`--po`/
+   the render writes `--slot`/`--step`/`--hinge`/`--ph`/`--po`/
    `--n`/`--dx`, the layout writes `--q`/`--r`/`--axis`/`--dpp`/`--rw0`
    (rewind::sync_scene_metrics). */
 #rw-flow-track {
@@ -1891,37 +1891,47 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
   --root_a: calc((var(--sroot, 0) - var(--align, 0)) * var(--step, 30) + var(--phase, 0));
   --theta: calc((var(--slot, 0) - var(--align, 0)) * var(--step, 30));
   --eff: calc(var(--theta) + var(--phase, 0));
-  /* D-orb-2: a **bounded arc**. Inside it the branch is visible; beyond it
-     the branch is *parked* — clamped to the arc's end, pushed back in depth
-     and faded, so a session with many forks queues at the two ends (in front
-     of and behind the window) instead of crowding the middle. Scrolling
-     slides the queue, so every branch takes its turn at the front. */
-  --a: clamp(calc(-1 * var(--arc, 60)), var(--eff), var(--arc, 60));
-  --over: calc(max(0, var(--eff) - var(--arc, 60)) + max(0, calc(-1 * var(--eff) - var(--arc, 60))));
+  /* **D-cone-8 (user decision, v0.5.71): the branch turns a full circle.** The
+     angle is `--eff` wrapped into (-180, 180], so 360 degrees brings the branch
+     back exactly where it started and no amount of scrolling can park it —
+     every branch is always on the cone, and it can go *below* its parent as
+     well as above. `mod()` is plain `calc()` here (measured in the target
+     Chromium, negative arguments included, and through a custom-property
+     chain). This replaces v0.5.68..v0.5.70's **bounded arc** (D-orb-2) and its
+     park: a parked branch was clamped to +-60 degrees, pushed back in depth by
+     `--over * -22px` — which left its parent's bead by up to 87px, measured —
+     and faded to 0.08 while the perspective shrank its beads from 13px to
+     2.2px. "The branch detaches from the parent and then shrinks out of
+     sight". */
+  --a: calc(mod(calc(var(--eff) + 180), 360) - 180);
   /* The plane's **absolute** angle: its own turn composed with every ancestor
      it lives inside. A bead counter-rotates by *this*, not by `--a` — with
      `--a` alone a nested bead over-rotated by its parent's turn and its dot
      came out squashed and 35px off the ray (measured). `--sum` is the static
-     part of the chain (the render writes it, clamped per level) and
-     `--root_a` the dynamic part, so no variable ever refers to itself. */
+     part of the chain (the render writes it) and `--root_a` the dynamic part,
+     so no variable ever refers to itself. Both sides are mod-360-invariant. */
   --abs: calc(var(--aroot, 0) + var(--sum, 0));
-  /* The park fade is a **value**, never the `opacity` property on this
-     element: `opacity < 1` would flatten the container (measured, v0.5.70:
-     a round 13px dot came out 12.86 x 3.31) and the beads' counter-rotation
-     would stop cancelling the branch's turn. The beads and the spine read it
-     instead — each element keeps its own opacity. */
-  --fade: clamp(0.08, calc(1 - var(--over) / 70), 0.92);
+  /* **D-cone-10 (user decision, v0.5.71)**: with the park gone the near and the
+     far half of the circle overlap on screen (`a` and `-a` are one ray), so the
+     half that points *away* from the viewer dims by 0.35 — near 1.0, far 0.65;
+     straight down (180) is neither and stays lit.
+     It is a **value**, never the `opacity` property on this element: `opacity <
+     1` would flatten the container (measured, v0.5.70: a round 13px dot came
+     out 12.86 x 3.31) and the beads' counter-rotation would stop cancelling the
+     branch's turn. The beads and the spine read it instead — each element keeps
+     its own opacity. */
+  --fade: calc(1 - 0.35 * max(0, sin(calc(var(--a) * 1deg))));
   /* The flat projection's scale (D9/L10): the outward step shrinks by
      `cos a − 0.12 sin a`, so the cone folds down onto rows. It is applied to
      the *container*, which scales the beads' positions and the spine's own
      angle together — the branch stays one straight line in both projections.
      `--kroot` is that factor for the top ancestor (dynamic: it carries the
      phase); `--kup`/`--kown` are what the render writes for a nested chain
-     (static, clamped per level) so a bead can counter-scale by the chain's
-     *product* and keep its dot round. */
-  --aroot: clamp(calc(-1 * var(--arc, 60)), var(--root_a, 0), var(--arc, 60));
+     (static) so a bead can counter-scale by the chain's *product* and keep its
+     dot round. Cosine is periodic, so the wrapped angle is the right one. */
+  --aroot: calc(mod(calc(var(--root_a, 0) + 180), 360) - 180);
   --kroot: calc(cos(calc(var(--aroot, 0) * 1deg)) - 0.12 * sin(calc(var(--aroot, 0) * 1deg)));
-  transform: translate3d(0, 0, calc(var(--over) * -22px)) rotateX(calc(var(--a) * 1deg));
+  transform: rotateX(calc(var(--a) * 1deg));
 }
 /* a branch of a branch (D-cone-6/7): its container sits on its parent's bead
    inside the parent's container, and it turns by its own small slot only —
@@ -1952,21 +1962,18 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
 .rw-br-line.abandoned { background: var(--text-muted); opacity: calc(var(--fade, 1) * 0.35); }
 .rw-br-line.active { opacity: calc(var(--fade, 1) * 0.55); }
 
-/* D-orb-9: a session with a single branch has no ring to queue on, so it
-   gets a *swing* instead — the one branch reads the phase through a sine, so
-   it rocks +-25 degrees and back rather than ever parking at the arc's end.
-   (0 branches needs nothing: with no branch container at all the scene is
-   the flat line it always was.) */
-.rw-orbit.solo .rw-branch {
-  --root_a: calc(sin(calc(var(--phase, 0) * 1deg)) * 25);
-  --eff: var(--root_a);
-}
+/* D-cone-11 (user decision, v0.5.71): a session with a single branch used to
+   get a +-25 degree *swing* (D-orb-9) because the bounded arc had nowhere for
+   it to go. With a full circle (D-cone-8) a lone branch orbits the trunk like
+   every other one, so there is no `solo` rule and no `solo` class any more —
+   and 0 branches still needs nothing: with no container at all the scene is
+   the flat line it always was. */
 
 /* Inside a branch the rounds ride on its ray (`--out` steps out at the
    slope, `--x` − `--hinge` columns along), and each one is counter-rotated
    about its own bead so a label (and the dot) always faces the viewer
-   (D-orb-5). The counter-rotation is `--a`, the *clamped* angle, so a parked
-   round stays square to the camera too. */
+   (D-orb-5). The counter-rotation is the plane's absolute angle, so a bead on
+   a branch that has turned behind the trunk stays square to the camera. */
 .rw-branch .rw3-node {
   top: calc(-1 * var(--out, 1) * var(--q, 0px));
   left: calc((var(--x) - var(--hinge)) * var(--cell));
@@ -1974,13 +1981,19 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
   transform: translate(-50%, calc(-1 * var(--dot-c, 6.5px))) rotateX(calc(-1 * var(--abs, 0) * 1deg));
   pointer-events: auto;
 }
-/* The park fade lives on the *leaves* of a bead, never on the bead or its
+/* The depth dim lives on the *leaves* of a bead, never on the bead or its
    container: `opacity < 1` makes an element a grouping element, and a
    grouping element flattens its 3D children — measured, v0.5.70: a bead's
    own opacity turned its 13px dot into 7.85 x 3.05 and moved its centre
    35px off the ray. The dot and the label have no 3D children, so they can
-   carry it. */
-.rw-branch .rw3-dot, .rw-branch .rw3-round { opacity: var(--fade, 1); }
+   carry it.
+   Most rounds of a branch are `off` (not on the main line, v0.5.65) and a dead
+   one is dim per its own state (v0.5.56), so those factors are *multiplied*
+   with the depth dim instead of being overridden by it. */
+.rw-branch .rw3-node .rw3-dot, .rw-branch .rw3-node .rw3-round { opacity: var(--fade, 1); }
+.rw-branch .rw3-node.off .rw3-dot { opacity: calc(var(--fade, 1) * .6); }
+.rw-branch .rw3-node.abandoned .rw3-dot { opacity: calc(var(--fade, 1) * .45); }
+.rw-branch .rw3-node.abandoned .rw3-round { opacity: calc(var(--fade, 1) * .6); }
 
 /* D-orb-9/10 + the plan's L10: the **flat projection** — the same local
    geometry with no 3D at all, flattened by scaling the container's outward
@@ -1988,9 +2001,9 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
    stays round and a label stays legible; the spine needs nothing, because a
    scaled line is still a straight line and it lands on the last bead.
    `prefers-reduced-motion` gets this, and so does the probe's `.flat`
-   class. */
+   class. The depth dim is inherited (it is a function of the wrapped angle,
+   which is the same plane in both projections). */
 #rw-flow-track.flat .rw-branch {
-  --fade: clamp(0.25, calc(1 - var(--over) / 90), 0.92);
   transform: scaleY(var(--kroot, 1));
 }
 #rw-flow-track.flat .rw-branch .rw-branch {
@@ -2008,14 +2021,13 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
 
 /* D9 (v0.5.68/70): less motion means the flat projection, held still.
    Pinning `--phase` to zero is what makes it *still* — the flat rows are
-   `-out·q·(cos a − 0.12 sin a)` and `a` is clamped `theta + phase`, so with
+   `-out·q·(cos a − 0.12 sin a)` and `a` is the wrapped `theta + phase`, so with
    no phase the cone keeps the shape its slots give it and the scroll moves
    nothing. (The media query is mandatory: measured, `prefers-reduced-motion`
    does nothing by itself.) */
 @media (prefers-reduced-motion: reduce) {
   #rw-flow-track { --phase: 0; }
   .rw-branch {
-    --fade: clamp(0.25, calc(1 - var(--over) / 90), 0.92);
     transform: scaleY(var(--kroot, 1));
   }
   .rw-branch .rw-branch { transform: scaleY(var(--kown, 1)); }

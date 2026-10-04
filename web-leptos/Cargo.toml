@@ -68,4 +68,7 @@ web-sys = { version = "0.3", features = [
   "Selection",
   "MediaQueryList",
   "VisualViewport",
+  # bug 3 / D-cone-12: the flow scene arms its own layout probe on mount —
+  # mounting is not a reactive event, so no effect can see it.
+  "ResizeObserver",
 ] }
