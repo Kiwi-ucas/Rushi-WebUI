@@ -1998,3 +1998,304 @@ put two branches on the same angle (0.0px apart, 7 overlapping pairs) because
 slot 3 wraps to 0. (2) A fan of one has no "gap" — its spacing is the whole
 circle, so a check that compares its single angle's gap to a *capped* spacing
 fails by construction (the nested fan's cap is 120, its lone angle 180).
+
+## 14. Round 5 — the relaxation model and the tilted cone (proposed 2026-10-04)
+
+**The two asks (user, verbatim):**
+
+1. *"你的C方案可以，我还有在你的C方案上更好的解决方法：为节点和连线创建实体，实体间存在
+   斥力，会自动排斥开，同时可以避免节点重合和连线干扰的问题"* — model the nodes **and the
+   connectors** as bodies with mutual repulsion, so that overlaps and line interference
+   resolve themselves.
+2. *"圆锥面的开口方向不要正对着水平右方向，而是向右上一点角度。这样在旋转时，在主分支上方的
+   分支会因为圆锥面这样的角度被放大……上方放大的这个分支保持和主线节点相同的大小"* — tilt
+   the cone so its opening points up-right instead of straight right; the branch above the
+   main line then reads as the near/focused one, but it must keep the **main line's node
+   size**.
+
+This section is the research + plan that follows. Section 14.8 lists the decisions I need.
+
+---
+
+### 14.1 What the scene is today (measured, not remembered)
+
+**The mechanism.** The server projection gives every round a column `x`, a lane and a branch
+membership (`fin`). The client turns that into, per branch: a container sitting on its parent's
+bead, `--th` (the fan angle, degrees), `--n` rounds, `--dx` columns; per bead: `--x` and
+`--out` (1-based steps out); and one spine bar per lit run. The stylesheet does the rest:
+
+```css
+.rw-branch   { top: var(--axis); transform: rotateX(calc(var(--a) * 1deg)); }
+.rw-branch .rw-branch { top: calc(-1 * var(--po) * var(--q)); }        /* nested */
+.rw-branch .rw3-node  { top: calc(-1 * var(--out) * var(--q)); }        /* a bead */
+.rw-br-line  { width: hypot(dx*cell, n*q); transform: rotate(-atan2(n*q, dx*cell)); }
+```
+
+So one step out is `(cell, −q·cos a, −q·sin a)` in CSS axes (x right, **y down**, z toward the
+viewer): **`cos a` sets the height and `sin a` sets the depth**, and the two are orthogonal
+coordinates of the same circle. `#rw-flow-track { perspective: 1400px }` magnifies by
+`k = 1400/(1400 − z)` — so the near half of the circle is **bigger than 1.0** and the far half
+smaller.
+
+**The rotation.** `--phase = (scrollLeft − --rw0) · --dpp`, `--dpp = 240°/panelWidth`, and a
+branch's effective angle is `θ + phase`. Every branch therefore turns by the same angle as the
+user scrolls: **the layout must be judged over the whole circle, not at one screenshot.**
+
+**The live fixture (`rewind`, 2026-10-04).** `cols 34`, `cell 32.359px`, `q 25.714px`,
+`axis 209px` (panel height 418px), `d 1400px`, `r = 180px`; 4 fins — a **root fan of 3**
+(0°, 120°, −120°) plus one **nested** child (180°, `po = 1`).
+
+**The phase sweep.** The scene was rebuilt analytically (same laws; it reproduces the painted
+page exactly — at `phase 0` it gives the 0.0px `fin1 r21` × `trunk r31` that CDP measures) and
+swept over 180 phases at 2°:
+
+| quantity | value |
+| --- | --- |
+| phases with **no** bead pair < 13px | **0 / 180** |
+| best phase (162°) | 1 pair (5.8px, `fin2 r22` × `trunk r30`) |
+| worst phase (30°) | **9 pairs**, 8 of them branch×trunk, closest **1.3px** (a branch is exactly edge-on there) |
+| pairs < 13px over the whole sweep | 616, of which **412 branch×trunk** |
+| phases with an exact (<1px) coincidence | **15** (φ ≈ 0 ± 7°, `fin1 r21` × `trunk r31`) |
+| phases where some branch is within 8.6° of edge-on | 54 / 180 |
+
+**Three classes, three different causes.**
+
+* **K1 — the exact coincidence.** A branch in the screen plane (`a ≈ 0/180`, `z = 0`) whose
+  container offset `po` equals a bead's `out` lands *exactly* on a trunk bead: the height is
+  `(po + out·cos a)·q = 0`. Only possible when `po = out` and `a = 180°` — i.e. a child of its
+  parent's **first** bead, which is the live case (`po = out = 1`). Measured: 0.0px, and
+  `elementFromPoint` there returns the **branch** bead, so the trunk round is covered.
+* **K2 — the edge-on pass.** At `a = ±90°` the vertical offset is *identically* zero: the
+  branch's beads lie on the trunk row, one column apart, each a few px from the trunk's own
+  beads (the perspective separates them a little: 1.3px at the closest). **No angular or radial
+  change can remove K2** — it is the geometry of a full circle (D-cone-8) plus a trunk bead in
+  every column plus "one step out = one column right". It is a *transient* (≈ ±8.6° of phase,
+  ≈ ±37px of scroll) but the user may stop anywhere.
+* **K3 — the mirror pair.** Two branches at `±a` share a height (`cos` is even) and differ only
+  in depth, so only the dim (D-cone-10) and the perspective's few px separate them: 4.2px at
+  the live rest phase. Inherent to a symmetric fan.
+
+**The size measurements (the motivation for ask 2).** Painted dot widths at rest:
+
+| bead | angle | z | dot |
+| --- | --- | --- | --- |
+| trunk (any) | — | 0 | **13.00 x 13.00** |
+| fin 0, round 14 (aligned) | 0° | 0 | 13.00 |
+| fin 1, round 21 (nested) | 180° | 0 | 13.00 |
+| fin 2, round 22 (far) | +120° | −22.3 · out | 12.80 |
+| fin 3, round 29 (near) | −120° | +22.3 · out | **14.63** (+12.6%) |
+
+fin 3's *last* bead grows to 14.63px: `k = 1400/(1400 − 7·25.714·0.866) = 1.125` ⇒
+`13 · 1.125 = 14.63` — the model and the page agree, so **the near branch is up to 12.6% bigger
+than the main line today**. That is exactly what the user is describing.
+
+**The bar the suite currently accepts.** `orbit_probe.py`'s `L8b` is literally *"every visible
+bead is clickable, **or covered by a bead on the same px**"* — it tolerates K1. Any new model
+has to raise that bar.
+
+---
+
+### 14.2 The constraints any solution must respect
+
+| # | constraint | where it comes from |
+| --- | --- | --- |
+| C1 | The trunk is the timeline: its beads never move off their column or off the axis row. | D1 / "the trunk stays a straight line" |
+| C2 | A branch is **one straight ray** from its parent's bead. A connector therefore cannot be an independent body — it moves **with** its branch. A bead may slide **along** its own ray (that keeps it on the ray and the spine straight). | D-cone-6, "every connector must be a straight line with no bends" |
+| C3 | The rotation stays CSS + scroll driven. **No per-frame simulation**: the solver runs once per layout and its result is baked into the same custom properties. | D9/D7, the wheel/scroll design |
+| C4 | The objective must be **phase-independent** — the user can stop at any phase. | `--phase` = scroll |
+| C5 | Deterministic: same data + same panel ⇒ the same picture (no RNG, no time), so the probes can assert it. | the probe suite |
+
+C2 is the one place where the literal form of ask 1 has to bend: a connector that floats free
+would have to bend or detach from its parent, and both are locked against. The physical reading
+that *is* legal: **a branch is a rigid body** (its hinge is its parent's bead; it may turn and
+it may start a little farther out) and **a bead may slide along its own branch**.
+
+---
+
+### 14.3 Proposal A — "entities and repulsion" as a layout-time relaxation
+
+**A1 — the bodies and the legal degrees of freedom.**
+
+| body | may move | may not |
+| --- | --- | --- |
+| trunk bead | — (fixed) | its column, its row |
+| branch | its angle θ within `±CAP` of its fan's even angle; its radial offset `--d0 ∈ [0, 1]` steps (all its beads shift out together; the spine already has `--d0`) | its hinge (= its parent's bead), its straightness, its rounds' order |
+| branch bead | radially along its own ray, if we also let the spine take `--d1` (the last bead's step) — the ray stays straight either way | its ray, its column ordering |
+| spine | nothing on its own; it is redrawn from the first to the last bead | leaving its branch |
+
+**A2 — the objective.** Minimise the worst violation over a phase set Φ (72 phases at 5°; the diagnosis
+swept 180 at 2° and saw no phase pass), with a hard bar:
+
+* **R-a** no two beads within 1px at any phase (this kills K1 outright);
+* **R-b** at the *rest* phase, no two beads within one dot (13px);
+* **R-c** over the whole rotation, a pair < 13px is allowed **only** when one of the two is on a
+  branch within ±8.6° of edge-on at that phase (K2, admitted);
+* **R-d** no bead within 6px of a *foreign* branch's spine at any phase;
+* **R-e** the fan still reads even: a branch's angle stays within `±CAP` of `fan_root_theta` /
+  `fan_nested_theta` (see D-phys-6).
+
+**A3 — the solver.** Seed = today's even fan. Per iteration: evaluate the violations over Φ
+analytically (the client has `q`, `cell`, `axis` in px after `sync_scene_metrics`), then apply a
+damped correction per branch (angle) and per branch (radial), accumulate, clamp to the legal
+range, and repeat (≤ 40 iterations). Complexity is tiny: |Φ| × pairs ≈ 72 × (48²/2) ≈ 83k
+distance checks per iteration ⇒ a few ms in wasm, and only when the data or the panel changes.
+The result is memoised on `(projection hash, panel w/h, cell, q)` so a re-render cannot move the
+picture (C5) and there is no render loop.
+
+**A4 — what it fixes, and what it cannot.**
+
+* **K1 → gone, guaranteed** (R-a). This is the defect the user actually hit.
+* **K3 → much better**: a repulsion between the two branches of a mirror pair pushes them *apart*
+  symmetrically, so the 4.2px gap grows to a dot's width (if `CAP` allows the turn).
+* **K2 → not fixable by any angle or radius**, see §14.1. Three ways out (D-phys-5):
+  * **(a) accept + cue**: when `|cos a| < 0.15` the whole branch is *near edge-on* — dim it (and
+    optionally shrink its dots) so it reads as "this branch points at you" instead of as trunk
+    beads. Cheap, honest, does not fix the overlap.
+  * **(b) hard fix**: give branch beads a **half-column x offset** (they then never share a
+    column with a trunk bead ⇒ ≥ 16px = half a cell apart even at edge-on). Real fix, at the
+    price of the branch's rounds sitting half a column off the trunk's grid.
+  * **(c) accept silently** (documented).
+
+**A5 — where it lives.** Client-side, as a pure function (the same pattern as `fan_angles_tests`:
+written as testable Rust, compiled for wasm, and run in a host harness by extraction + asserted
+by the browser probes). The server keeps its projection unchanged — it does not know the px
+metrics, and making it viewport-dependent would poison the cache key.
+
+---
+
+### 14.4 Proposal B — the tilted cone and the size cap
+
+**B1 — the size cap (the part that is unambiguous).** Cap the perspective magnification at the
+main line's size, per bead, about the bead's own centre:
+
+```
+scale = min(1, 1/k) = min(1, (d − z)/d) = min(1, 1 + z/d)
+```
+
+* z ≤ 0 (away) ⇒ the bead keeps its shrunken size: the far half still reads as background.
+* z > 0 (toward the viewer) ⇒ the bead is scaled *back* to 13.00px, so the focused branch is
+  exactly the main line's size — the user's ask.
+* Scaling about the bead's **centre** leaves the centre where it is, so the spine (drawn
+  separately, from the first to the last bead) stays exactly on the beads. No locked rule moves.
+
+CSS cannot know `z` on its own (it accumulates along a nesting chain), so the **render writes it
+as a number of steps** (`--zp = Σ rᵢ·sin aᵢ`) and the **layout writes `--qk = q / 1400`** as a
+plain number ⇒ `scale = min(1, 1 + var(--zp) * var(--qk))` — no length division in CSS.
+
+**B2 — the tilt, and one uncomfortable fact.** *Up* (the screen height, `cos a`) and *near*
+(the depth, `sin a`) are **orthogonal directions of the same circle**. So "the branch above the
+main line" is *not* automatically the near one: at any phase the upper region holds a
+mirror pair, one near (magnified) and one far (dimmed). Two candidate readings of the ask:
+
+* **(i) roll the fan's frame about the view axis** — `transform: rotateZ(ψ) rotateX(a)` on each
+  branch container (ψ ≈ −8°…−12°). This *is* "the cone's opening points up-right": the cone's
+  axis is the column direction, and the roll gives it an upward component, so the whole fan
+  leans up-right and its beads drift upward as they go out — **while the trunk stays exactly
+  horizontal**. It does **not** make "up" equal "near" (nothing can), and the mirror pair still
+  shares a height; the depth dim + the size cap remain the separators.
+* **(ii) bias the fan's reference direction** (a constant added to the phase/θ, e.g. −25°): the
+  focused/aligned branch would rest at *up-and-near* (magnified, then capped by B1) and its
+  opposite at far. One constant, but it breaks D-fan-3's "the aligned branch points straight
+  up".
+
+My recommendation is **(i)** — it is the literal reading, it keeps "aligned = straight up", and
+it adds the up-right lean the user asked for — with **(ii)** available as a small constant if
+they want the focused branch to rest *near* as well.
+
+**B3 — the cost of the tilt (fit).** The fit is `r = min(axis, h − axis) − 16 − 13`,
+`q = r / longest`; with the roll, the top of the content is
+`longest·(q·cos ψ + cell·|sin ψ|)` — about 30.9px per step against 25.7px today (+20% at ψ = 10°),
+and the axis row (currently `SCENE_AXIS_FRAC = 0.50`) must be re-centred. Both are a *little*
+more branch shortening on top of D-cone-9's ~30%. ψ must be chosen by look, not by taste:
+−8° is ≈ 4.5px/step of drift (barely visible), −15° is ≈ 8.4px/step (a clearly slanted cone).
+
+**B4 — does the tilt apply to the flat (reduced-motion) projection?** It is a *static* lean, so
+it can: `--kroot`'s law would need the same ψ. Decision D-slant-4.
+
+---
+
+### 14.5 Verification plan
+
+New/raised checks (the existing suite counts 48 + 68 + 8 + 140 today):
+
+| id | check |
+| --- | --- |
+| **R1** | at the rest phase, zero bead pairs < 13px (today: 3, one of them 0.0px) |
+| **R2** | swept over N phases driven by real `scrollLeft` steps, **zero pairs < 1px** (today: 15 phases) |
+| **R3** | over the same sweep, every pair < 13px has a branch within ±8.6° of edge-on (today: 616 pairs, **405** of them not explainable by edge-on — of which the K1 coincidence and the mirror pair) |
+| **R4** | no bead within 6px of a foreign spine at the rest phase |
+| **R5** | the solver is stable: two loads of the same session at the same panel give identical `--th`/`--d0`/`--zp` values |
+| **R6** | with the cap: a bead on the near branch measures 13.00px (today 14.63px) and the far branch stays < 13.00px |
+| **R7** | with the tilt: the trunk's beads are still exactly on the axis row (`|Δy| < 0.5px`) and a branch's ray is still one straight line (the spine's endpoints coincide with its first/last bead) |
+| **R8** | the even fan still reads even: every angle is within `CAP` of the fan law, and a fan of k has k distinct angles |
+| `L8b` | raised: "every visible bead is clickable" — a bead may only be covered by itself (K1 gone) |
+
+The phase-sweep harness (`/tmp/sweep2.py`, a model that reproduces the painted page) is the tool
+for R2/R3; the browser probes do R1/R4/R6/R7 on the real DOM.
+
+---
+
+### 14.6 Step plan (once the decisions land)
+
+1. **O-relax-1** — the law as a pure function + its unit assertions (`relax_*` next to
+   `fan_*`), host-harness extraction, wasm compile.
+2. **O-relax-2** — the layout pass: read `q`/`cell`/`axis`, run the solver, write the result
+   into a memoised resource the cone render reads; the render gains `--d0`, `--d1`, `--zp`.
+3. **O-relax-3** — the K2 decision implemented (D-phys-5), the `L8b` bar raised.
+4. **O-slant-1** — the cap (`--zp`, `--qk`, the per-bead `scale`) + `R6`.
+5. **O-slant-2** — the tilt (D-slant-2/3/4): the stylesheet's `rotateZ`, the flat law, the fit
+   and the axis re-centre.
+6. **O-slant-3** — docs (§3b.6 + §6 numbers), the mirror's canary/gone-set check, probes, both
+   repos, a version bump.
+
+Everything stays client + stylesheet: **the server projection does not change** (its
+`orbit.step_deg`/`arc_deg` stay unread).
+
+---
+
+### 14.7 Non-goals (this round)
+
+* No live per-frame physics, no continuous animation beyond the existing scroll-driven phase.
+* No change to the trunk, the columns, the states, or the click/hit-test contract.
+* No zoom, no mini-map, no second view style (D4/D-orb-10 still hold).
+* Connectors do not become free bodies (C2).
+
+---
+
+### 14.8 Open questions for the user
+
+**A — the relaxation**
+
+* **D-phys-1**: do you accept the *constrained* form of ask 1 — bodies are **branch** (angle +
+  radial offset) and **bead** (radial slide), and a connector moves with its branch (it can
+  never float free)? **[recommended: yes]**
+* **D-phys-2**: the solver runs **once per layout** (client side, deterministic, memoised) and
+  its result is baked into CSS custom properties — not a live simulation.
+  **[recommended: yes]**
+* **D-phys-3**: the bar is judged over the **whole rotation** (worst phase), not just the
+  picture on screen. **[recommended: yes]**
+* **D-phys-4**: the bar itself: R-a (no <1px anywhere) + R-b (rest phase: no <13px) + R-c (over
+  the rotation, <13px only near edge-on) + R-d (no bead within 6px of a foreign spine).
+  **[recommended: yes]**
+* **D-phys-5 (K2, the edge-on pass)**: accept + a cue (dim/shrink the branch when
+  `|cos a| < 0.15`), or the **hard** half-column fix, or accept silently?
+  **[recommended: (a) cue for v1; (b) later if the transient still bothers you]**
+* **D-phys-6**: how far may the solver move a branch off its even-fan angle? ±10° / ±20° / free.
+  **[recommended: ±20° — the fan still reads even, the mirror pair gets room]**
+* **D-phys-7**: may a *bead* slide radially (the spine takes `--d1`), or only whole branches?
+  **[recommended: whole branches in v1]**
+
+**B — the cone**
+
+* **D-slant-1**: cap the magnification so a near branch is exactly the main line's size
+  (13.00px), the far half keeps shrinking. **[recommended: yes — it is the literal ask]**
+* **D-slant-2**: which tilt — (i) the roll (`rotateZ`, the cone's axis leans up-right, the trunk
+  stays horizontal), (ii) bias the fan's rest direction (the aligned branch rests up-and-near,
+  but no longer "straight up"), or (iii) both? **[recommended: (i)]**
+* **D-slant-3**: if (i), how far? ψ = −8° / −12° / −15° — note the fit cost (the branches
+  shorten again). **[recommended: pick by look, start at −10°]**
+* **D-slant-4**: does the lean also apply to the flat / reduced-motion projection?
+  **[recommended: yes, it is static]**
+* **D-slant-5**: with the lean, the axis row and `SCENE_AXIS_FRAC` must be re-centred
+  (the content's top grows by `cell·|sin ψ|` per step). **[recommended: recompute, then
+  re-measure]**
