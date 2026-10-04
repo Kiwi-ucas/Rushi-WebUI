@@ -347,6 +347,13 @@ ribbon per branch").
   fit under the trunk. Nothing scales an *element* — only the step — so every
   dot is still 13px: the focused branch is 13.00px by construction (`a = 0`),
   the unfocused ones vary only with the perspective (11.7…13.2px measured).
+* **The wheel keeps a pan fallback (v0.5.73).** A fan of **0 or 1 branch** has
+  nothing to bring up (a lone branch is always the focused one — D-cone-11 is
+  superseded), so there the vertical wheel pans again, through the same proxy
+  v0.5.69 introduced (the scroller is `overflow-x` only, so a vertical delta
+  would otherwise scroll nothing: measured `260 → 260`). Every live session but
+  `rewind` has such a fan, and v0.5.69's "a gesture is never a no-op" rule has
+  to hold on them too.
 * **A nested fan starts two steps out (v0.5.73).** Plan §14.1's **K1** was the
   exact, phase-independent coincidence of a nested branch whose container
   offset `po` equals a bead's `out` (the live fixture: a fork off the parent's

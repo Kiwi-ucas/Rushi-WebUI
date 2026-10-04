@@ -2696,6 +2696,16 @@ question (O-slant-1..3), and it stays open.
   succeeds; `cargo test -p rushi-web` unchanged; the two native law tests
   (extracted, `rustc --test`) pass.
 
+**Correction 4 — the wheel keeps a pan fallback.** D-snap-2 says the vertical
+wheel is the focus control. On a fan of **0 or 1 branch** there is nothing to
+bring up (a lone branch is always the focused one under this law, which
+supersedes D-cone-11's "a lone branch orbits like any other"), so the wheel
+falls back to the pan it had before the carousel — and it has to go through
+the same **proxy** v0.5.69 needed: the scroller is `overflow-x` only, so a
+vertical delta scrolls nothing by itself (measured: `260 → 260` with the event
+left alone). Without this, the wheel was a **no-op on every live session but
+`rewind`**, which breaks v0.5.69's rule — `flow_style_b_probe`'s F4 caught it.
+
 **Still open (ranked)**
 
 1. **K3, the mirror pair (8.3px measured)** — the two one-bead lower branches
