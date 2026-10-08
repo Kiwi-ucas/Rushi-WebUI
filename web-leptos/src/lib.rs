@@ -26,6 +26,16 @@ pub const WEBUI_VERSION: &str = env!("RUSHI_WEBUI_VERSION");
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
+use std::cell::RefCell;
+use wasm_bindgen::JsCast;
+use wasm_bindgen::JsValue;
+
+thread_local! {
+    /// M15: the window-resize listener that re-clamps the right panel's
+    /// width (`rp_width`). Kept alive for the app's lifetime — a page
+    /// runs exactly one App, so a process-lifetime keep is safe.
+    static RP_RESIZE_LISTENER: RefCell<Option<JsValue>> = const { RefCell::new(None) };
+}
 
 /// Root component: builds app layout + wires up background polling.
 #[component]
@@ -64,6 +74,11 @@ fn App() -> impl IntoView {
     // key is the session's working path; the head shows the alias or the
     // path's basename, and the path itself is never modified.
     state.project_labels.set(ui::read_project_labels());
+
+    // v0.5.58: the per-session composer drafts (localStorage) — the
+    // session-bound input text, so a session's unsent message survives a
+    // reload and is restored when the user selects that session.
+    state.drafts.set(ui::read_drafts());
 
     // v0.5.65 (Style B): which History style is showing. The **flow** scene
     // is the default since v0.5.67 (user decision, superseding D2's list
@@ -278,6 +293,45 @@ fn App() -> impl IntoView {
             // selected, and the selected round's full text (B2).
             crate::rewind::register_flow_effects(state);
 
+    // M15: right-panel width state. `rp_width` lives in AppState
+    // (in-memory only — a refresh resets it to 420, per user decision);
+    // `rp_dragging` tracks the resizer drag for the handle's active
+    // style. Shrinking the window under a wide panel re-clamps it.
+    let rp_width = state.rp_width;
+    let rp_dragging = create_rw_signal(false);
+    {
+        let w_sig = state.rp_width;
+        let on_resize = wasm_bindgen::closure::Closure::<dyn Fn()>::new(move || {
+            let Some(w) = web_sys::window() else {
+                return;
+            };
+            // web-sys 0.3.105: `inner_width()` is a `Result<JsValue>`.
+            let vw = w
+                .inner_width()
+                .ok()
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1280.0) as u32;
+            let min_w = 320u32;
+            let max_w = 720u32.min(vw.saturating_sub(320));
+            let now = w_sig.get();
+            let next = now.clamp(min_w, max_w.max(min_w));
+            if next != now {
+                w_sig.set(next);
+            }
+        });
+        if let Some(w) = web_sys::window() {
+            let _ = w.add_event_listener_with_callback(
+                "resize",
+                on_resize.as_js_value().unchecked_ref::<js_sys::Function>(),
+            );
+        }
+        // Keep the closure (and its signal capture) alive for the
+        // app's lifetime.
+        RP_RESIZE_LISTENER.with(|c| {
+            c.borrow_mut().replace(on_resize.as_js_value().clone());
+        });
+    }
+
     view! {
         <div id="app" class=app_class>
             <ui::Sidebar state=state />
@@ -340,13 +394,91 @@ fn App() -> impl IntoView {
             // M8: the right tool panel (Files tree + preview / terminal).
             // A flex column in #app — `#main` shrinks to make room.
             // Hidden in the "full" layout (the dispatch view owns the
-            // window).
+            // window). M15: the 7px `.rp-resizer` strip sits in the
+            // main↔panel seam; dragging it writes `rp_width` (the
+            // panel's width, in-memory only — a refresh resets it).
             <Show
                 when=move || {
                     state.rp_open.get() && state.layout_mode.get() != "full"
                 }
                 fallback=|| ()
             >
+                <div
+                    class=move || {
+                        let mut c = String::from("rp-resizer");
+                        if rp_dragging.get() {
+                            c.push_str(" active");
+                        }
+                        c
+                    }
+                    on:pointerdown=move |ev: web_sys::PointerEvent| {
+                        let Some(w) = web_sys::window() else {
+                            return;
+                        };
+                        if let Some(b) = w.document().and_then(|d| d.body()) {
+                            let _ = b.class_list().add_1("rp-dragging");
+                        }
+                        rp_dragging.set(true);
+                        if let Some(t) = ev.target() {
+                            if let Ok(el) = t.dyn_into::<web_sys::HtmlElement>() {
+                                let _ = el.set_pointer_capture(ev.pointer_id());
+                            }
+                        }
+                    }
+                    on:pointermove=move |ev: web_sys::PointerEvent| {
+                        // Width = distance from the pointer to the
+                        // viewport's right edge (the panel's right edge
+                        // is pinned to the window's right edge),
+                        // clamped to [320, min(720, vw-320)].
+                        if !rp_dragging.get() {
+                            return;
+                        }
+                        let Some(w) = web_sys::window() else {
+                            return;
+                        };
+                        // web-sys 0.3.105: `inner_width()` → Result<JsValue>;
+                        // `PointerEvent::client_x()` is an i32.
+                        let vw = w
+                            .inner_width()
+                            .ok()
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(1280.0) as u32;
+                        let x = ev.client_x().max(0) as u32;
+                        let min_w = 320u32;
+                        let max_w = 720u32.min(vw.saturating_sub(320));
+                        // The strip is 7px wide and the pointer sits at
+                        // its center: subtract half the strip so the
+                        // grab point maps to the current panel edge —
+                        // no width "jump" on grab, and a drag of δpx
+                        // moves the panel edge by exactly δpx.
+                        let width = vw
+                            .saturating_sub(x)
+                            .saturating_sub(4)
+                            .clamp(min_w, max_w.max(min_w));
+                        rp_width.set(width);
+                    }
+                    on:pointerup=move |ev: web_sys::PointerEvent| {
+                        rp_dragging.set(false);
+                        if let Some(t) = ev.target() {
+                            if let Ok(el) = t.dyn_into::<web_sys::HtmlElement>() {
+                                let _ = el.release_pointer_capture(ev.pointer_id());
+                            }
+                        }
+                        if let Some(w) = web_sys::window() {
+                            if let Some(b) = w.document().and_then(|d| d.body()) {
+                                let _ = b.class_list().remove_1("rp-dragging");
+                            }
+                        }
+                    }
+                    on:pointercancel=move |_ev: web_sys::PointerEvent| {
+                        rp_dragging.set(false);
+                        if let Some(w) = web_sys::window() {
+                            if let Some(b) = w.document().and_then(|d| d.body()) {
+                                let _ = b.class_list().remove_1("rp-dragging");
+                            }
+                        }
+                    }
+                />
                 <ui::RightPanel state=state />
             </Show>
             <ui::NewSessionDialog state=state />

@@ -619,11 +619,23 @@ pub fn register_flow_effects(state: AppState) {
             return;
         }
         let Some(t) = tree.get() else { return };
+        let cur = t.current_seq;
         let known = selected
             .get()
             .is_some_and(|seq| t.flow.nodes.iter().any(|n| n.seq == seq));
         if !known {
-            selected.set(t.current_seq);
+            // v0.5.58c: write only on a REAL change. This effect observes
+            // `selected` (the `known` read above) AND writes it — a no-op
+            // `selected.set(same)` still notifies (Leptos `set` has no
+            // equality guard), so re-writing the same value re-invalidates
+            // this very effect. For an empty session `current_seq` is
+            // `null`, so the unconditional `selected.set(None)` spun the
+            // main thread in a synchronous loop (webui froze, page would
+            // not even refresh). Guarding on `!= cur` makes the empty case
+            // converge (selected stays None, no write, no re-trigger).
+            if selected.get() != cur {
+                selected.set(cur);
+            }
         }
     });
 

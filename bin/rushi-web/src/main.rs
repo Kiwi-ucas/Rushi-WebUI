@@ -48,6 +48,11 @@ struct AppState {
     cfg: Arc<WebConfig>,
     sessions: Arc<SessionManager>,
     loops: Arc<LoopManager>,
+    /// M15: the session-scoped pty registry (terminal tabs are
+    /// session-bound — a shell outlives the WS connection that opened
+    /// it and is re-attached, with ring replay, when the client comes
+    /// back).
+    terms: Arc<term::TermRegistry>,
 }
 
 #[derive(Deserialize)]
@@ -353,6 +358,9 @@ async fn delete_session(State(st): State<AppState>, Path(id): Path<String>) -> i
     if let Err(e) = st.loops.stop(&id).await {
         eprintln!("rushi-web: stop loop for '{}' failed: {e}", id);
     }
+    // M15: a session's terminals are bound to it — killing the session
+    // kills its shells (their cwd is about to disappear anyway).
+    st.terms.purge(&id);
     match st.sessions.delete(&id).await {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
         Err(e) => (StatusCode::NOT_FOUND, e.to_string()).into_response(),
@@ -427,6 +435,90 @@ async fn get_goal(State(st): State<AppState>, Path(id): Path<String>) -> impl In
 async fn get_essence(State(st): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     let view = essence::read(&st.sessions.session_dir(&id));
     (StatusCode::OK, Json(view)).into_response()
+}
+
+// ── context meter (v0.5.75) ────────────────────────────────────────
+/// The numbers the context-meter panel cannot derive from the event log:
+/// the system prompt's character count (the panel prices it with the
+/// `ceil(chars / 4) + 4` heuristic) and the `[limits]` pair that owns the
+/// context budget and the compaction reserve.
+///
+/// The panel anchors its whole composition to the provider-reported
+/// prompt size, so this copy only has to be *close*: a stale system
+/// prompt shifts the residual ("tools & injects") segment, it can never
+/// make the panel contradict `usage`.
+#[derive(Serialize)]
+struct ContextMeta {
+    system_chars: Option<u64>,
+    budget: Option<u64>,
+    compact_reserve: Option<u64>,
+}
+
+impl ContextMeta {
+    fn unknown() -> Self {
+        Self {
+            system_chars: None,
+            budget: None,
+            compact_reserve: None,
+        }
+    }
+}
+
+/// Read the meta from the config file this session's LOOP actually runs:
+/// the per-session derivative when one exists (`modelcfg` writes it on a
+/// model edit, and the spawn hands that path to the loop), the shared
+/// file otherwise — the same choice `process::spawn` makes.
+fn read_context_meta(shared: &std::path::Path, session: &str) -> ContextMeta {
+    let per_session = process::session_config_path(shared, session);
+    let path = if per_session.exists() {
+        per_session
+    } else {
+        shared.to_path_buf()
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return ContextMeta::unknown();
+    };
+    let Ok(doc) = text.parse::<toml::Value>() else {
+        return ContextMeta::unknown();
+    };
+    let limit = |key: &str| -> Option<u64> {
+        doc.get("limits")
+            .and_then(|l| l.get(key))
+            .and_then(|v| v.as_integer())
+            .and_then(|n| u64::try_from(n).ok())
+    };
+    ContextMeta {
+        system_chars: doc
+            .get("system_prompt")
+            .and_then(|s| s.get("text"))
+            .and_then(|v| v.as_str())
+            .map(|t| t.chars().count() as u64),
+        budget: limit("context_budget_tokens"),
+        compact_reserve: limit("compact_reserve_tokens"),
+    }
+}
+
+/// v0.5.75: the context meter's server-side numbers for one session.
+async fn get_context_meta(State(st): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
+    let Some(shared) = st.cfg.config_path.as_deref() else {
+        return (StatusCode::OK, Json(ContextMeta::unknown())).into_response();
+    };
+    (StatusCode::OK, Json(read_context_meta(shared, &id))).into_response()
+}
+
+/// v0.5.57: the session's latest compaction_summary event (the current
+/// context-handoff summary). Served so the webui can pin a persistent
+/// "context summary" card — the event itself lives deep in the event log
+/// (often far outside the last-200 truncated window) and would otherwise
+/// be invisible after a page reload.
+async fn get_compaction(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match st.sessions.latest_compaction(&id).await {
+        Some(ev) => (StatusCode::OK, Json(ev)).into_response(),
+        None => (StatusCode::NOT_FOUND, Json(serde_json::Value::Null)).into_response(),
+    }
 }
 
 // ── time-inject plugin (rushi-time-inject) ─────────────────────────
@@ -547,9 +639,11 @@ async fn post_model_key(
 #[derive(Deserialize)]
 struct SessionModelBody {
     /// The model entry this session should run, or `null` to follow the
-    /// config's active entry again.
-    #[serde(default)]
-    model: Option<String>,
+    /// config's active entry again. v0.5.76: ABSENT leaves it untouched
+    /// (mirrors `effort`) — the model popup's effort row posts only
+    /// `effort` and must not disturb the model choice.
+    #[serde(default, deserialize_with = "double_option")]
+    model: Option<Option<String>>,
     /// v0.5.45: the session's reasoning effort, or `null` to keep the
     /// entry's own. Absent (rather than null) leaves it untouched — the
     /// card chip only edits the model.
@@ -570,8 +664,10 @@ async fn post_session_model(
     Path(id): Path<String>,
     Json(body): Json<SessionModelBody>,
 ) -> impl IntoResponse {
-    if let Err(e) = st.sessions.set_model(&id, body.model.as_deref()).await {
-        return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    if let Some(model) = body.model {
+        if let Err(e) = st.sessions.set_model(&id, model.as_deref()).await {
+            return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+        }
     }
     if let Some(effort) = body.effort {
         if let Err(e) = st.sessions.set_effort(&id, effort.as_deref()).await {
@@ -670,24 +766,50 @@ async fn ws_session(socket: WebSocket, st: AppState, session: String) {
     // loop process for the session starts or dies.
     let mut loop_rx = st.loops.subscribe();
 
-    // M9/M11: session terminals (PTY). Up to TERM_CAP live ptys per
-    // connection — one per open terminal tab, keyed by the client's
-    // terminal id. Each pty is owned by THIS connection: when the
-    // socket ends, every shell's process group is torn down (Term's
-    // Drop). `term_tx` stays held for the life of the connection so
-    // the `term_rx` arm below never observes a spurious "channel
-    // closed" mid-session; only a real EOF from a pty reader drains it.
-    // The channel carries (term_id, Some(bytes)) output chunks and
-    // (term_id, None) EOF markers (the shell for that id exited).
+    // M9/M11/M15: session terminals (PTY). The ptys live in the
+    // session-scoped registry (`st.terms`): a session switch or a page
+    // refresh disconnects THIS socket, but the shells keep running in
+    // the registry, and reconnecting sockets re-attach. The registry's
+    // reader threads fan each pty's chunks into this connection's
+    // `term_tx`; the `term_rx` arm in the select! turns them into
+    // frames. The channel carries (term_id, Some(bytes)) output chunks
+    // and (term_id, None) EOF markers (the shell for that id exited).
+    // `attach_token` is this connection's identity in the registry's
+    // fanout lists — teardown detaches by token, not by kill.
     const TERM_CAP: u32 = 4;
-    struct TermSlot {
-        term: term::Term,
-        reader: std::thread::JoinHandle<()>,
-    }
-    let mut terms: std::collections::HashMap<u32, TermSlot> =
-        std::collections::HashMap::new();
+    let attach_token = {
+        static NEXT_ATTACH: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1);
+        NEXT_ATTACH.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    };
     let (term_tx, mut term_rx) =
         tokio::sync::mpsc::channel::<(u32, Option<Vec<u8>>)>((TERM_CAP as usize) * 64);
+
+    // M15: re-attach to every pty this session still runs (a session
+    // switch / refresh dropped the previous socket). Replay each slot's
+    // ring tail so the client's terminals catch up, then report
+    // liveness. (If the socket is already dead the select loop below
+    // will break on its first failed send.)
+    for (id, eof, replay) in st.terms.attach_all(&session, attach_token, &term_tx) {
+        for chunk in &replay {
+            let frame = serde_json::json!([{
+                "kind": "term_out",
+                "id": id,
+                "data": chunk,
+            }]);
+            if sock_tx.send(Message::text(frame.to_string())).await.is_err() {
+                break;
+            }
+        }
+        let frame = serde_json::json!([{
+            "kind": "term_status",
+            "id": id,
+            "running": !eof,
+        }]);
+        if sock_tx.send(Message::text(frame.to_string())).await.is_err() {
+            break;
+        }
+    }
 
     // 3. Inbound commands from the client:
     //    {"kind":"message","content":"...","queue":"steer|follow"}
@@ -748,18 +870,20 @@ async fn ws_session(socket: WebSocket, st: AppState, session: String) {
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
             },
             chunk = term_rx.recv() => {
-                // M9/M11: pty master output, tagged with the terminal
-                // id. A (id, None) chunk is the reader's EOF marker —
-                // the shell for that id exited naturally: drop the slot
-                // (Term::Drop kills the group; the child is already
-                // dead) and report running:false so the client's exit
-                // overlay can offer a restart.
+                // M9/M11/M15: pty master output, tagged with the
+                // terminal id, fanned out from the session registry's
+                // reader threads through this connection's attach
+                // channel. A (id, None) chunk is a reader's EOF
+                // marker — the shell for that id exited naturally; the
+                // registry keeps the (dead) slot so a restart can
+                // reuse the id, so here we just report running:false
+                // for the client's exit overlay.
                 match chunk {
                     Some((id, Some(bytes))) => {
-                        // A stray chunk for a terminal that was already
-                        // closed/removed (the reader thread outlived the
-                        // close by one chunk) is dropped.
-                        if !terms.contains_key(&id) {
+                        // A stray chunk for a pty that was already
+                        // closed (in flight when `term_close` landed)
+                        // is dropped.
+                        if !st.terms.has(&session, id) {
                             continue;
                         }
                         let frame = serde_json::json!([{
@@ -772,10 +896,6 @@ async fn ws_session(socket: WebSocket, st: AppState, session: String) {
                         }
                     }
                     Some((id, None)) => {
-                        if let Some(mut slot) = terms.remove(&id) {
-                            slot.term.close();
-                            let _ = slot.reader.join();
-                        }
                         let frame = serde_json::json!([{
                             "kind": "term_status",
                             "id": id,
@@ -785,7 +905,7 @@ async fn ws_session(socket: WebSocket, st: AppState, session: String) {
                             break;
                         }
                     }
-                    None => {} // the base sender is dropped; the loop ends
+                    None => {} // the term channel closed; the other arms continue
                 }
             }
             msg = sock_rx.next() => match msg {
@@ -870,79 +990,65 @@ async fn ws_session(socket: WebSocket, st: AppState, session: String) {
                                 let _ = st.loops.stop(&session).await;
                             }
                             // ── M9/M11: terminal frames (multi-pty, id-tagged) ──
+                            // ── M9/M11/M15: terminal frames (multi-pty, id-tagged) ──
                             "term_open" => {
                                 let id = item.get("id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                                 let cols = item.get("cols").and_then(|v| v.as_u64()).unwrap_or(80) as u32;
                                 let rows = item.get("rows").and_then(|v| v.as_u64()).unwrap_or(24) as u32;
-                                // Replace an existing slot with this id
-                                // (restart after a shell exit): kill the old
-                                // shell's group and drain its reader first.
-                                if let Some(mut old) = terms.remove(&id) {
-                                    old.term.close();
-                                    let _ = old.reader.join();
-                                }
-                                // Cap: at most TERM_CAP live ptys per connection.
-                                if !terms.contains_key(&id) && terms.len() >= TERM_CAP as usize {
-                                    let frame = serde_json::json!([{
-                                        "kind": "term_status",
-                                        "id": id,
-                                        "running": false,
-                                        "error": format!("terminal limit ({}) reached", TERM_CAP),
-                                    }]);
-                                    let _ = sock_tx.send(Message::text(frame.to_string())).await;
-                                } else {
-                                    match files::session_workdir(&st, &session) {
-                                        Some(wd) => match term::open_term(&wd, cols, rows) {
-                                            Ok((t, reader)) => {
-                                                let tx = term_tx.clone();
-                                                let handle = std::thread::spawn(move || {
-                                                    let mut r = reader;
-                                                    let mut buf = [0u8; 4096];
-                                                    use std::io::Read as _;
-                                                    loop {
-                                                        match r.read(&mut buf) {
-                                                            Ok(0) => {
-                                                                // EOF: the shell exited.
-                                                                // Notify the
-                                                                // select loop so
-                                                                // it can drop
-                                                                // the slot and
-                                                                // report
-                                                                // running=false.
-                                                                let _ = tx.blocking_send((id, None));
-                                                                break;
-                                                            }
-                                                            Ok(n) => {
-                                                                let _ = tx.blocking_send((id, Some(buf[..n].to_vec())));
-                                                            }
-                                                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                                                            Err(_) => break,
-                                                        }
-                                                    }
-                                                });
-                                                terms.insert(id, TermSlot { term: t, reader: handle });
-                                                let frame = serde_json::json!([{"kind":"term_status","id":id,"running":true}]);
-                                                let _ = sock_tx.send(Message::text(frame.to_string())).await;
+                                // M15 spawn-or-attach: a live pty with this
+                                // id (left running by a session switch or a
+                                // page refresh) is re-attached and its ring
+                                // tail is replayed instead of spawning a
+                                // second shell; a dead (EOF) slot or a
+                                // missing one spawns a fresh pty under the
+                                // same id ("restart shell" path).
+                                match files::session_workdir(&st, &session) {
+                                    Some(wd) => {
+                                        let attach = Some(term_tx.clone());
+                                        match st.terms.open(
+                                            &session,
+                                            id,
+                                            cols,
+                                            rows,
+                                            &wd,
+                                            attach_token,
+                                            &attach,
+                                        ) {
+                                        Ok(replay) => {
+                                            for chunk in &replay {
+                                                let frame =
+                                                    serde_json::json!([{
+                                                        "kind": "term_out",
+                                                        "id": id,
+                                                        "data": chunk,
+                                                    }]);
+                                                if sock_tx.send(Message::text(frame.to_string())).await.is_err() {
+                                                    break;
+                                                }
                                             }
-                                            Err(e) => {
-                                                let frame = serde_json::json!([{
-                                                    "kind": "term_status",
-                                                    "id": id,
-                                                    "running": false,
-                                                    "error": format!("term_open failed: {e}"),
-                                                }]);
-                                                let _ = sock_tx.send(Message::text(frame.to_string())).await;
-                                            }
-                                        },
-                                        None => {
+                                            let frame =
+                                                serde_json::json!([{"kind":"term_status","id":id,"running":true}]);
+                                            let _ = sock_tx.send(Message::text(frame.to_string())).await;
+                                        }
+                                        Err(e) => {
                                             let frame = serde_json::json!([{
                                                 "kind": "term_status",
                                                 "id": id,
                                                 "running": false,
-                                                "error": "term_open: no working directory for this session",
+                                                "error": e,
                                             }]);
                                             let _ = sock_tx.send(Message::text(frame.to_string())).await;
                                         }
+                                        }
+                                    }
+                                    None => {
+                                        let frame = serde_json::json!([{
+                                            "kind": "term_status",
+                                            "id": id,
+                                            "running": false,
+                                            "error": "term_open: no working directory for this session",
+                                        }]);
+                                        let _ = sock_tx.send(Message::text(frame.to_string())).await;
                                     }
                                 }
                             }
@@ -950,28 +1056,26 @@ async fn ws_session(socket: WebSocket, st: AppState, session: String) {
                                 let id = item.get("id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                                 let data = item.get("data").and_then(|v| v.as_str()).unwrap_or("");
                                 if let Ok(bytes) = term::b64decode(data) {
-                                    if let Some(slot) = terms.get_mut(&id) {
-                                        slot.term.write_input(&bytes);
-                                    }
+                                    // M15: the pty lives in the session
+                                    // registry, not on this socket — input
+                                    // works even right after a reconnect,
+                                    // before the attach replays.
+                                    st.terms.input(&session, id, &bytes);
                                 }
                             }
                             "term_resize" => {
                                 let id = item.get("id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                                 let cols = item.get("cols").and_then(|v| v.as_u64()).unwrap_or(80) as u32;
                                 let rows = item.get("rows").and_then(|v| v.as_u64()).unwrap_or(24) as u32;
-                                if let Some(slot) = terms.get_mut(&id) {
-                                    slot.term.resize(cols, rows);
-                                }
+                                st.terms.resize(&session, id, cols, rows);
                             }
                             "term_close" => {
                                 let id = item.get("id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                                if let Some(mut slot) = terms.remove(&id) {
-                                    slot.term.close();
-                                    // Drain the old reader so its (now-dead
-                                    // shell's) output cannot race other
-                                    // terminals; then signal the client.
-                                    let _ = slot.reader.join();
-                                }
+                                // M15: the ONE path that kills a pty on
+                                // demand (explicit tab close). The session
+                                // deletion REST purges the whole session;
+                                // a bare disconnect does NOT.
+                                st.terms.close(&session, id);
                                 let frame = serde_json::json!([{"kind":"term_status","id":id,"running":false}]);
                                 let _ = sock_tx.send(Message::text(frame.to_string())).await;
                             }
@@ -988,12 +1092,12 @@ async fn ws_session(socket: WebSocket, st: AppState, session: String) {
         }
     }
 
-    // M9/M11: tear down EVERY open terminal with the connection — kill
-    // each shell's process group, then drain and stop its reader thread.
-    for (_, mut slot) in terms.drain() {
-        slot.term.close();
-        let _ = slot.reader.join();
-    }
+    // M15: disconnecting this socket does NOT kill the shells — they
+    // belong to the session and keep running in the registry (their
+    // output accumulates in each slot's ring). Detach this connection's
+    // fanout entries; the ptys die on explicit `term_close`, on session
+    // deletion, or when the server itself exits.
+    st.terms.detach(&session, attach_token);
 
     watcher.abort();
     stream_watcher.abort();
@@ -1247,10 +1351,12 @@ async fn main() -> anyhow::Result<()> {
 
     let sessions = Arc::new(SessionManager::new(cfg.clone()));
     let loops = Arc::new(LoopManager::new(cfg.clone()));
+    let terms = Arc::new(term::TermRegistry::new());
     let state = AppState {
         cfg,
         sessions,
         loops,
+        terms,
     };
 
     let app = Router::new()
@@ -1271,6 +1377,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/sessions/{id}/rewind/node/{seq}", get(get_rewind_node))
         .route("/api/sessions/{id}/goal", get(get_goal).post(post_goal))
         .route("/api/sessions/{id}/essence", get(get_essence))
+        .route("/api/sessions/{id}/context-meta", get(get_context_meta))
+        .route("/api/sessions/{id}/compaction", get(get_compaction))
         .route(
             "/api/sessions/{id}/time-inject",
             get(get_time_inject).post(post_time_inject),
@@ -1304,6 +1412,25 @@ mod tests {
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// v0.5.76: the model popup's effort row posts only `effort`. The
+    /// absent `model` must therefore mean "leave the model alone"; an
+    /// explicit `null` still clears it and a string still sets it.
+    #[test]
+    fn session_model_body_distinguishes_absent_from_null() {
+        let b: super::SessionModelBody = serde_json::from_str(r#"{"effort":"high"}"#).unwrap();
+        assert!(b.model.is_none(), "absent model = untouched");
+        assert_eq!(b.effort, Some(Some("high".to_string())));
+
+        let b: super::SessionModelBody = serde_json::from_str(r#"{"model":null}"#).unwrap();
+        assert_eq!(b.model, Some(None), "explicit null = clear");
+        assert!(b.effort.is_none(), "absent effort = untouched");
+
+        let b: super::SessionModelBody =
+            serde_json::from_str(r#"{"model":"m1","effort":null}"#).unwrap();
+        assert_eq!(b.model, Some(Some("m1".to_string())));
+        assert_eq!(b.effort, Some(None), "explicit null effort = clear");
     }
 
     /// `--loop-cmd "/k/rushi run"`: the shell handed over one element.

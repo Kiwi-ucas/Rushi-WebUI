@@ -126,6 +126,24 @@ pub async fn set_session_model(session: &str, model: Option<&str>) -> Result<(),
     Ok(())
 }
 
+/// v0.5.76: set (or, with `None`, clear) a session's reasoning effort.
+/// The body carries ONLY `effort`: the server treats an absent `model`
+/// as "leave it untouched", so an effort change cannot disturb the
+/// session's model choice (only an explicit `null` clears that).
+pub async fn set_session_effort(session: &str, effort: Option<&str>) -> Result<(), String> {
+    let url = format!("/api/sessions/{}/model", js_sys::encode_uri_component(session));
+    let payload = serde_json::json!({ "effort": effort });
+    let req = Request::post(&url)
+        .header("Content-Type", "application/json")
+        .body(payload.to_string())
+        .map_err(|e| e.to_string())?;
+    let res = req.send().await.map_err(|e| e.to_string())?;
+    if res.status() >= 400 {
+        return Err(res.text().await.unwrap_or_default());
+    }
+    Ok(())
+}
+
 /// v0.5.44: store (or, with `None`, clear) the key for one env var name.
 /// The key is never read back — only its presence is reported.
 pub async fn set_model_key(name: &str, value: Option<&str>) -> Result<(), String> {
@@ -313,6 +331,19 @@ pub async fn load_goal(id: &str) -> Option<crate::model::GoalView> {
         .and_then(|v| serde_json::from_value(v.get("current")?.clone()).ok())
 }
 
+/// v0.5.75: the context meter's server-side numbers for one session —
+/// the system prompt's size and the `[limits]` pair (read from the same
+/// config the session's loop runs). `None` on any failure; the panel then
+/// falls back to its two-segment estimate and no compaction marker.
+pub async fn load_context_meta(id: &str) -> Option<crate::model::ContextMeta> {
+    let res = Request::get(&format!("/api/sessions/{id}/context-meta"))
+        .send()
+        .await
+        .ok()?;
+    let text = res.text().await.ok()?;
+    serde_json::from_str::<crate::model::ContextMeta>(&text).ok()
+}
+
 pub async fn goal_action(id: &str, action: &str, goal: Option<&str>) {
     let payload = json!({
         "action": action,
@@ -336,6 +367,37 @@ pub async fn load_essence(id: &str) -> Result<Vec<crate::model::EssenceEntry>, S
         v.get("entries").cloned().unwrap_or(Value::Array(vec![])),
     )
     .map_err(|e| e.to_string())
+}
+
+/// v0.5.57: the session's most recent `compaction_summary` event — the
+/// current context-handoff summary. Served so the transcript can pin a
+/// persistent "context summary" card; the event itself lives deep in the
+/// event log (often far outside the last-200 truncated window) and would
+/// otherwise be invisible after a page reload. `None` when the session has
+/// no compaction yet (server answers 404 / null).
+pub async fn load_latest_compaction(id: &str) -> Option<crate::model::CompactionSummary> {
+    let res = Request::get(&format!("/api/sessions/{id}/compaction"))
+        .send()
+        .await
+        .ok()?;
+    if res.status() >= 400 {
+        return None;
+    }
+    let text = res.text().await.ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    if v.is_null() {
+        return None;
+    }
+    let summary = v
+        .get("summary")
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_string();
+    if summary.is_empty() {
+        return None;
+    }
+    let ts = v.get("ts").and_then(|t| t.as_str()).unwrap_or("").to_string();
+    Some(crate::model::CompactionSummary { summary, ts })
 }
 
 /// v0.5.56: the session's time-inject toggle (sidebar time plugin). The

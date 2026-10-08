@@ -23,6 +23,54 @@ fn ev_key_indices(n: usize, gen: u64) -> Vec<(u64, usize)> {
     (0..n).map(|i| (gen, i)).collect()
 }
 
+/// v0.5.57: the pinned "context summary" card. Renders the active
+/// session's latest `compaction_summary` (the current context-handoff) at
+/// the top of the transcript so it survives a page reload — that event
+/// normally sits deep in the log, far outside the last-200 history
+/// window, and would otherwise be invisible after a refresh. Collapsed by
+/// default (one-line header); the body is the same markdown renderer as
+/// an assistant message. The card carries NO `.event` class, so the pile
+/// engine's 1:1 `.event`→index mapping is unaffected.
+#[component]
+fn PinnedCompactionCard(state: AppState) -> impl IntoView {
+    let latest = state.latest_compaction;
+    let open = create_rw_signal(false);
+    view! {
+        <Show
+            when=move || latest.get().is_some()
+            fallback=|| ()
+        >
+            { move || {
+                match latest.get() {
+                    Some(cs) => {
+                        let summary = cs.summary;
+                        let ts: String = cs.ts.chars().take(19).collect();
+                        view! {
+                            <div class="comp-card">
+                                <button
+                                    class=move || {
+                                        if open.get() { "comp-card-header open" } else { "comp-card-header" }
+                                    }
+                                    on:click=move |_| open.update(|o| *o = !*o)
+                                >
+                                    <span class="comp-card-glyph">{ move || if open.get() { "\u{25be}".to_string() } else { "\u{25b8}".to_string() } }</span>
+                                    <span class="comp-card-title">"context summary"</span>
+                                    <span class="comp-card-ts">{ move || ts.clone() }</span>
+                                </button>
+                                <Show when=move || open.get()>
+                                    <div class="ev-content comp-card-body">{ md_blocks_view(summary.clone()) }</div>
+                                </Show>
+                            </div>
+                        }
+                        .into_any()
+                    }
+                    None => view! { <div /> }.into_any(),
+                }
+            }}
+        </Show>
+    }
+}
+
 #[component]
 pub fn Transcript(state: AppState) -> impl IntoView {
     let events = state.events;
@@ -47,6 +95,11 @@ pub fn Transcript(state: AppState) -> impl IntoView {
 
     view! {
         <div id="transcript">
+            // v0.5.57: pinned context-summary card (the session's latest
+            // compaction), kept visible across a page reload. Rendered
+            // first so it sits atop the transcript. No `.event` class, so
+            // the pile engine's 1:1 `.event`→index mapping is intact.
+            <PinnedCompactionCard state=state />
             // v0.5.17: "load earlier" — the server ships only the last
             // page of events on connect; this button pages backwards
             // (older events) and prepends them to the loaded window.
@@ -425,26 +478,20 @@ fn ev_body(
                 })
                 .unwrap_or_default();
 
+            // v0.5.75: the `242607 in | 227 out | 242432 cached` line under
+            // every assistant message is gone — the context meter's panel
+            // shows those numbers on demand. The state writes below stay:
+            // they are the ONLY feed for the top bar (ctx_used) and for the
+            // panel's "last turn" rows (cached / out).
             let usage = ev.get("usage").cloned();
-            let usage_line = usage.as_ref().and_then(|u| {
-                let mut parts: Vec<String> = Vec::new();
-                if let Some(n) = u.get("input_tokens").and_then(|v| v.as_u64()) {
-                    parts.push(format!("{n} in"));
-                }
-                if let Some(n) = u.get("output_tokens").and_then(|v| v.as_u64()) {
-                    parts.push(format!("{n} out"));
-                }
-                if let Some(n) = u.get("cached_tokens").and_then(|v| v.as_u64()) {
-                    parts.push(format!("{n} cached"));
-                }
-                let s = parts.join(" | ");
-                if s.is_empty() { None } else { Some(s) }
-            });
-
             if let Some(u) = &usage {
                 if let Some(n) = u.get("input_tokens").and_then(|v| v.as_u64()) {
                     state.ctx_used.set(n);
                 }
+                state
+                    .ctx_cached
+                    .set(u.get("cached_tokens").and_then(|v| v.as_u64()));
+                state.ctx_out.set(u.get("output_tokens").and_then(|v| v.as_u64()));
             }
 
             let tc_views: Vec<AnyView> = tool_calls
@@ -466,16 +513,10 @@ fn ev_body(
             } else {
                 view! { <div /> }.into_any()
             };
-            let usage_badge: AnyView = match usage_line {
-                Some(u) => view! { <div class="ev-usage">{ u }</div> }.into_any(),
-                None => view! { <div /> }.into_any(),
-            };
-
             let v = view! {
                 { thinking }
                 <div class="ev-content">{ md_blocks_view(content) }</div>
                 { tc_views }
-                { usage_badge }
             };
             v.into_any()
         }
@@ -540,10 +581,17 @@ fn ev_body(
                 <details class="ev-result-det">
                     <summary>{ summary }</summary>
                     <pre class="ev-result">{ result_text_display }</pre>
+                    // v0.5.75: the tool-log pointer moved INSIDE the expanded
+                    // result. It is a fixed file name (tools.jsonl) rendered as
+                    // plain text — not a link — so as a permanent footer on
+                    // every tool_result card it was pure UI cost. The only real
+                    // signal it carries is "the full output went to the log
+                    // file", which matters exactly while you are looking at the
+                    // clipped preview. Collapsed cards no longer show it.
+                    <Show when=move || tool_log.is_some() fallback=|| ()>
+                        <div class="ev-tool-log">{ format!("tool log: {}", tool_log_display.as_deref().unwrap_or("")) }</div>
+                    </Show>
                 </details>
-                <Show when=move || tool_log.is_some() fallback=|| ()>
-                    <div class="ev-tool-log">{ format!("tool log: {}", tool_log_display.as_deref().unwrap_or("")) }</div>
-                </Show>
             }.into_any()
         }
 
@@ -552,28 +600,51 @@ fn ev_body(
             view! { <div class="ev-err-msg">{ msg }</div> }.into_any()
         }
 
-        "compaction_started" | "compaction_summary" | "compaction_failed" => {
+        // v0.5.56: the summary body is a markdown document (the kernel
+        // writes the handoff/summary in md) — render it with the shared
+        // md renderer, the same way an assistant message body renders,
+        // instead of a flat string. Status / failure lines stay plain
+        // (they are short status messages, not md documents).
+        "compaction_summary" => {
+            let body = ev
+                .get("summary")
+                .and_then(|v| v.as_str())
+                .or_else(|| ev.get("message").and_then(|v| v.as_str()))
+                .unwrap_or("Summary generated.")
+                .to_string();
+            // A `branch_of` marker means this summarizes an abandoned
+            // branch (a rewind add-on: no handoff boundary, the text
+            // lands in branch-summary/vN.md), not a plain compaction —
+            // keep that distinction as a small label above the body.
+            let seq = ev
+                .get("branch_of")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let is_branch = ev.get("branch_of").is_some();
+            let label = if is_branch {
+                format!("Branch summary (abandoned branch after rewind #{seq}).")
+            } else {
+                String::new()
+            };
+            let label_view: AnyView = if label.is_empty() {
+                view! { <span /> }.into_any()
+            } else {
+                view! { <div class="ev-comp-label">{ label }</div> }.into_any()
+            };
+            view! {
+                <div class="ev-comp-text">
+                    { label_view }
+                    <div class="ev-content">{ md_blocks_view(body) }</div>
+                </div>
+            }
+            .into_any()
+        }
+
+        "compaction_started" | "compaction_failed" => {
             let msg = match t {
                 "compaction_started" => format!(
                     "Compaction in progress\u{2026} ({})",
                     ev.get("reason").and_then(|v| v.as_str()).unwrap_or("")
-                ),
-                // v0.1.5 branch-summarize: a `branch_of` marker summarizes
-                // the branch abandoned at that rewind seq. It is an add-on
-                // on the active path, not a handoff boundary (no
-                // handoff.md; the text lands in branch-summary/vN.md), so
-                // it reads differently from a compaction.
-                "compaction_summary" if ev.get("branch_of").is_some() => format!(
-                    "Branch summary (abandoned branch after rewind #{}). {}",
-                    ev.get("branch_of").and_then(|v| v.as_u64()).unwrap_or(0),
-                    ev.get("summary").and_then(|v| v.as_str()).unwrap_or("")
-                ),
-                "compaction_summary" => format!(
-                    "Compacted. {}",
-                    ev.get("summary")
-                        .and_then(|v| v.as_str())
-                        .or_else(|| ev.get("message").and_then(|v| v.as_str()))
-                        .unwrap_or("Summary generated.")
                 ),
                 _ => format!(
                     "Compaction failed: {}",

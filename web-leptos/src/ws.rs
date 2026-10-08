@@ -31,20 +31,13 @@ pub fn set_term_writer(id: u32, f: impl FnMut(Vec<u8>) + 'static) {
     TERM_WRITE.with(|c| c.borrow_mut().get_or_insert_with(std::collections::HashMap::new).insert(id, Box::new(f)));
 }
 
-/// M11: clear the sink for terminal `id` (tab unmount / session switch).
+/// M11: clear the sink for terminal `id` (explicit tab close / session
+/// deletion). M15: session switches keep the sinks — the kept
+/// terminals' ptys outlive the socket swap.
 pub fn clear_term_writer(id: u32) {
     TERM_WRITE.with(|c| {
         if let Some(m) = c.borrow_mut().as_mut() {
             m.remove(&id);
-        }
-    });
-}
-
-/// M11: clear every terminal sink (session switch tears down all ptys).
-pub fn clear_all_term_writers() {
-    TERM_WRITE.with(|c| {
-        if let Some(m) = c.borrow_mut().as_mut() {
-            m.clear();
         }
     });
 }
@@ -180,12 +173,13 @@ pub fn connect(state: &AppState, session: &str) {
     // connection; a queued flush then finds empty buffers and no-ops,
     // so it can never append into the new session's live card.
     drop_pending_deltas();
-    // M11: a fresh connection owns fresh (no) terminals — the previous
-    // socket's ptys were torn down with it. Reset every terminal's
-    // liveness state and detach every xterm writer sink.
-    state.term_state.set(std::collections::HashMap::new());
-    clear_all_term_writers();
-
+    // M15: terminals are session-bound — a session switch (this very
+    // reconnect) does NOT tear down other sessions' xterm writer
+    // sinks or liveness lamps. The server re-attaches this socket to
+    // the session's surviving ptys and pushes `term_status` frames
+    // that resync `term_state`; the kept terminals' writers keep
+    // routing into their (still-mounted) xterm instances. Only an
+    // explicit tab close (or a session deletion) removes a writer.
     let w = match web_sys::window() {
         Some(w) => w,
         None => return,
@@ -212,6 +206,9 @@ pub fn connect(state: &AppState, session: &str) {
     let ws_status = state.ws_status;
     let ctx_used = state.ctx_used;
     let rounds_ctxk = state.rounds_ctxk;
+    // v0.5.75: the meter panel's last-turn split rides the same replay.
+    let ctx_cached = state.ctx_cached;
+    let ctx_out = state.ctx_out;
     let loop_running = state.loop_running;
     let live_text = state.live_text;
     let live_reasoning = state.live_reasoning;
@@ -252,6 +249,8 @@ pub fn connect(state: &AppState, session: &str) {
         let events = events;
         let ctx_used = ctx_used;
         let rounds_ctxk = rounds_ctxk;
+        let ctx_cached = ctx_cached;
+        let ctx_out = ctx_out;
         let loop_running = loop_running;
         let live_text = live_text;
         let live_reasoning = live_reasoning;
@@ -293,9 +292,11 @@ pub fn connect(state: &AppState, session: &str) {
                             .unwrap_or_default();
                         let normed: Vec<Value> =
                             evs.into_iter().map(|mut v| normalize_event(&mut v)).collect();
-                        let (ctx, ctxk) = rebuild_ctx_bookkeeping(&normed);
-                        ctx_used.set(ctx);
-                        rounds_ctxk.set(ctxk);
+                        let book = rebuild_ctx_bookkeeping(&normed);
+                        ctx_used.set(book.ctx);
+                        rounds_ctxk.set(book.rounds);
+                        ctx_cached.set(book.cached);
+                        ctx_out.set(book.out);
                         tool_pending.set(rebuild_tool_pending(&normed));
                         settling.set(false); // v0.5.15: a history replay never settles
                         // v0.5.17: truncated-history window state.
@@ -352,9 +353,11 @@ pub fn connect(state: &AppState, session: &str) {
                                 v.extend(events.get());
                                 v
                             };
-                            let (ctx, ctxk) = rebuild_ctx_bookkeeping(&merged);
-                            ctx_used.set(ctx);
-                            rounds_ctxk.set(ctxk);
+                            let book = rebuild_ctx_bookkeeping(&merged);
+                            ctx_used.set(book.ctx);
+                            rounds_ctxk.set(book.rounds);
+                            ctx_cached.set(book.cached);
+                            ctx_out.set(book.out);
                             tool_pending.set(rebuild_tool_pending(&merged));
                             earlier_loaded.update(|v| *v += new_count as u64);
                             events.set(merged);
@@ -884,11 +887,23 @@ pub fn term_close(id: u32) {
     send_command("", &json!({ "kind": "term_close", "id": id }));
 }
 
+/// The context bookkeeping derived from an event list: the bar's usage,
+/// each round's ctxK, and (v0.5.75) the LAST assistant usage's cache /
+/// output split — the numbers the meter panel's "last turn" rows show.
+#[derive(Default)]
+pub(crate) struct CtxBookkeeping {
+    pub ctx: u64,
+    pub rounds: Vec<u64>,
+    pub cached: Option<u64>,
+    pub out: Option<u64>,
+}
+
 /// Rebuild the legacy ctx bookkeeping from a (partial or full) event
 /// list: `ctx_used` is the last assistant input_tokens usage; each
 /// user_message (except the very first event) closes the previous
 /// round, recording `ctx_used` as that round's ctxK.
-pub(crate) fn rebuild_ctx_bookkeeping(normed: &[Value]) -> (u64, Vec<u64>) {
+pub(crate) fn rebuild_ctx_bookkeeping(normed: &[Value]) -> CtxBookkeeping {
+    let mut book = CtxBookkeeping::default();
     let mut ctx = 0u64;
     let mut ctxk: Vec<u64> = Vec::new();
     for (i, ev) in normed.iter().enumerate() {
@@ -902,13 +917,24 @@ pub(crate) fn rebuild_ctx_bookkeeping(normed: &[Value]) -> (u64, Vec<u64>) {
             {
                 if n > 0 {
                     ctx = n;
+                    // v0.5.75: the same usage owns the cache/output split,
+                    // so they never drift from the bar's number.
+                    let u = ev.get("usage");
+                    book.cached = u
+                        .and_then(|u| u.get("cached_tokens"))
+                        .and_then(|n| n.as_u64());
+                    book.out = u
+                        .and_then(|u| u.get("output_tokens"))
+                        .and_then(|n| n.as_u64());
                 }
             }
         } else if t == "user_message" && i > 0 {
             ctxk.push(ctx);
         }
     }
-    (ctx, ctxk)
+    book.ctx = ctx;
+    book.rounds = ctxk;
+    book
 }
 
 /// Rebuild the running tool-call set: tool_call ids with no matching

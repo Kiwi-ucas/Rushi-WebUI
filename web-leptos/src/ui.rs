@@ -133,6 +133,37 @@ pub fn persist_project_labels(labels: &std::collections::HashMap<String, String>
     }
 }
 
+// ── per-session composer drafts (v0.5.58) ───────────────────────────
+// The main input box is bound to the ACTIVE session (model::AppState
+// `draft` / `drafts`). On a session switch the outgoing session's unsent
+// text is stashed here and the incoming session's own draft restored, so
+// the box never carries one session's words into another and a send can't
+// land in the wrong session. The map is persisted to localStorage so it
+// survives a full page reload.
+
+/// The persisted session-name → unsent-text map. Tolerant: a missing key,
+/// a broken JSON blob, or a non-object all read as "no drafts".
+pub fn read_drafts() -> std::collections::HashMap<String, String> {
+    web_sys::window()
+        .and_then(|w| w.local_storage().ok())
+        .flatten()
+        .and_then(|s| s.get_item("rushi-drafts").ok())
+        .flatten()
+        .and_then(|v| {
+            serde_json::from_str::<std::collections::HashMap<String, String>>(&v).ok()
+        })
+        .unwrap_or_default()
+}
+
+pub fn persist_drafts(drafts: &std::collections::HashMap<String, String>) {
+    if let Some(s) = web_sys::window().and_then(|w| w.local_storage().ok()).flatten() {
+        let _ = s.set_item(
+            "rushi-drafts",
+            &serde_json::to_string(drafts).unwrap_or_else(|_| "{}".into()),
+        );
+    }
+}
+
 /// The label a group head shows for `group_key` (a working path): the user's
 /// alias when one is set, else the path's basename (`dispatch_group_label`).
 pub fn group_label(state: AppState, group_key: &str) -> String {
@@ -310,10 +341,17 @@ fn model_settings_icon() -> AnyView {
 }
 
 /// v0.5.44: the session card's model chip — the entry this session runs
-/// with, plus a popup styled after the input box's steer selector to
-/// change it. The chip is disabled while the session's loop runs: the
-/// choice applies at the next launch, so changing it mid-run would only
-/// mislead (and, worse, make the chip disagree with what is running).
+/// with, plus a popup to change it. The chip is disabled while the
+/// session's loop runs: the choice applies at the next launch, so
+/// changing it mid-run would only mislead (and, worse, make the chip
+/// disagree with what is running).
+///
+/// v0.5.76: the popup speaks the SIDEBAR's language (`.smc-*` — flat
+/// 11px/700 rows on the `#sess-menu` panel skin) instead of borrowing
+/// the message box's steer selector (`.qsel-*`, 13.3px raised pills);
+/// and it grew a "thinking effort" row (`ms::effort_choices`, written to
+/// the session's `.effort` marker — the same field the new-session
+/// dialog sets). Both choices apply at the next launch.
 #[component]
 fn SessionModelChip(
     state: AppState,
@@ -327,6 +365,7 @@ fn SessionModelChip(
     // clip an absolutely positioned panel.
     let pos = RwSignal::new((0.0_f64, 0.0_f64));
     let names = state.model_names;
+    let model_ids = state.model_ids;
     let sessions = state.sessions;
     // Signals, not plain Strings: a `move` closure nested in the `view!`
     // body would otherwise move them out of the view closure, which must
@@ -365,9 +404,34 @@ fn SessionModelChip(
             format!("model: {l} — click to change")
         }
     };
+    // v0.5.76: the session's pending effort ("" = follow the entry's own
+    // `reasoning_effort`). Read back from the session list like `current`,
+    // so a write followed by the list reload updates the pills.
+    let current_effort = Signal::derive(move || {
+        let n = session_name.get();
+        sessions
+            .get()
+            .into_iter()
+            .find(|s| s.name == n)
+            .and_then(|s| s.effort)
+            .unwrap_or_default()
+    });
+    // The levels this model family accepts (family inferred from the
+    // provider model_id; unknown/empty => every level the kernel knows).
+    let levels = Signal::derive(move || {
+        let id = model_ids
+            .get()
+            .get(&current.get())
+            .cloned()
+            .unwrap_or_default();
+        crate::ms::effort_choices(&id)
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<String>>()
+    });
 
     view! {
-        <div class="sess-model">
+        <div class="sess-model" class:open=move || open.get()>
             <button
                 class="sess-model-chip"
                 disabled=move || running.get()
@@ -385,24 +449,25 @@ fn SessionModelChip(
                 }
             >
                 <span class="smc-text">{ move || label() }</span>
-                <span class="qsel-chev">{ "\u{25be}" }</span>
+                <span class="smc-chev">{ "\u{25be}" }</span>
             </button>
             <Show when=move || open.get() fallback=|| ()>
                 <div
-                    class="qsel-backdrop"
+                    class="smc-backdrop"
                     on:click=move |e: MouseEvent| {
                         e.stop_propagation();
                         open.set(false);
                     }
                 />
                 <div
-                    class="qsel-panel sess-model-panel"
+                    class="smc-panel sess-model-panel"
                     style=move || {
                         let (x, y) = pos.get();
                         format!("left:{x:.0}px; top:{y:.0}px;")
                     }
                     on:click=move |e: MouseEvent| e.stop_propagation()
                 >
+                    <div class="smc-sec">{ "model" }</div>
                     { move || {
                         let cur = current.get();
                         let session_base = session_name.get();
@@ -416,7 +481,7 @@ fn SessionModelChip(
                                 let st = state;
                                 view! {
                                     <button
-                                        class="qsel-opt"
+                                        class="smc-opt"
                                         aria-selected=sel
                                         on:click=move |_| {
                                             let session = session.clone();
@@ -442,7 +507,7 @@ fn SessionModelChip(
                                             after_dispatch(move || open.set(false));
                                         }
                                     >
-                                        <span class="qsel-tick">{ "\u{2713}" }</span>
+                                        <span class="smc-tick">{ "\u{2713}" }</span>
                                         { n.clone() }
                                     </button>
                                 }
@@ -451,6 +516,58 @@ fn SessionModelChip(
                             .collect();
                         opts
                     } }
+                    <div class="smc-sec">{ "thinking effort" }</div>
+                    <div class="smc-eff">
+                        <button
+                            class="smc-eff-pill"
+                            class:on=move || current_effort.get().is_empty()
+                            title="follow the model entry's own reasoning_effort"
+                            on:click=move |_| {
+                                let session = session_name.get_untracked();
+                                spawn_local(async move {
+                                    let _ = api::set_session_effort(&session, None).await;
+                                    if let Ok(list) = api::load_sessions().await {
+                                        state.sessions.set(list);
+                                    }
+                                });
+                            }
+                        >{ "inherit" }</button>
+                        { move || {
+                            let cur = current_effort.get();
+                            levels
+                                .get()
+                                .into_iter()
+                                .map(|v| {
+                                    let on = v == cur;
+                                    // `v` labels the pill, `val` rides into
+                                    // the handler (one String each, like the
+                                    // model rows above).
+                                    let val = v.clone();
+                                    let session = session_name.get_untracked();
+                                    view! {
+                                        <button
+                                            class="smc-eff-pill"
+                                            class:on=move || on
+                                            on:click=move |_| {
+                                                let session = session.clone();
+                                                let val = val.clone();
+                                                spawn_local(async move {
+                                                    let _ = api::set_session_effort(
+                                                        &session,
+                                                        Some(val.as_str()),
+                                                    )
+                                                        .await;
+                                                    if let Ok(list) = api::load_sessions().await {
+                                                        state.sessions.set(list);
+                                                    }
+                                                });
+                                            }
+                                        >{ v.clone() }</button>
+                                    }
+                                })
+                                .collect_view()
+                        } }
+                    </div>
                 </div>
             </Show>
         </div>
@@ -567,7 +684,24 @@ pub fn select_session(state: AppState, name: &str) {
             state.loop_done_unviewed.write().remove(&old);
         }
     }
+    // v0.5.58: session-bound composer draft — stash the OUTGOING
+    // session's unsent text (keyed by that session) before switching, so
+    // it is restored when the user comes back and never carries into the
+    // next session's input (where a send could land in the wrong session).
+    if let Some(old_name) = state.active_session.get() {
+        let text = state.draft.get();
+        if !text.is_empty() {
+            state.drafts.update(|m| {
+                m.insert(old_name, text);
+            });
+        }
+    }
     state.active_session.set(Some(name.to_string()));
+    // v0.5.58: restore THIS session's own draft into the composer (empty
+    // if it never had one), replacing whatever the previous session left
+    // in the box. Persist the cross-session map so it survives a reload.
+    state.draft.set(state.drafts.with(|m| m.get(name).cloned()).unwrap_or_default());
+    crate::ui::persist_drafts(&state.drafts.get());
     // v0.5.55 P1: opening this session consumes its "finished, unviewed"
     // green lamp. Remember the view so the 10 s `loops` poll and the
     // connect-time `loops` frame do not re-seed the lamp for this session
@@ -579,7 +713,17 @@ pub fn select_session(state: AppState, name: &str) {
     state.view_round.set(None);
     state.ctx_used.set(0);
     state.rounds_ctxk.set(Vec::new());
+    // v0.5.75: the meter panel is session-scoped — drop the previous
+    // session's numbers AND its meta before the new fetch lands.
+    state.ctx_cached.set(None);
+    state.ctx_out.set(None);
+    state.ctx_meta.set(None);
+    state.ctx_panel_open.set(false);
     state.goal.set(None);
+    // v0.5.57: drop the previous session's pinned context summary so the
+    // card does not briefly show the OTHER session's compaction while the
+    // new session's fetch is in flight.
+    state.latest_compaction.set(None);
     // v0.5.38: drop the previous session's loop-cmd value so the chip
     // does not briefly show the OTHER session's command while the new
     // session's full-transcript fetch is in flight.
@@ -587,7 +731,7 @@ pub fn select_session(state: AppState, name: &str) {
     state.loop_cmd_sess.set(None);
     state.menu_session.set(None);
     state.clear_live();
-    reset_panel_session(state);
+    switch_panel_session(&state);
 
     let s2 = state;
     let name2 = name.to_string();
@@ -602,7 +746,14 @@ pub fn select_session(state: AppState, name: &str) {
         // does not come back on the next poll or reload.
         api::mark_loop_viewed(&name2).await;
         s2.goal.set(api::load_goal(&name2).await);
+        // v0.5.75: the meter's server-side numbers (system prompt size +
+        // limits) ride the same session-switch fetch wave.
+        s2.ctx_meta.set(api::load_context_meta(&name2).await);
         s2.loop_running.set(api::loop_running(&name2).await);
+        // v0.5.57: pin the session's latest compaction summary (the current
+        // context handoff) so it survives a page reload — it normally sits
+        // deep in the event log, far outside the last-200 history window.
+        s2.latest_compaction.set(api::load_latest_compaction(&name2).await);
         // v0.5.38: fetch the full transcript right away so the loop-cmd
         // chip is correct from the first paint (not after the 4s poll),
         // when its command is buried under >200 model/tool events.
@@ -615,29 +766,51 @@ pub fn select_session(state: AppState, name: &str) {
     });
 }
 
-/// M11: the right-panel tab model is connection-scoped — a session
-/// switch (or deletion of the active session) tears down every open
-/// tab. The server killed the previous socket's ptys on disconnect, so
-/// close all terminal tabs' ptys explicitly (a no-op for already-dead
-/// ids), detach every xterm writer, and reset to a bare Files home tab.
-fn reset_panel_session(state: AppState) {
-    for t in state.rp_tabs.get().iter().filter(|t| t.kind == RpTabKind::Term) {
-        ws::term_close(t.id);
-    }
-    ws::clear_all_term_writers();
-    // M13: reset to the EMPTY start view (no tabs). Files/terminal tabs
-    // are opened on demand via the start view's launcher buttons or the
-    // "+" menu; tab ids are connection-scoped, so a session switch drops
-    // every open tab.
-    state.rp_tabs.set(Vec::new());
-    state.rp_active.set(0);
-    state.rp_next_id.set(1);
-    state.rp_term_seq.set(1);
+/// M15: session switch — the right panel drops the session-scoped FILE
+/// views but keeps every terminal tab: terminals are session-bound
+/// (their ptys keep running in the server's session store), so a
+/// switch must not `term_close` them or clear the xterm writer sinks.
+/// The id counters stay alive too (a kept id must not be reused by
+/// another session's new terminal), and the `term_state` lamps of the
+/// kept terminals stay as they were — the reconnecting socket's
+/// `term_status` frames resync them.
+fn switch_panel_session(state: &AppState) {
+    let active = state.rp_active.get();
+    state.rp_tabs.update(|ts| {
+        ts.retain(|t| t.kind != RpTabKind::File && t.kind != RpTabKind::Files);
+    });
     state.rp_expanded.update(|s| s.clear());
     state.rp_children.set(std::collections::HashMap::new());
     state.rp_preview_map.set(std::collections::HashMap::new());
     state.rp_err_map.set(std::collections::HashMap::new());
-    state.term_state.set(std::collections::HashMap::new());
+    if !state.rp_tabs.get().iter().any(|t| t.id == active) {
+        state.rp_active.set(state.rp_tabs.get().first().map(|t| t.id).unwrap_or(0));
+    }
+}
+
+/// M15: session deletion — the session's terminals die with it (the
+/// REST handler purges the server-side slots; here we drop the client
+/// half: close any still-live pty, detach the writer sinks, remove the
+/// tabs). File views of the deleted session (its File/Files tabs, when
+/// it was the active one) are dropped with it.
+fn teardown_panel_for_session(state: &AppState, deleted: &str) {
+    for t in state
+        .rp_tabs
+        .get()
+        .iter()
+        .filter(|t| t.sess == deleted && t.kind == RpTabKind::Term)
+    {
+        ws::term_close(t.id);
+        ws::clear_term_writer(t.id);
+        state.term_state.update(|m| {
+            m.remove(&t.id);
+        });
+    }
+    state.rp_tabs.update(|ts| ts.retain(|t| t.sess != deleted));
+    let active = state.rp_active.get();
+    if !state.rp_tabs.get().iter().any(|t| t.id == active) {
+        state.rp_active.set(state.rp_tabs.get().first().map(|t| t.id).unwrap_or(0));
+    }
 }
 
 pub fn delete_session(state: AppState, name: &str) {
@@ -646,6 +819,10 @@ pub fn delete_session(state: AppState, name: &str) {
     spawn_local(async move {
         match api::delete_session(&name_owned).await {
             Ok(()) => {
+                // M15: a session's terminals are bound to it — deleting
+                // the session kills its ptys (the REST handler already
+                // purged the server slots; drop the client half here).
+                teardown_panel_for_session(&s2, &name_owned);
                 if s2.active_session.get().as_deref() == Some(name_owned.as_str()) {
                     s2.active_session.set(None);
                     s2.events.set(Vec::new());
@@ -653,11 +830,29 @@ pub fn delete_session(state: AppState, name: &str) {
                     s2.view_round.set(None);
                     s2.ctx_used.set(0);
                     s2.rounds_ctxk.set(Vec::new());
+                    s2.ctx_cached.set(None);
+                    s2.ctx_out.set(None);
+                    s2.ctx_meta.set(None);
+                    s2.ctx_panel_open.set(false);
                     s2.goal.set(None);
                     s2.clear_live();
-                    reset_panel_session(s2);
+                    // The panel's file views belonged to the now-gone
+                    // session — drop them (terminal tabs of OTHER
+                    // sessions survive, M15).
+                    s2.rp_expanded.update(|s| s.clear());
+                    s2.rp_children.set(std::collections::HashMap::new());
+                    s2.rp_preview_map.set(std::collections::HashMap::new());
+                    s2.rp_err_map.set(std::collections::HashMap::new());
                     ws::close_current();
                     s2.ws_status.set("disconnected".to_string());
+                    // v0.5.58: the session is gone — drop its unsent draft and
+                    // empty the box so it can't carry into the next selected
+                    // session (or survive a reload).
+                    s2.drafts.update(|m| {
+                        m.remove(&name_owned);
+                    });
+                    s2.draft.set(String::new());
+                    crate::ui::persist_drafts(&s2.drafts.get());
                 }
                 if let Ok(sessions) = api::load_sessions().await {
                     s2.sync_session_bookkeeping(&sessions);
@@ -1051,6 +1246,17 @@ pub async fn do_send(state: AppState, content: String, queue: String) {
         }
         return;
     };
+    // v0.5.58b (plan A): sending CONSUMES the session's stored draft. The
+    // send handler already cleared the live box optimistically; this drops
+    // the persisted copy so the just-sent text does not reappear in the
+    // box when the user leaves and comes back (or after a reload). Note:
+    // if the HTTP fallback below fails, the text is also gone from the
+    // draft (consistent with the box already being cleared) — the user is
+    // alerted "send failed".
+    state.drafts.update(|m| {
+        m.remove(&active);
+    });
+    crate::ui::persist_drafts(&state.drafts.get());
     // Only `follow` writes the queue field; the steer path leaves it
     // absent (schema: a missing field means steer, old logs stay valid).
     let queue_opt = (queue == "follow").then(|| queue.clone());
@@ -1955,39 +2161,458 @@ fn goal_body_view(g: &GoalView) -> AnyView {
 }
 
 // ── context bar (port of updateCtxBar / renderRounds / setView) ──
+
+/// v0.5.75: the meter's budget. The kernel's `[limits].context_budget_tokens`
+/// wins when the session's config was readable — that is the number the
+/// loop actually compacts against. Otherwise v0.5.46 behaviour: the active
+/// session's per-model entry, else the shared fallback.
+pub(crate) fn ctx_budget(state: AppState) -> u64 {
+    if let Some(b) = state.ctx_meta.get().and_then(|m| m.budget) {
+        if b > 0 {
+            return b;
+        }
+    }
+    let Some(sess) = state.active_session.get() else {
+        return CTX_BUDGET_FALLBACK;
+    };
+    let name = state
+        .sessions
+        .get()
+        .into_iter()
+        .find(|s| s.name == sess)
+        .and_then(|s| s.model)
+        .unwrap_or_default();
+    if name.is_empty() {
+        return CTX_BUDGET_FALLBACK;
+    }
+    state
+        .model_ctx
+        .get()
+        .get(&name)
+        .copied()
+        .unwrap_or(CTX_BUDGET_FALLBACK)
+}
+
+/// Used / budget in percent, clamped to 100.
+fn ctx_percent(state: AppState) -> f64 {
+    let used = state.ctx_used.get() as f64;
+    let budget = ctx_budget(state).max(1) as f64;
+    (used / budget * 100.0).min(100.0)
+}
+
+/// dsh's compact count for the panel's own rows (`formatTokens` in
+/// `dsh-client-ui-chat`): below 1K the number stays exact — `format_ctx`
+/// would round a 283-token system prompt to "0K".
+fn fmt_tokens(n: u64) -> String {
+    if n < 1_000 {
+        return n.to_string();
+    }
+    if n < 1_000_000 {
+        let k = n as f64 / 1_000.0;
+        return if k >= 100.0 {
+            format!("{}K", k.round() as u64)
+        } else {
+            format!("{}K", (k * 10.0).round() / 10.0)
+        };
+    }
+    let m = n as f64 / 1_000_000.0;
+    format!("{}M", (m * 10.0).round() / 10.0)
+}
+
+/// Thousands-separated exact count (`242432` → `242,432`) — the exact
+/// figures dsh prints in its per-turn rows, beside the compact `~242K`.
+fn fmt_exact(n: u64) -> String {
+    let digits = n.to_string();
+    let len = digits.len();
+    let mut out = String::with_capacity(len + len / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (len - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// dsh's density heuristic (`dsh-token-meter`: `CHARS_PER_TOKEN = 4`,
+/// system prompt `ceil(chars / 4) + 4`, per-block overhead). The messages
+/// run denser here: these transcripts mix CJK, where 4 chars/token
+/// under-counts, so 3.5 keeps the estimate honest.
+const CHARS_PER_TOKEN: f64 = 3.5;
+const SYSTEM_CHARS_PER_TOKEN: u64 = 4;
+
+/// The prompt's composition as far as it can be known from the browser.
+#[derive(Clone, Copy)]
+struct Breakdown {
+    system: u64,
+    tools: u64,
+    messages: u64,
+}
+
+/// Estimate the composition (v0.5.75). The event log carries no request
+/// envelope — no system prompt, no tool schemas, no chat template — so
+/// only the messages are countable. The provider-reported prompt size
+/// (`ctx_used`) anchors the total; the system prompt is priced from the
+/// server's character count; the residue becomes the third segment
+/// ("tools & injects"), which is exactly where tool schemas and the
+/// kernel's hook injections land. **The three always add up to `used`** —
+/// the panel can never contradict the bar.
+fn compute_breakdown(state: AppState) -> Breakdown {
+    let used = state.ctx_used.get();
+    // One pass over the loaded window. `chars_after_first` deliberately
+    // starts at the window's first assistant message: its `input_tokens`
+    // already prices everything that came before it (including the prompt
+    // prefix and every round outside the window), so the prompt that
+    // precedes it must NOT be counted again from text.
+    let (chars_all, chars_after_first, first_in) = state.events.with(|evs| {
+        let mut chars_all: u64 = 0;
+        let mut chars_after: u64 = 0;
+        let mut first_in: Option<u64> = None;
+        let mut seen_first = false;
+        for ev in evs.iter() {
+            let t = ev.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let mut n: u64 = 0;
+            match t {
+                "user_message" => {
+                    if let Some(c) = ev.get("content").and_then(|v| v.as_str()) {
+                        n = c.chars().count() as u64;
+                    }
+                }
+                "assistant_message" => {
+                    if let Some(c) = ev.get("content").and_then(|v| v.as_str()) {
+                        n = c.chars().count() as u64;
+                    }
+                    if let Some(tcs) = ev.get("tool_calls").and_then(|v| v.as_array()) {
+                        for tc in tcs {
+                            if let Some(args) = tc.get("arguments") {
+                                n += args.to_string().chars().count() as u64;
+                            }
+                        }
+                    }
+                }
+                "tool_result" => {
+                    if let Some(c) = ev
+                        .get("value")
+                        .and_then(|v| v.get("text"))
+                        .and_then(|v| v.as_str())
+                    {
+                        n = c.chars().count() as u64;
+                    }
+                }
+                _ => {}
+            }
+            chars_all += n;
+            if seen_first {
+                chars_after += n;
+            }
+            if t == "assistant_message" && first_in.is_none() {
+                first_in = ev
+                    .get("usage")
+                    .and_then(|u| u.get("input_tokens"))
+                    .and_then(|n| n.as_u64())
+                    .filter(|n| *n > 0);
+                seen_first = true;
+            }
+        }
+        (chars_all, chars_after, first_in)
+    });
+    let est = |chars: u64| (chars as f64 / CHARS_PER_TOKEN).ceil() as u64;
+    // Windowed history: anchor on the first assistant usage inside the
+    // window instead of guessing from the round count (rounds vary far
+    // too much in size). Everything the window is missing is already
+    // inside that number.
+    let mut messages = match (state.hist_has_more.get(), first_in) {
+        (true, Some(first)) => first.saturating_add(est(chars_after_first)),
+        _ => est(chars_all),
+    };
+    let mut system = state
+        .ctx_meta
+        .get()
+        .and_then(|m| m.system_chars)
+        .map(|c| c / SYSTEM_CHARS_PER_TOKEN + 4)
+        .unwrap_or(0);
+    if system + messages > used {
+        // A very dense window can overshoot: scale the two estimates down
+        // so the bar stays a decomposition of `used`, never a rival to it.
+        let total = system + messages;
+        if total == 0 {
+            system = 0;
+            messages = 0;
+        } else {
+            system = (system as u128 * used as u128 / total as u128) as u64;
+            messages = used - system;
+        }
+    }
+    let tools = used.saturating_sub(system + messages);
+    Breakdown {
+        system,
+        tools,
+        messages,
+    }
+}
+
+/// The panel's width, dsh's rule: `min(264px, 100vw - 24px)`.
+fn panel_width(vw: f64) -> f64 {
+    264.0_f64.min((vw - 24.0).max(120.0))
+}
+
+/// Place the panel under the button's right edge (the meter sits at the
+/// right end of the top band, so anchoring there keeps it attached) and
+/// clamp into the viewport — dsh's `useAnchoredPosition` with
+/// `side: "bottom"`, `gap: 8`, `margin: 12`. No flip: the top band always
+/// has room below it.
+fn anchor_panel(state: AppState) -> (f64, f64) {
+    let Some(win) = web_sys::window() else {
+        return (12.0, 12.0);
+    };
+    let vw = win
+        .inner_width()
+        .ok()
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1280.0);
+    let vh = win
+        .inner_height()
+        .ok()
+        .and_then(|v| v.as_f64())
+        .unwrap_or(800.0);
+    let Some(doc) = win.document() else {
+        return (12.0, 12.0);
+    };
+    let Some(btn) = doc.get_element_by_id("ctx-k-btn") else {
+        return (12.0, 12.0);
+    };
+    let rect = btn.get_bounding_client_rect();
+    let width = panel_width(vw);
+    let mut left = rect.right() - width;
+    left = left.clamp(12.0, (vw - width - 12.0).max(12.0));
+    let mut top = rect.bottom() + 8.0;
+    if let Some(panel) = doc.get_element_by_id("ctx-panel") {
+        let h = panel.get_bounding_client_rect().height();
+        if h > 0.0 {
+            top = top.clamp(12.0, (vh - h - 12.0).max(12.0));
+        }
+    }
+    let _ = state;
+    (left, top)
+}
+
+thread_local! {
+    /// The meter panel's document listeners (outside `pointerdown`, Escape,
+    /// `resize`). Held as `into_js_value` results, NOT as cloned
+    /// `js_sys::Function`s: dropping a `Closure` invalidates the JS
+    /// function it produced (the "closure invoked after being dropped"
+    /// trap this codebase already documented), so the closure has to be
+    /// leaked deliberately. A page runs one App, so a process-lifetime
+    /// keep is safe.
+    static CTX_PANEL_LISTENERS: std::cell::RefCell<Vec<wasm_bindgen::JsValue>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Install the panel's document listeners once. The outside-click test
+/// spares the button itself: a `pointerdown` there is followed by the
+/// button's own `click`, and closing on the former would fight the toggle.
+fn ctx_panel_listeners(state: AppState) {
+    if CTX_PANEL_LISTENERS.with(|c| !c.borrow().is_empty()) {
+        return;
+    }
+    let Some(win) = web_sys::window() else { return };
+    let Some(doc) = win.document() else { return };
+
+    let hit = {
+        let doc = doc.clone();
+        move |id: &str, target: &web_sys::Node| -> bool {
+            doc.get_element_by_id(id)
+                .map(|el| el.unchecked_ref::<web_sys::Node>().contains(Some(target)))
+                .unwrap_or(false)
+        }
+    };
+
+    let s1 = state;
+    let on_down = Closure::<dyn FnMut(web_sys::Event)>::new(move |e: web_sys::Event| {
+        if !s1.ctx_panel_open.get_untracked() {
+            return;
+        }
+        let Some(target) = e.target().and_then(|t| t.dyn_into::<web_sys::Node>().ok()) else {
+            return;
+        };
+        if !hit("ctx-panel", &target) && !hit("ctx-k-btn", &target) {
+            s1.ctx_panel_open.set(false);
+        }
+    });
+    let on_down_val = on_down.into_js_value();
+    let _ = doc.add_event_listener_with_callback("pointerdown", on_down_val.unchecked_ref());
+
+    let s2 = state;
+    let on_key = Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |e: web_sys::KeyboardEvent| {
+        if e.key() == "Escape" && s2.ctx_panel_open.get_untracked() {
+            s2.ctx_panel_open.set(false);
+        }
+    });
+    let on_key_val = on_key.into_js_value();
+    let _ = doc.add_event_listener_with_callback("keydown", on_key_val.unchecked_ref());
+
+    let s3 = state;
+    let on_resize = Closure::<dyn FnMut()>::new(move || {
+        if s3.ctx_panel_open.get_untracked() {
+            s3.ctx_panel_pos.set(anchor_panel(s3));
+        }
+    });
+    let on_resize_val = on_resize.into_js_value();
+    let _ = win.add_event_listener_with_callback("resize", on_resize_val.unchecked_ref());
+
+    CTX_PANEL_LISTENERS.with(|c| {
+        *c.borrow_mut() = vec![on_down_val, on_key_val, on_resize_val];
+    });
+}
+
+/// One row of the panel's legend / last-turn list.
+fn ctx_row(key: &'static str, hint: &'static str, value: String) -> AnyView {
+    view! {
+        <div class="ctx-prow" title=hint>
+            <span class="ctx-pkey">{ key }</span>
+            <span class="ctx-pval">{ value }</span>
+        </div>
+    }
+    .into_any()
+}
+
+/// The panel's body. Built inside the `Show`, so every closure here runs
+/// only while the panel is open — the closed meter costs nothing per
+/// frame (the frame path stays read-only).
+fn ctx_panel_body(state: AppState) -> AnyView {
+    let used = move || state.ctx_used.get();
+    let figures = move || format!("~{} / {}", format_ctx(used()), format_ctx(ctx_budget(state)));
+
+    let segments = move || {
+        let b = compute_breakdown(state);
+        let total = (b.system + b.tools + b.messages).max(1);
+        let pct = ctx_percent(state);
+        let mk = |n: u64, cls: &'static str| -> Option<AnyView> {
+            let w = pct * (n as f64) / (total as f64);
+            if w <= 0.05 {
+                return None;
+            }
+            Some(
+                view! { <div class=format!("ctx-seg {cls}") style=format!("width:{w:.2}%") /> }
+                    .into_any(),
+            )
+        };
+        [
+            mk(b.system, "ctx-tint-system"),
+            mk(b.tools, "ctx-tint-tools"),
+            mk(b.messages, "ctx-tint-messages"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<AnyView>>()
+    };
+
+    let mark = move || match state.ctx_meta.get() {
+        Some(m) => match (m.budget, m.compact_reserve) {
+            (Some(b), Some(r)) if b > 0 => {
+                let p = ((b.saturating_sub(r)) as f64 / b as f64 * 100.0).clamp(0.0, 100.0);
+                format!("left:{p:.2}%;")
+            }
+            _ => "display:none;".to_string(),
+        },
+        None => "display:none;".to_string(),
+    };
+
+    let zero = move || used() == 0;
+
+    view! {
+        <div class="ctx-phead">
+            <span class="ctx-plit">{ move || format!("{:.1}%", ctx_percent(state)) }</span>
+            <span class="ctx-psent">{ " of context used" }</span>
+            <span class="ctx-pfig">{ figures }</span>
+        </div>
+        <div class="ctx-pbar">
+            <div class="ctx-pmark" style=mark />
+            { segments }
+        </div>
+        <div class="ctx-prows">
+            { move || {
+                let b = compute_breakdown(state);
+                vec![
+                    ctx_row("System prompt", "priced from the kernel config (chars / 4 + 4)", format!("~{}", fmt_tokens(b.system))),
+                    ctx_row(
+                        if state.hist_has_more.get() { "Earlier rounds + tools" } else { "Tools & injects" },
+                        "residual: tool schemas, hook injections, chat template — plus any rounds outside the loaded window",
+                        format!("~{}", fmt_tokens(b.tools)),
+                    ),
+                    ctx_row("Messages", "estimated at ~3.5 chars/token over the loaded window", format!("~{}", fmt_tokens(b.messages))),
+                ]
+            } }
+        </div>
+        <Show when=move || state.hist_has_more.get() fallback=|| ()>
+            <div class="ctx-pnote">
+                { "only the newest rounds are loaded — Messages is anchored to the first assistant usage in the window, which already prices everything older" }
+            </div>
+        </Show>
+        <div class="ctx-prule" />
+        <div class="ctx-pcap">{ "last turn" }</div>
+        <div class="ctx-prows">
+            <Show when=move || !zero() fallback=|| ()>
+                <Show
+                    when=move || { state.ctx_cached.get().is_some() && used() > 0 }
+                    fallback=|| ()
+                >
+                    { move || {
+                        let c = state.ctx_cached.get().unwrap_or(0);
+                        let pct = c as f64 / used().max(1) as f64 * 100.0;
+                        ctx_row("Cache hit", "share of the prompt served from the prompt cache", format!("{pct:.1}%"))
+                    } }
+                </Show>
+                <Show when=move || state.ctx_cached.get().is_some() fallback=|| ()>
+                    { move || {
+                        let c = state.ctx_cached.get().unwrap_or(0);
+                        ctx_row("Uncached input", "prompt tokens the provider billed as new", fmt_exact(used().saturating_sub(c)))
+                    } }
+                </Show>
+                <Show when=move || state.ctx_cached.get().is_some() fallback=|| ()>
+                    { move || ctx_row("Cache read", "prompt tokens served from the prompt cache", fmt_exact(state.ctx_cached.get().unwrap_or(0))) }
+                </Show>
+                <Show when=move || state.ctx_out.get().is_some() fallback=|| ()>
+                    { move || ctx_row("Output", "tokens generated in the last turn", fmt_exact(state.ctx_out.get().unwrap_or(0))) }
+                </Show>
+            </Show>
+            <Show when=zero fallback=|| ()>
+                <div class="ctx-pempty">{ "no usage recorded yet" }</div>
+            </Show>
+        </div>
+    }
+    .into_any()
+}
+
 #[component]
 pub fn ContextBar(state: AppState) -> impl IntoView {
     let ctx_used = state.ctx_used;
     let view_round = state.view_round;
     let events = state.events;
     let layout = state.layout_mode;
+    let panel_open = state.ctx_panel_open;
+    let panel_pos = state.ctx_panel_pos;
 
-    // v0.5.46: the budget is the ACTIVE session's model entry, not a
-    // hard-coded 262k — a 1M-context entry reads "1M". The server
-    // resolves each session's model (own choice -> last used -> config
-    // active), so the name is always there; a name with no matching
-    // entry (renamed away, deleted) falls back to the kernel's default.
-    let budget = move || {
-        let Some(sess) = state.active_session.get() else {
-            return CTX_BUDGET_FALLBACK;
-        };
-        let name = state
-            .sessions
-            .get()
-            .into_iter()
-            .find(|s| s.name == sess)
-            .and_then(|s| s.model)
-            .unwrap_or_default();
-        if name.is_empty() {
-            return CTX_BUDGET_FALLBACK;
+    // v0.5.75: the meter panel's document listeners (outside click /
+    // Escape / resize). Installed once, for the app's lifetime.
+    ctx_panel_listeners(state);
+
+    // Re-anchor after the content changes: the panel's height is only
+    // known once it is in the DOM, and the clamp depends on it. Runs only
+    // while open (the early return), so the closed meter is free.
+    Effect::new(move |_| {
+        if !panel_open.get() {
+            return;
         }
-        state
-            .model_ctx
-            .get()
-            .get(&name)
-            .copied()
-            .unwrap_or(CTX_BUDGET_FALLBACK)
-    };
+        let _ = state.ctx_meta.get();
+        let _ = ctx_used.get();
+        let _ = state.ctx_cached.get();
+        let _ = state.ctx_out.get();
+        state.events.with(|_| ());
+        panel_pos.set(anchor_panel(state));
+    });
+
+    let budget = move || ctx_budget(state);
 
     let fill_style = move || {
         let used = ctx_used.get();
@@ -2002,12 +2627,40 @@ pub fn ContextBar(state: AppState) -> impl IntoView {
         format!("width:{pct:.1}%; background:{color};")
     };
 
-    let ctx_pct = move || {
-        let pct = (ctx_used.get() as f64 / budget() as f64 * 100.0).min(100.0);
-        format!("{pct:.1}%")
-    };
+    let ctx_pct = move || format!("{:.1}%", ctx_percent(state));
 
     let ctx_k = move || format!("~{} / {}", format_ctx(ctx_used.get()), format_ctx(budget()));
+
+    // The compaction line: the kernel compacts once the prompt reaches
+    // `budget - reserve`. Hidden when the server gave us no `[limits]`;
+    // it turns --warn the moment the fill passes it.
+    let mark_style = move || match state.ctx_meta.get() {
+        Some(m) => match (m.budget, m.compact_reserve) {
+            (Some(b), Some(r)) if b > 0 => {
+                let p = ((b.saturating_sub(r)) as f64 / b as f64 * 100.0).clamp(0.0, 100.0);
+                let hot = (ctx_used.get() as f64 / b as f64 * 100.0) >= p;
+                if hot {
+                    format!("left:{p:.2}%; background:var(--warn);")
+                } else {
+                    format!("left:{p:.2}%;")
+                }
+            }
+            _ => "display:none;".to_string(),
+        },
+        None => "display:none;".to_string(),
+    };
+    let mark_title = move || match state.ctx_meta.get() {
+        Some(m) => match (m.budget, m.compact_reserve) {
+            (Some(b), Some(r)) if b > 0 => format!(
+                "auto-compaction starts at {} (budget {} - reserve {})",
+                format_ctx(b.saturating_sub(r)),
+                format_ctx(b),
+                format_ctx(r)
+            ),
+            _ => String::new(),
+        },
+        None => String::new(),
+    };
 
     view! {
         <div id="context-bar">
@@ -2025,11 +2678,31 @@ pub fn ContextBar(state: AppState) -> impl IntoView {
                     </button>
                 </Show>
                 <span id="ctx-label">{ "context" }</span>
-                <div id="ctx-track">
+                <div id="ctx-track" title=mark_title>
                     <div id="ctx-fill" style=fill_style />
+                    <div id="ctx-mark" style=mark_style />
                 </div>
                 <span id="ctx-pct">{ ctx_pct }</span>
-                <span id="ctx-k">{ ctx_k }</span>
+                // v0.5.75: the figures ARE the meter's button now. Click
+                // opens the composition panel (a port of dsh's
+                // `ContextMeter`), outside click / Escape close it.
+                <button
+                    id="ctx-k-btn"
+                    class=move || if panel_open.get() { "open" } else { "" }
+                    title="context usage"
+                    aria-haspopup="dialog"
+                    aria-expanded=move || if panel_open.get() { "true" } else { "false" }
+                    on:click=move |_| {
+                        if panel_open.get() {
+                            panel_open.set(false);
+                        } else {
+                            panel_open.set(true);
+                            panel_pos.set(anchor_panel(state));
+                        }
+                    }
+                >
+                    { ctx_k }
+                </button>
                 // M8/M13: right tool panel toggle. Right edge of the
                 // context bar, symmetric to the sidebar's own edge
                 // buttons. M13: redesigned as a stateful "panel" icon
@@ -2053,6 +2726,19 @@ pub fn ContextBar(state: AppState) -> impl IntoView {
             <div id="ctx-rounds">
                 { move || rounds_view(events, view_round, state) }
             </div>
+            <Show when=move || panel_open.get() fallback=|| ()>
+                <div
+                    id="ctx-panel"
+                    role="dialog"
+                    aria-label="context usage"
+                    style=move || {
+                        let (l, t) = panel_pos.get();
+                        format!("left:{l:.0}px; top:{t:.0}px;")
+                    }
+                >
+                    { ctx_panel_body(state) }
+                </div>
+            </Show>
         </div>
     }
 }
@@ -2682,7 +3368,10 @@ fn send_stop_icon(running: bool) -> AnyView {
 
 #[component]
 pub fn InputModule(state: AppState) -> impl IntoView {
-    let msg = RwSignal::new(String::new());
+    // v0.5.58: the composer text is session-bound — it lives in
+    // `state.draft` (restored/stashed by `select_session` per session,
+    // keyed by `state.drafts`), not a component-local signal, so it no
+    // longer carries one session's words into another on a switch.
     // v0.5.6: the send button doubles as the loop start/stop control
     // (green triangle = send + start; red square = stop).
     let loop_running = state.loop_running;
@@ -2737,14 +3426,14 @@ pub fn InputModule(state: AppState) -> impl IntoView {
                     id="msg-input"
                     placeholder="Send a message... (Ctrl+Enter to send)"
                     rows="1"
-                    bind:value=msg
+                    bind:value=state.draft
                     on:input=move |_| { size_msg_input(); }
                     on:keydown=move |e: KeyboardEvent| {
                         if e.key() == "Enter" && (e.ctrl_key() || e.meta_key()) {
                             e.prevent_default();
                             let q = qsel_value.get().clone();
-                            let text = msg.get();
-                            msg.set(String::new());
+                            let text = state.draft.get();
+                            state.draft.set(String::new());
                             size_msg_input();
                             let s = state;
                             spawn_local(async move {
@@ -2780,8 +3469,8 @@ pub fn InputModule(state: AppState) -> impl IntoView {
                         // ensures the loop is running (the old
                         // #btn-start). An empty message does nothing.
                         let q = qsel_value.get().clone();
-                        let text = msg.get();
-                        msg.set(String::new());
+                        let text = state.draft.get();
+                        state.draft.set(String::new());
                         size_msg_input();
                         let s = state;
                         spawn_local(async move {
@@ -2976,6 +3665,7 @@ fn open_files_tab(state: AppState) {
             kind: RpTabKind::Files,
             path: String::new(),
             label: "Files".to_string(),
+            sess: String::new(),
         });
     });
     state.rp_active.set(0);
@@ -3015,6 +3705,7 @@ fn open_file(state: AppState, rel: &str) {
             kind: RpTabKind::File,
             path: rel_owned.clone(),
             label,
+            sess: sess.clone(),
         });
     });
     state.rp_active.set(id);
@@ -3073,13 +3764,22 @@ fn new_terminal(state: AppState) {
     state.rp_next_id.update(|n| *n += 1);
     let seq = state.rp_term_seq.get();
     state.rp_term_seq.update(|n| *n += 1);
-    let label = format!("Term {seq}");
+    // M15: the terminal is bound to the session it was opened in —
+    // the label shows the binding, and the tab (with its server pty)
+    // survives session switches until explicitly closed or the
+    // session is deleted.
+    let sess = match state.active_session.get() {
+        Some(s) => s,
+        None => return,
+    };
+    let label = format!("Term {seq} · {sess}");
     state.rp_tabs.update(|tabs| {
         tabs.push(RpTab {
             id,
             kind: RpTabKind::Term,
             path: String::new(),
             label,
+            sess,
         });
     });
     state
@@ -3418,11 +4118,18 @@ pub fn RightPanel(state: AppState) -> impl IntoView {
     let tabs = state.rp_tabs;
     let active_id = state.rp_active;
     let active_session = state.active_session;
+    // M15: user-adjustable panel width (the `.rp-resizer` strip in
+    // lib.rs writes `rp_width` on drag; the panel reads it through the
+    // `--rp-w` custom property, default 420px).
+    let rp_width = state.rp_width;
     // M13: the "+" dropdown's open state (local to this panel).
     let plus_menu = create_rw_signal(false);
 
     view! {
-        <aside id="right-panel">
+        <aside
+            id="right-panel"
+            style=move || format!("--rp-w: {}px", rp_width.get())
+        >
             <div class="rp-tabbar">
                 <div class="rp-tabs">
                     <For

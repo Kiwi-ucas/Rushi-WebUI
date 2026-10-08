@@ -2,18 +2,23 @@
 //! `window.Terminal` by `vendor/xterm/xterm.js`) bridged to the
 //! server-side PTY over the active session's WS connection.
 //!
+//! M15: the PTY is session-bound — it outlives a session switch (the
+//! server keeps it in the session store and replays its output ring on
+//! re-attach), so unmounting a pane does NOT close the pty. Only an
+//! explicit "close tab" sends `term_close`. The vendored xterm core
+//! has no auto-resize, so the grid is fitted to its host by hand
+//! (`fit_term` + a ResizeObserver); the initial fit also precedes the
+//! first `term_open`, so the pty opens at the host's real size.
+//!
 //! Outbound frames (sent via `ws::term_*`):
-//!   term_open  {cols, rows}   spawn the shell in the session workdir
+//!   term_open  {cols, rows}   spawn-or-attach the shell (session workdir)
 //!   term_input {data: base64}  raw keystrokes
 //!   term_resize{cols, rows}   SIGWINCH the pty
 //!   term_close                kill the pty's process group
 //! Inbound frames (routed by `ws.rs`):
 //!   term_out    {data: base64}  pty master output → xterm.write
-//!   term_status {running: bool}  shell spawn / exit
+//!   term_status {running: bool}  shell spawn / attach / exit
 //!
-//! A fresh xterm instance is created per session (the panel's terminal
-//! view is re-keyed by the active session) and torn down with
-//! `term_close` on unmount, so no PTY outlives its tab / session.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -34,6 +39,14 @@ thread_local! {
     /// would detach the callback). Entries are removed on unmount.
     static TERM_HOOKS: RefCell<Option<
         HashMap<u32, (Closure<dyn FnMut(JsValue)>, Closure<dyn FnMut(JsValue)>)>,
+    >> = const { RefCell::new(None) };
+
+    /// M15: the per-terminal `ResizeObserver` (host box → `fit_term`)
+    /// plus its callback keep-alive, keyed by terminal tab id.
+    /// Disconnected on unmount (the observer would otherwise keep
+    /// firing on a detached host).
+    static TERM_OBS: RefCell<Option<
+        HashMap<u32, (JsValue, Closure<dyn FnMut(js_sys::Array)>)>,
     >> = const { RefCell::new(None) };
 }
 
@@ -71,6 +84,97 @@ fn call1(obj: &JsValue, name: &str, arg: &JsValue) -> Result<JsValue, String> {
     args.set(0, arg.clone());
     js_sys::Reflect::apply(f, obj, &args)
         .map_err(|e| e.as_string().unwrap_or_else(|| "call failed".to_string()))
+}
+
+/// Call a 2-arg method on `obj`.
+fn call2(obj: &JsValue, name: &str, a: f64, b: f64) -> Result<JsValue, String> {
+    let f = js_sys::Reflect::get(obj, &JsValue::from_str(name))
+        .map_err(|e| e.as_string().unwrap_or_else(|| "property missing".to_string()))?;
+    let f = f.unchecked_ref::<js_sys::Function>();
+    let args = js_sys::Array::new();
+    args.set(0, JsValue::from_f64(a));
+    args.set(1, JsValue::from_f64(b));
+    js_sys::Reflect::apply(f, obj, &args)
+        .map_err(|e| e.as_string().unwrap_or_else(|| "call failed".to_string()))
+}
+
+// ── M15: fit the xterm grid to its host element ─────────────────────
+//
+// The vendored xterm core has NO auto-resize (no FitAddon, no internal
+// ResizeObserver): after `open()`, the grid stays at its default 80x24
+// no matter how wide the host actually is. On a ~400px host that means
+// the pty opens 80 cols wide while only ~52 cols are visible, and the
+// right ~28 columns of every line are clipped by `.term-host`'s
+// overflow:hidden — the "terminal content cut off at the right edge"
+// bug. So we fit by hand: measure the rendered grid's cell size, derive
+// the cols/rows the host can hold, and `term.resize` — which fires the
+// existing onResize → term_resize → SIGWINCH pipeline, so the pty
+// follows the panel width (resizer drag, window resize, ...).
+
+/// Measure `host`'s inner `.xterm` box against the rendered cell size
+/// and resize the terminal to it (a no-op when the grid already fits,
+/// or when the host has no layout yet / no rows rendered).
+fn fit_term(term: &JsValue, host: &JsValue) -> bool {
+    // Available box = the .xterm element (positioned inset:10px inside
+    // the host by .term-host .xterm).
+    let Some(x) = host
+        .dyn_ref::<web_sys::Element>()
+        .and_then(|el| el.query_selector(".xterm").ok())
+        .flatten()
+        .and_then(|x| x.dyn_into::<web_sys::HtmlElement>().ok())
+    else {
+        return false;
+    };
+    let w = x.client_width() as f64;
+    let h = x.client_height() as f64;
+    if w < 20.0 || h < 20.0 {
+        return false; // host not laid out yet
+    }
+    // Current grid (the xterm defaults to 80x24 before any fit).
+    let cols_now = js_sys::Reflect::get(term, &JsValue::from_str("cols"))
+        .ok()
+        .and_then(|v| v.as_f64())
+        .unwrap_or(80.0);
+    let rows_now = js_sys::Reflect::get(term, &JsValue::from_str("rows"))
+        .ok()
+        .and_then(|v| v.as_f64())
+        .unwrap_or(24.0);
+    if cols_now < 2.0 {
+        return false;
+    }
+    // Cell width comes from xterm's OWN rendered rows (the ground
+    // truth for how wide one column is at this font/theme); the row
+    // height from a row element. Fall back to the font metrics when
+    // nothing is rendered yet.
+    let mut cell_w = 0.0;
+    let mut cell_h = 0.0;
+    if let Some(rows) = x.query_selector(".xterm-rows").ok().flatten() {
+        if let Ok(rows_el) = rows.dyn_into::<web_sys::HtmlElement>() {
+            cell_w = (rows_el.scroll_width() as f64) / cols_now;
+            if let Some(row) = rows_el.first_element_child() {
+                if let Ok(row_el) = row.dyn_into::<web_sys::HtmlElement>() {
+                    cell_h = row_el.client_height() as f64;
+                }
+            }
+        }
+    }
+    if cell_h < 4.0 {
+        cell_h = 14.0; // fontSize 12 default row height
+    }
+    if cell_w < 2.0 {
+        // No rendered rows yet: estimate from the font (monospace at
+        // 12px ≈ 7.2px/col); the next fit after the first paint
+        // corrects it with real row measurements.
+        cell_w = 7.0;
+    }
+    let cols = ((w - 1.0) / cell_w).floor().max(2.0);
+    let rows = ((h - 1.0) / cell_h).floor().max(2.0);
+    if cols == cols_now && rows == rows_now {
+        return true;
+    }
+    // Fires onResize → term_resize → SIGWINCH (the pty follows).
+    let _ = call2(term, "resize", cols, rows);
+    true
 }
 
 /// Create an xterm instance, open it on `host`, and attach the `onData`
@@ -268,7 +372,7 @@ fn TermMount(state: AppState, term_id: u32, restart: RwSignal<u32>) -> impl Into
         match create_xterm(&host, &on_data, &on_resize) {
             Ok(term) => {
                 dbg_term(&format!("term {term_id}: xterm created"));
-                let el: web_sys::Element = host.unchecked_into();
+                let el: web_sys::Element = host.clone().unchecked_into();
                 let _ = el.set_attribute("data-term", "ok");
                 // Keep the owned Closures alive for the terminal's
                 // lifetime (xterm holds them as JS properties; the
@@ -288,9 +392,35 @@ fn TermMount(state: AppState, term_id: u32, restart: RwSignal<u32>) -> impl Into
                     write(&out_term, &bytes);
                 });
                 focus(&term);
+                // M15: fit the grid to the host NOW (a no-op when the
+                // host has no layout yet — the term_open task below
+                // retries the fit), and keep it in sync on every
+                // layout change with a ResizeObserver: the resizer
+                // drag, window resizes, and panel open/close all land
+                // here → fit_term → term.resize → onResize →
+                // term_resize → SIGWINCH, so the pty follows the
+                // panel width.
+                fit_term(&term, &host);
+                let term_ro = term.clone();
+                let host_ro = host.clone();
+                let ro_cb = Closure::<dyn FnMut(js_sys::Array)>::new(move |_: js_sys::Array| {
+                    fit_term(&term_ro, &host_ro);
+                });
+                if let Ok(ro) =
+                    web_sys::ResizeObserver::new(ro_cb.as_ref().unchecked_ref::<js_sys::Function>())
+                {
+                    ro.observe(host.unchecked_ref::<web_sys::Element>());
+                    let ro_v = JsValue::from(&ro);
+                    TERM_OBS.with(|c| {
+                        c.borrow_mut()
+                            .get_or_insert_with(HashMap::new)
+                            .insert(term_id, (ro_v, ro_cb));
+                    });
+                }
                 // term_open once the socket is up (retry ~10 s).
                 let tsig = term_js_eff;
                 let ts_map = term_state_open;
+                let host_open = host.clone();
                 leptos::task::spawn_local(async move {
                     let mut opened = false;
                     for _ in 0..40 {
@@ -301,6 +431,19 @@ fn TermMount(state: AppState, term_id: u32, restart: RwSignal<u32>) -> impl Into
                         gloo_timers::future::TimeoutFuture::new(250).await;
                     }
                     let t = tsig.get().unwrap_or(JsValue::UNDEFINED);
+                    // M15: wait (briefly) for the host to be laid out
+                    // and FIT the grid to it — the pty must open at the
+                    // host's real size, not xterm's 80×24 default
+                    // (the "content cut off at the right edge" bug).
+                    // The fit is idempotent; if the host never lays
+                    // out, dims() below falls back to the current grid
+                    // and the ResizeObserver corrects it later.
+                    for _ in 0..8 {
+                        if fit_term(&t, &host_open) {
+                            break;
+                        }
+                        gloo_timers::future::TimeoutFuture::new(250).await;
+                    }
                     let (c, r) = dims(&t);
                     if opened {
                         ws::term_open(term_id, c, r);
@@ -342,12 +485,23 @@ fn TermMount(state: AppState, term_id: u32, restart: RwSignal<u32>) -> impl Into
         }
     });
 
-    // Unmount: detach this terminal's output sink, kill just this pty,
-    // drop its callback keeps, and dispose xterm.
+    // Unmount: detach this terminal's output sink, drop its callback
+    // keeps and the fit observer, and dispose xterm. M15: the pty is
+    // NOT closed here — it is session-bound and outlives this pane
+    // (panel close, session switch); only an explicit "close tab"
+    // (`close_tab` → `ws::term_close`) or a session deletion kills it.
     let term_js_cleanup = term_js;
     on_cleanup(move || {
         ws::clear_term_writer(term_id);
-        ws::term_close(term_id);
+        TERM_OBS.with(|c| {
+            if let Some(m) = c.borrow_mut().as_mut() {
+                if let Some((ro, _cb)) = m.remove(&term_id) {
+                    if let Ok(ro_el) = ro.dyn_into::<web_sys::ResizeObserver>() {
+                        ro_el.disconnect();
+                    }
+                }
+            }
+        });
         TERM_HOOKS.with(|c| {
             if let Some(m) = c.borrow_mut().as_mut() {
                 m.remove(&term_id);

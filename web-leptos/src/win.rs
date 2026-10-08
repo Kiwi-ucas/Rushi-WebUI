@@ -285,9 +285,12 @@ pub fn maybe_trim(state: &AppState) {
         }
     }
     // Re-derive everything that is a function of the window.
-    let (ctx, ctxk) = state.events.with(|v| crate::ws::rebuild_ctx_bookkeeping(v));
-    state.ctx_used.set(ctx);
-    state.rounds_ctxk.set(ctxk);
+    let book = state.events.with(|v| crate::ws::rebuild_ctx_bookkeeping(v));
+    state.ctx_used.set(book.ctx);
+    state.rounds_ctxk.set(book.rounds);
+    // v0.5.75: the meter panel's "last turn" rows ride the same rebuild.
+    state.ctx_cached.set(book.cached);
+    state.ctx_out.set(book.out);
     let pending = state.events.with(|v| crate::ws::rebuild_tool_pending(v));
     state.tool_pending.set(pending);
     state.rebuild_derived();

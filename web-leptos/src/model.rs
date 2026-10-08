@@ -102,6 +102,11 @@ pub struct SessionInfo {
     /// else the entry the last loop used, else the config's active one.
     #[serde(default)]
     pub model: Option<String>,
+    /// v0.5.76: this session's reasoning effort (the server's `.effort`
+    /// marker; absent = follow the entry's own `reasoning_effort`).
+    /// Feeds the effort row in the session-card model popup.
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
 /// M7: project groups for the dispatch view (layout "full") — the
@@ -211,8 +216,13 @@ pub struct RpTab {
     pub kind: RpTabKind,
     /// Workdir-relative path (File tabs only; empty otherwise).
     pub path: String,
-    /// Display label ("Files" / file name / "Term N").
+    /// Display label ("Files" / file name / "Term N · session").
     pub label: String,
+    /// M15: the session a terminal tab belongs to ("" for Files/File
+    /// tabs). Terminal tabs are session-bound and survive session
+    /// switches; the server keeps their ptys running and re-attaches
+    /// them when the session's socket returns.
+    pub sess: String,
 }
 
 /// Per-terminal-tab liveness, keyed by the terminal tab id. Drives the
@@ -278,6 +288,22 @@ pub fn ordered_sessions(
         }
     });
     out
+}
+
+/// Context-meter meta (v0.5.75): the numbers the panel cannot derive
+/// from the event log — the system prompt's character count (priced on
+/// the panel with `ceil(chars / 4) + 4`) and the `[limits]` pair that
+/// owns the context budget and the compaction reserve. All three are
+/// optional; without them the panel degrades to the two-segment estimate
+/// and drops the compaction marker.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct ContextMeta {
+    #[serde(default)]
+    pub system_chars: Option<u64>,
+    #[serde(default)]
+    pub budget: Option<u64>,
+    #[serde(default)]
+    pub compact_reserve: Option<u64>,
 }
 
 /// Goal panel payload (port of JS `loadGoal` / goal view).
@@ -347,6 +373,17 @@ pub struct EssenceEntry {
     pub survivals: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retracted_reason: Option<String>,
+}
+
+/// v0.5.57: the active session's latest compaction_summary, pinned as a
+/// collapsible "context summary" card atop the transcript. Served by
+/// `GET /api/sessions/{id}/compaction`; `summary` is the markdown handoff
+/// document, `ts` the RFC3339 timestamp of that compaction.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct CompactionSummary {
+    pub summary: String,
+    #[serde(default)]
+    pub ts: String,
 }
 
 /// Rewind plugin: one node of the conversation history tree = one user
@@ -892,6 +929,18 @@ pub struct AppState {
     /// Context usage recorded at each round close (legacy `rounds[].ctxK`);
     /// index i = round i. Shown as "~K" on the ctx chips.
     pub rounds_ctxk: RwSignal<Vec<u64>>,
+    /// v0.5.75: the latest assistant usage's cache/output split — the two
+    /// numbers that used to print under every assistant message and now
+    /// live in the context meter's panel ("last turn").
+    pub ctx_cached: RwSignal<Option<u64>>,
+    pub ctx_out: RwSignal<Option<u64>>,
+    /// v0.5.75: the meter panel. `ctx_panel_pos` is the fixed-position
+    /// anchor in viewport pixels (left, top), recomputed from the button's
+    /// rect on open / resize / content growth.
+    pub ctx_panel_open: RwSignal<bool>,
+    pub ctx_panel_pos: RwSignal<(f64, f64)>,
+    /// Server-reported system-prompt size + limits for the active session.
+    pub ctx_meta: RwSignal<Option<ContextMeta>>,
     /// Number of cards currently folded into the pile (drives the
     /// pile-stack header). Updated by the engine every step.
     pub pile_count: RwSignal<usize>,
@@ -985,9 +1034,29 @@ pub struct AppState {
     /// v0.5.38: which session `loop_cmd` belongs to (guard so the
     /// refresh only re-fetches on a session change, not every poll).
     pub loop_cmd_sess: RwSignal<Option<String>>,
+    /// v0.5.58: the composer's (main input box's) current text, bound to
+    /// the active session. On a session switch the outgoing session's
+    /// unsent text is stashed in `drafts` and the incoming session's own
+    /// draft is restored, so the box never carries one session's words
+    /// into another (and a send can't land in the wrong session).
+    pub draft: RwSignal<String>,
+    /// v0.5.58: per-session unsent composer drafts (session name → text).
+    /// The cross-session memory behind `draft`; persisted to localStorage
+    /// (`rushi-drafts`, `ui::persist_drafts`) so it survives a reload.
+    pub drafts: RwSignal<std::collections::HashMap<String, String>>,
+    /// v0.5.57: the active session's latest compaction_summary (the current
+    /// context-handoff), pinned as a collapsible card atop the transcript
+    /// so it stays visible across a page reload. `None` = no compaction
+    /// yet (card hidden). Refreshed in ui.rs when the active session changes.
+    pub latest_compaction: RwSignal<Option<CompactionSummary>>,
     /// M8: right tool panel open/closed (persisted as "rushi-rp-open").
     /// The panel is a session-scoped inspector: Files tree + preview.
     pub rp_open: RwSignal<bool>,
+    /// M15: the right panel's width in px, user-adjustable by dragging
+    /// the `.rp-resizer` strip at the panel's left edge. Clamped to
+    /// [320, min(720, viewport-320)]. In-memory only — a refresh resets
+    /// it to the default 420 (the user decided against persisting it).
+    pub rp_width: RwSignal<u32>,
     /// M11: the open right-panel tabs (browser-style). The Files home
     /// tab (id 0) is always present; file/terminal tabs are created on
     /// demand (open a file / new terminal) and closed via the tab
@@ -1037,6 +1106,11 @@ pub struct AppState {
     /// reports for the active session's model. One `/api/model` fetch
     /// feeds this together with `model_names`.
     pub model_ctx: RwSignal<std::collections::BTreeMap<String, u64>>,
+    /// v0.5.76: entry name -> provider `model_id`. Feeds the effort row
+    /// in the session-card popup — `ms::effort_choices` infers the
+    /// levels a model family accepts from the id. Same one-shot
+    /// `/api/model` fetch as the two signals above.
+    pub model_ids: RwSignal<std::collections::BTreeMap<String, String>>,
     /// Rewind plugin: the active session's projected history tree
     /// (`GET /api/sessions/{id}/rewind`). None until the first fetch.
     pub rewind_tree: RwSignal<Option<RewindTree>>,
@@ -1105,6 +1179,11 @@ impl AppState {
             menu_session: RwSignal::new(None),
             menu_pos: RwSignal::new((0.0, 0.0)),
             rounds_ctxk: RwSignal::new(Vec::new()),
+            ctx_cached: RwSignal::new(None),
+            ctx_out: RwSignal::new(None),
+            ctx_panel_open: RwSignal::new(false),
+            ctx_panel_pos: RwSignal::new((0.0, 0.0)),
+            ctx_meta: RwSignal::new(None),
             pile_count: RwSignal::new(0),
             pile_top_brief: RwSignal::new(String::new()),
             pile_open: RwSignal::new(false),
@@ -1127,11 +1206,17 @@ impl AppState {
             drop_target: RwSignal::new(None),
             loop_cmd: RwSignal::new(String::new()),
             loop_cmd_sess: RwSignal::new(None),
+            draft: RwSignal::new(String::new()),
+            drafts: RwSignal::new(std::collections::HashMap::new()),
+            latest_compaction: RwSignal::new(None),
             rp_open: RwSignal::new(false),
+            rp_width: RwSignal::new(420),
             // M13: start with NO tabs — the panel shows the "start"
             // view (Files / Terminal launcher buttons); tabs are
-            // created on demand and are connection-scoped (a session
-            // switch resets the panel to the empty start view).
+            // created on demand. M15: terminal tabs are session-bound
+            // (they survive a session switch; the server keeps their
+            // ptys running); Files/File tabs stay connection-scoped
+            // (a session switch drops them back to the start view).
             rp_tabs: RwSignal::new(Vec::new()),
             rp_active: RwSignal::new(0),
             rp_next_id: RwSignal::new(1),
@@ -1149,6 +1234,7 @@ impl AppState {
             model_probe: RwSignal::new(std::collections::HashMap::new()),
             model_names: RwSignal::new(Vec::new()),
             model_ctx: RwSignal::new(std::collections::BTreeMap::new()),
+            model_ids: RwSignal::new(std::collections::BTreeMap::new()),
             rewind_tree: RwSignal::new(None),
             rewind_pending: RwSignal::new(None),
             rewind_gen: RwSignal::new(0),
@@ -1172,6 +1258,21 @@ impl AppState {
             v.entries
                 .iter()
                 .filter_map(|e| e.context_tokens.map(|c| (e.name.clone(), c)))
+                .collect(),
+        );
+        // v0.5.76: the provider model_id per entry — the effort levels
+        // are inferred from it (ms::effort_choices).
+        self.model_ids.set(
+            v.entries
+                .iter()
+                .filter_map(|e| {
+                    let id = e.model_id.clone()?;
+                    if id.is_empty() {
+                        None
+                    } else {
+                        Some((e.name.clone(), id))
+                    }
+                })
                 .collect(),
         );
     }

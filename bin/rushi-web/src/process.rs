@@ -24,7 +24,7 @@ use crate::config::WebConfig;
 /// directory makes every relative path mean exactly what it means in the
 /// original. The `config.session.<id>.toml` name is covered by the
 /// kernel repo's `config*.toml` ignore rule.
-fn session_config_path(cfg_pin: &Path, session: &str) -> std::path::PathBuf {
+pub(crate) fn session_config_path(cfg_pin: &Path, session: &str) -> std::path::PathBuf {
     cfg_pin
         .parent()
         .map(Path::to_path_buf)
@@ -35,7 +35,7 @@ fn session_config_path(cfg_pin: &Path, session: &str) -> std::path::PathBuf {
 /// A session id that is safe to embed in a file name next to the kernel
 /// config. Session names are directory names already, so this only has
 /// to defend against the odd character a name could still carry.
-fn safe_session_id(session: &str) -> String {
+pub(crate) fn safe_session_id(session: &str) -> String {
     session
         .chars()
         .map(|c| {

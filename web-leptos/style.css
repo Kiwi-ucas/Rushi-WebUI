@@ -467,10 +467,40 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
 .ctx-round-more:disabled { opacity: 0.55; cursor: default; }
 .ctx-round-more.failed { color: var(--danger); border-color: var(--danger); }
 #ctx-label { color: var(--text-muted); min-width: 0; }
-#ctx-track { flex: 1; height: 6px; background: var(--bg-elev); border: none; border-radius: 3px; overflow: hidden; box-shadow: var(--groove); }
+#ctx-track { position: relative; flex: 1; height: 6px; background: var(--bg-elev); border: none; border-radius: 3px; overflow: hidden; box-shadow: var(--groove); }
 #ctx-fill { height: 100%; background: var(--accent); width: 0%; transition: width 0.3s; }
 #ctx-pct { min-width: 32px; text-align: right; color: var(--text-muted); font-variant-numeric: tabular-nums; }
-#ctx-k { color: var(--text-muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+/* v0.5.75: the meter. `~242K / 262K` is a BUTTON now (dsh's
+   ContextMeter trigger, ported): click opens #ctx-panel. `#ctx-mark` is
+   the auto-compaction line — it reads the kernel's own threshold
+   (budget - reserve), hidden while the server has no [limits]. */
+#ctx-mark { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--ink); }
+#ctx-k-btn { font: inherit; font-weight: 700; color: var(--text-muted); background: transparent; border: none; border-radius: 999px; padding: 1px 8px; margin: 0 2px; cursor: pointer; font-variant-numeric: tabular-nums; white-space: nowrap; }
+#ctx-k-btn:hover { background: var(--bg-elev); color: var(--text); }
+#ctx-k-btn.open { background: var(--bg-elev); color: var(--text); box-shadow: var(--groove); }
+/* The panel: dsh's geometry (fixed, min(264px, 100vw - 24px), radius 12,
+   padding 12, 12/20px type) on the app's popover surface — same relief as
+   #sess-menu, one z layer above it (200) and below the modal (300). */
+#ctx-panel { position: fixed; z-index: 220; box-sizing: border-box; width: min(264px, calc(100vw - 24px)); background: var(--bg-elev); border: none; border-radius: 12px; box-shadow: var(--shadow-hover); color: var(--text-muted); padding: 12px; font-size: 12px; font-weight: 400; line-height: 20px; }
+.ctx-phead { display: flex; align-items: center; gap: 6px; }
+.ctx-plit { color: var(--text); font-weight: 500; font-variant-numeric: tabular-nums; }
+.ctx-psent:empty { display: none; }
+.ctx-pfig { margin-left: auto; color: var(--text); font-weight: 500; font-variant-numeric: tabular-nums; }
+.ctx-pbar { position: relative; display: flex; gap: 1px; height: 4px; margin: 10px 0 12px; border-radius: 999px; background: var(--bg); overflow: hidden; }
+.ctx-seg { flex: none; height: 100%; min-width: 2px; border-radius: 1px; }
+.ctx-pmark { position: absolute; top: -1px; bottom: -1px; width: 1px; background: var(--ink); }
+/* one green ramp, derived from the theme: muted -> accent2 -> accent */
+.ctx-tint-system { background: var(--text-muted); }
+.ctx-tint-tools { background: var(--accent2); }
+.ctx-tint-messages { background: var(--accent); }
+.ctx-prows { margin: 6px 0 0; }
+.ctx-prow { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 2px 0; }
+.ctx-pkey { color: var(--text-muted); }
+.ctx-pval { color: var(--text); font-variant-numeric: tabular-nums; }
+.ctx-pnote { margin: 8px 0 0; font-size: 11px; line-height: 15px; opacity: 0.8; }
+.ctx-prule { height: 1px; margin: 10px 0 6px; background: var(--border); opacity: 0.6; }
+.ctx-pcap { font-size: 11px; letter-spacing: 0.04em; text-transform: uppercase; opacity: 0.85; }
+.ctx-pempty { padding: 2px 0; }
 
 /* v0.5.31: lock the card surface to vertical-only scrolling.
    overflow-y:auto alone makes the x axis compute to auto as well
@@ -690,6 +720,23 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
 .ev-err-msg { white-space: pre-wrap; word-break: break-word; }
 .ev-approval { background: var(--bg-elev); border: none; }
 .ev-compaction { background: var(--bg-elev); border-left: 3px solid var(--text-muted); }
+/* v0.5.56: compaction/branch summary's small status label, above the
+   markdown body (the body itself renders like an assistant message via
+   .ev-content + .md). Only shown for the branch_of case. */
+.ev-comp-label { font-size: 12px; font-weight: 600; color: var(--text-muted); margin: 0 0 6px; }
+/* v0.5.57: pinned "context summary" card — the active session's latest
+   compaction_summary, kept visible across a page reload (the event itself
+   sits deep in the log, outside the last-200 window). A raised card like
+   .event but accent-rimmed on the left so it reads as "pinned/current",
+   collapsed to a one-line header by default; body is the shared md
+   renderer (.ev-content) in its own scroller. */
+.comp-card { position: relative; margin-bottom: 12px; border-radius: 8px; padding: 0; background: var(--card-bg, var(--bg-elev)); box-shadow: var(--shadow); border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); border-left: 3px solid var(--accent); }
+.comp-card-header { display: flex; align-items: center; gap: 6px; width: 100%; padding: 8px 14px; background: none; border: none; cursor: pointer; color: var(--text); font: inherit; text-align: left; }
+.comp-card-header:hover { color: var(--accent); }
+.comp-card-glyph { font-size: 10px; color: var(--text-muted); width: 12px; flex: 0 0 auto; }
+.comp-card-title { font-size: 12px; font-weight: 700; letter-spacing: .5px; text-transform: uppercase; color: var(--accent); }
+.comp-card-ts { margin-left: auto; font-size: 11px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.comp-card-body { padding: 4px 14px 12px; max-height: 40vh; overflow: auto; }
 .ev-rewind { --card-bg: var(--bg-elev); background: var(--bg-elev); border: none; border-top: 2px dashed var(--text-muted); box-shadow: none; padding: 8px 14px; }
 .ev-retract { opacity: 0.5; text-decoration: line-through; }
 
@@ -1000,6 +1047,9 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
 .sess-model-chip:active:not(:disabled) { transform: translateY(1px); box-shadow: var(--shadow-pressed); }
 .sess-model-chip:disabled { opacity: .55; cursor: default; }
 .smc-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 150px; }
+/* v0.5.76: the popup no longer borrows the message box's `.qsel-*`
+   classes — its own `.smc-*` block at the end of this file carries the
+   chip's 9px chevron (`smc-chev`), so this rule is now dead. */
 .sess-model .qsel-chev { font-size: 9px; }
 /* Fixed so the scrollable session list cannot clip it. */
 .sess-model-panel { position: fixed; left: auto; right: auto; bottom: auto; max-height: 280px; overflow-y: auto; max-width: 280px; }
@@ -1032,15 +1082,55 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
     rim are gone. Only the 14px left-edge channel (#right-panel::before)
     keeps a recessed treatment. Every control still follows the shared
     press/hover relief.                                             */
+/* M15: the panel width is user-adjustable — the `.rp-resizer` strip in
+   the main↔panel seam writes `--rp-w` inline (lib.rs); the default
+   420px is the fallback (a refresh resets it, per user decision). */
 #right-panel {
-  flex: 0 0 420px;
-  width: 420px;
+  flex: 0 0 var(--rp-w, 420px);
+  width: var(--rp-w, 420px);
   min-width: 0;
   background: var(--bg);
   display: flex;
   flex-direction: column;
   overflow: hidden;
   position: relative;
+}
+/* M15: the 7px drag strip in the main↔panel seam (a flex child of
+   #app, rendered between #main and #right-panel). It sits on the
+   existing 14px recessed channel, so it reads as "grabbing the
+   groove" rather than a new surface. The hover/active accent line is
+   a control-level affordance only — no surface shadows are added
+   (M14 flat ruling). */
+.rp-resizer {
+  flex: 0 0 7px;
+  position: relative;
+  z-index: 48;
+  cursor: col-resize;
+  background: transparent;
+  touch-action: none;
+}
+.rp-resizer::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 3px;
+  height: 64px;
+  border-radius: 3px;
+  background: var(--accent);
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.rp-resizer:hover::after { opacity: 0.5; }
+.rp-resizer.active::after { opacity: 0.9; }
+/* M15: while the panel width is being dragged, lock text selection
+   and force the col-resize cursor (the pointer capture on the strip
+   already routes the moves; this keeps the chrome honest). */
+body.rp-dragging,
+body.rp-dragging * {
+  user-select: none !important;
+  cursor: col-resize !important;
 }
 /* M11: the 14px right-edge relief strip, now a full mirror of #main::before -
    it starts below the band and fades in over the same 14→34px ramp, so the
@@ -2125,3 +2215,55 @@ html[data-theme="dark"] #session-actions .sb-seg button.on { background: var(--a
 .time-switch-knob { position: absolute; top: 3px; left: 3px; width: 16px; height: 16px; border-radius: 50%; background: var(--text-muted); transition: transform .15s ease, background .15s ease; }
 .time-switch.on .time-switch-knob { transform: translateX(18px); background: var(--on-badge); }
 .time-status { font-size: 12px; line-height: 1.45; color: var(--text-muted); }
+
+
+/* ── v0.5.76: the session-card model popup ───────────────────────────
+   The chip lives in the sidebar, so its popup speaks the sidebar's
+   language: `#sess-menu`'s panel skin (--bg-elev, 10px radius, 5px
+   padding, --shadow-hover) and FLAT 11px/700 rows at the chip's scale —
+   it used to borrow the message box's steer selector (.qsel-*, 13.3px
+   raised pills), which read as a different design. The effort row keeps
+   the chip's own pill skin (11px/700, 9px radius, --bg-panel, raised)
+   with the app's usual "on" = accent fill (.ms-seg button.on). */
+.smc-backdrop { position: fixed; inset: 0; z-index: 60; }
+.smc-panel {
+  position: fixed; left: auto; right: auto; bottom: auto; z-index: 61;
+  min-width: 150px; max-width: 280px; max-height: 280px; overflow-y: auto;
+  padding: 5px; background: var(--bg-elev); border: none; border-radius: 10px;
+  box-shadow: var(--shadow-hover);
+  animation: qsel-pop .14s ease-out;
+}
+.smc-sec {
+  padding: 5px 8px 2px; font-size: 10px; font-weight: 700;
+  letter-spacing: .3px; text-transform: uppercase; color: var(--text-muted);
+}
+.smc-opt {
+  display: flex; align-items: center; gap: 6px; width: 100%;
+  padding: 4px 8px; border: none; border-radius: 6px; background: none;
+  /* longhands, NOT the `font:` shorthand: `inherit` is not a valid
+     component of it, the whole line silently drops (the `.qsel-opt` rule
+     this replaces had exactly that bug — `font: 500 13px/1 inherit`). */
+  color: var(--text-muted); font-size: 11px; font-weight: 700;
+  font-family: inherit; line-height: 1.4; text-align: left;
+  cursor: pointer;
+}
+.smc-opt:hover { background: var(--bg); color: var(--text); }
+.smc-tick { flex: 0 0 auto; width: 11px; visibility: hidden; color: var(--accent); font-size: 10px; }
+.smc-opt[aria-selected] { color: var(--text); }
+.smc-opt[aria-selected] .smc-tick { visibility: visible; }
+.smc-eff { display: flex; flex-wrap: wrap; gap: 4px; padding: 2px 8px 5px; }
+.smc-eff-pill {
+  border: 1px solid var(--border); background: var(--bg-panel); color: var(--text-muted);
+  border-radius: 9px; padding: 1px 7px; font-size: 11px; font-weight: 700;
+  font-family: inherit; line-height: 1.5; cursor: pointer;
+  box-shadow: var(--shadow); transition: box-shadow .12s ease, color .12s ease;
+}
+.smc-eff-pill:hover { color: var(--text); box-shadow: var(--shadow-hover); }
+.smc-eff-pill:active { transform: translateY(1px); box-shadow: var(--shadow-pressed); }
+.smc-eff-pill.on { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
+.smc-chev { font-size: 9px; color: var(--text-muted); transition: transform .15s ease; }
+.sess-model.open .smc-chev { transform: rotate(180deg); }
+@media (prefers-reduced-motion: reduce) {
+  .smc-panel { animation: none; }
+  .smc-chev { transition: none; }
+}

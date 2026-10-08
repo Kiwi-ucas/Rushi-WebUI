@@ -210,6 +210,32 @@ impl SessionManager {
         Ok(out)
     }
 
+    /// Return the session's MOST RECENT `compaction_summary` event (the
+    /// current context-handoff summary), by scanning the event log
+    /// backwards from the end.  `None` when the log is missing, empty,
+    /// or has no compaction_summary yet.  Only the tail is scanned: we
+    /// stop at the first hit, so this stays cheap for long logs.
+    pub async fn latest_compaction(&self, id: &str) -> Option<serde_json::Value> {
+        let path = self.events_path(id);
+        let data = match fs::read_to_string(&path).await {
+            Ok(d) if !d.trim().is_empty() => d,
+            _ => return None,
+        };
+        let lines: Vec<&str> = data.lines().filter(|l| !l.trim().is_empty()).collect();
+        for line in lines.iter().rev() {
+            // cheap pre-filter before the (heavier) JSON parse
+            if !line.contains("\"compaction_summary\"") {
+                continue;
+            }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                if v.get("type").and_then(|t| t.as_str()) == Some("compaction_summary") {
+                    return Some(v);
+                }
+            }
+        }
+        None
+    }
+
     /// Read a window of events from the log, for truncated history loading.
     ///
     /// `before_line` is the 1-based line number of the oldest event the
